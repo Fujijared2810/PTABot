@@ -19,7 +19,6 @@ from keep_alive import keep_alive
 BOT_VERSION = "Alpha Release 3.0"
 
 load_dotenv()
-heartbeat = keep_alive()  # Get the heartbeat function
 
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
 DB_NAME = os.getenv('DB_NAME', 'PTABotDB')
@@ -1749,22 +1748,6 @@ def send_manual_reminders(message):
         bot.send_message(message.chat.id, summary.replace('*', ''), parse_mode=None)
 
 keep_alive()
-
-# Start a thread to periodically send heartbeats
-def send_heartbeat():
-    while True:
-        try:
-            heartbeat()  # Call the heartbeat function
-            time.sleep(30)  # Send heartbeat every 30 seconds
-        except Exception as e:
-            logging.error(f"Heartbeat error: {e}")
-            time.sleep(60)  # On error, wait a minute and try again
-
-# Start the heartbeat thread
-heartbeat_thread = threading.Thread(target=send_heartbeat)
-heartbeat_thread.daemon = True
-heartbeat_thread.start()
-
 # Function to start the bot with auto-restart
 def start_bot():
     while True:
