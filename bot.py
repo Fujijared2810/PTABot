@@ -16,7 +16,7 @@ from pymongo import MongoClient
 from keep_alive import keep_alive
 
 
-BOT_VERSION = "Alpha Release 2.8"
+BOT_VERSION = "Alpha Release 3.0"
 
 load_dotenv()
 
@@ -36,32 +36,6 @@ payment_collection = db['payments']
 old_members_collection = db['old_members']
 pending_collection = db['pending']
 changelog_collection = db['changelogs']
-
-# def migrate_data_to_mongodb():
-#     """Migrate existing JSON files to MongoDB"""
-#     try:
-#         # Check if migration already completed
-#         if pending_collection.count_documents({}) > 0:
-#             logging.info("MongoDB already has data, skipping migration")
-#             return
-            
-#         logging.info("Starting data migration to MongoDB...")
-        
-#         # Migrate payment data
-#         if os.path.exists('pending_users.json'):
-#             with open('pending_users.json', 'r') as f:
-#                 data = json.load(f)
-#                 for user_id, user_data in data.items():
-#                     # Convert user_id to string if it's not already
-#                     doc = {'_id': str(user_id)}
-#                     doc.update(user_data)
-#                     pending_collection.insert_one(doc)
-#                 logging.info(f"Migrated {len(data)} pending users")
-        
-#         # Migrate other JSON data similarly...
-#         logging.info("Data migration completed")
-#     except Exception as e:
-#         logging.error(f"Migration error: {e}")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -212,8 +186,6 @@ PENDING_USERS = load_pending_users()
 CHANGELOGS = load_changelogs()
 #migrate_data_to_mongodb()
 
-
-
 ### COMMAND HANDLERS ###
 
 @bot.message_handler(commands=['dm'])
@@ -233,6 +205,16 @@ def handle_dm_command(message):
     except ApiException as e:
         bot.send_message(message.chat.id, f"❌ Failed to send DM: {e.result_json['description']}. Please start a conversation with the bot first by sending /start in a private chat.")
 
+# Add this function to delete a specific user from pending
+def delete_pending_user(user_id):
+    try:
+        result = pending_collection.delete_one({'_id': str(user_id)})
+        if result.deleted_count > 0:
+            logging.info(f"Deleted pending user {user_id} from MongoDB")
+        else:
+            logging.info(f"No pending user {user_id} found to delete in MongoDB")
+    except Exception as e:
+        logging.error(f"Error deleting pending user {user_id} from MongoDB: {e}")
 
 # Start Command - Sends intro message and asks for the payment plan
 @bot.message_handler(commands=['start'])
@@ -259,6 +241,12 @@ def send_welcome(message):
         elif PENDING_USERS[user_id].get('status') == 'waiting_approval':
             pending_payment = True
             logging.info(f"User {user_id} has pending payment verification")
+        elif PENDING_USERS[user_id].get('status') in ['rejected', 'payment_rejected']:
+            # If status is rejected or payment_rejected, reset their status to allow choosing again
+            PENDING_USERS.pop(user_id, None)  # Remove from dictionary
+            delete_pending_user(user_id)  # Remove from MongoDB
+            logging.info(f"User {user_id} with rejected status has been removed from pending users")
+            # Continue to display welcome message
     
     # Handle pending requests first - don't show intro message again
     if pending_verification:
@@ -517,10 +505,11 @@ def callback_reject_old_member(call):
             bot.answer_callback_query(call.id, "❌ This user is not waiting for confirmation.")
             return
 
-        # Remove from pending list and notify user
-        PENDING_USERS.pop(user_id, None)
-        save_pending_users()
-        bot.send_message(user_id, "❌ Your request to be an old member has been rejected. Please reach out to the admins for more details.")
+        # Completely remove the user from pending instead of just marking as rejected
+        PENDING_USERS.pop(user_id, None)  # Remove from dictionary
+        delete_pending_user(user_id)  # Remove from MongoDB
+        
+        bot.send_message(user_id, "❌ Your request to be an old member has been rejected. Please reach out to the admins for more details or use /start to try again.")
         bot.answer_callback_query(call.id, "❌ User rejected successfully.")
 
         # Log admin activity and notify all admins
@@ -681,18 +670,6 @@ def handle_payment_screenshot(message):
     save_pending_users()
     bot.send_message(chat_id, "✅ Your payment confirmation is under review. We will notify you once verified.")
 
-
-# Add this function to delete a specific user from pending
-def delete_pending_user(user_id):
-    try:
-        result = pending_collection.delete_one({'_id': str(user_id)})
-        if result.deleted_count > 0:
-            logging.info(f"Deleted pending user {user_id} from MongoDB")
-        else:
-            logging.info(f"No pending user {user_id} found to delete in MongoDB")
-    except Exception as e:
-        logging.error(f"Error deleting pending user {user_id} from MongoDB: {e}")
-
 # Admin Approves Payment
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_payment_"))
 def callback_approve_payment(call):
@@ -785,7 +762,7 @@ def callback_approve_payment(call):
 
             # ⏳ Step 5: Delay revocation and notify admins
             def revoke_link_later(chat_id, invite_link, admin_ids):
-                time.sleep(5)  # Wait 5 seconds before revoking
+                time.sleep(15)  # Wait 5 seconds before revoking
                 try:
                     bot.revoke_chat_invite_link(chat_id, invite_link)
                     for admin_id in admin_ids:
@@ -830,9 +807,11 @@ def callback_reject_payment(call):
             bot.answer_callback_query(call.id, "❌ This user is not waiting for payment verification.")
             return
 
-        bot.send_message(user_id, "We were unable to verify your payment. Please ensure your submission meets our requirements and try again.")
-        PENDING_USERS.pop(user_id, None)
-        save_pending_users()
+        # Completely remove the user from pending instead of just marking as rejected
+        PENDING_USERS.pop(user_id, None)  # Remove from dictionary
+        delete_pending_user(user_id)  # Remove from MongoDB
+        
+        bot.send_message(user_id, "We were unable to verify your payment. Please ensure your submission meets our requirements and try again with /start.")
         bot.answer_callback_query(call.id, "❌ Payment rejected successfully.")
 
         # Log admin activity and notify all admins
@@ -856,11 +835,12 @@ def handle_cancel_confirmation(message):
     if message.chat.type != 'private':
         return  # Ignore if not in private chat
     chat_id = message.chat.id
+    user_id = message.from_user.id  # Add this line to properly define user_id
     confirmation = message.text
 
     if confirmation == "Yes":
         # User confirmed cancellation
-        PENDING_USERS[chat_id]['status'] = 'membership_cancelled'
+        PENDING_USERS[user_id]['status'] = 'membership_cancelled'
         save_pending_users()
 
         # Forward the cancellation request to admins
@@ -877,9 +857,8 @@ def handle_cancel_confirmation(message):
     else:
         bot.send_message(chat_id, "❌ Invalid response. Please choose 'Yes' or 'No'.")
 
-    bot.send_message(chat_id, "Thank you for using our bot!\nCan you give me a rate of 1-5 stars? And leave a feedback.")
-    PENDING_USERS[chat_id] = {'status': 'awaiting_feedback'}
-    save_pending_users()
+    PENDING_USERS.pop(user_id, None)  # Remove from dictionary
+    delete_pending_user(user_id)  # Remove from MongoDB
 
 # Function to remind users 3 days before payment deadline
 def escape_markdown(text):
@@ -905,26 +884,41 @@ def send_payment_reminder():
                     # Check if user is approaching due date (within 3 days)
                     days_until_due = (due_date - current_time).days
                     if 0 <= days_until_due <= 3 and data['haspayed']:
-                        try:
-                            bot.send_chat_action(user_id, 'typing')
-                            bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
-                            logging.info(f"Sent payment reminder to user {user_id}")
+                        # Check if we've already sent a reminder for this payment period
+                        if not data.get('reminder_sent', False):
+                            try:
+                                # Send reminder to user
+                                bot.send_chat_action(user_id, 'typing')
+                                bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
+                                logging.info(f"Sent payment reminder to user {user_id}")
+                                
+                                # Send notification to admins (only once)
+                                for admin_id in ADMIN_IDS:
+                                    bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
+                                
+                                # Mark that we've sent a reminder
+                                PAYMENT_DATA[user_id_str]['reminder_sent'] = True
+                                save_payment_data()
                             
-                            for admin_id in ADMIN_IDS:
-                                bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
-                        
-                        except ApiException as e:
-                            logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
-                            for admin_id in ADMIN_IDS:
-                                bot.send_message(
-                                    admin_id, 
-                                    f"⚠️ *Failed to send payment reminder*\n\n"
-                                    f"Could not send payment reminder to {user_display}.\n"
-                                    f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
-                                    f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
-                                    f"Please contact them manually.",
-                                    parse_mode="Markdown"
-                                )
+                            except ApiException as e:
+                                logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
+                                
+                                # Only notify admins if we haven't already sent a reminder
+                                if not data.get('reminder_sent', False):
+                                    for admin_id in ADMIN_IDS:
+                                        bot.send_message(
+                                            admin_id, 
+                                            f"⚠️ *Failed to send payment reminder*\n\n"
+                                            f"Could not send payment reminder to {user_display}.\n"
+                                            f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
+                                            f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
+                                            f"Please contact them manually.",
+                                            parse_mode="Markdown"
+                                        )
+                                    
+                                    # Mark that we've sent a reminder to admins
+                                    PAYMENT_DATA[user_id_str]['reminder_sent'] = True
+                                    save_payment_data()
                     
                     # Check if membership has expired
                     elif due_date < current_time and data['haspayed']:
@@ -934,6 +928,8 @@ def send_payment_reminder():
                             logging.info(f"Sent expiry notice to user {user_id}")
                             
                             PAYMENT_DATA[user_id_str]['haspayed'] = False
+                            # Reset the reminder flag when payment expires
+                            PAYMENT_DATA[user_id_str]['reminder_sent'] = False
                             save_payment_data()
                             
                             for admin_id in ADMIN_IDS:
@@ -942,6 +938,8 @@ def send_payment_reminder():
                         except ApiException as e:
                             logging.error(f"Failed to send expiry notice to user {user_id}: {e}")
                             PAYMENT_DATA[user_id_str]['haspayed'] = False
+                            # Reset the reminder flag when payment expires
+                            PAYMENT_DATA[user_id_str]['reminder_sent'] = False
                             save_payment_data()
                             
                             for admin_id in ADMIN_IDS:
@@ -1101,46 +1099,6 @@ def update_payment_status(message):
         bot.send_message(chat_id, "❌ User not found.")
     PENDING_USERS.pop(chat_id, None)
     save_pending_users()
-
-
-# New handler to collect feedback
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'awaiting_feedback')
-def collect_feedback(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
-    chat_id = message.chat.id
-    feedback_text = message.text
-    user_id = message.from_user.id
-    username = message.from_user.username or "No Username"
-
-    # Parse rating and feedback
-    rating_match = re.search(r'\b([1-5])\b', feedback_text)
-    rating = 0
-    feedback = feedback_text
-
-    if rating_match:
-        rating = int(rating_match.group(1))
-        feedback = feedback_text.replace(rating_match.group(), '', 1).strip()
-    else:
-        rating = 0  # Indicates invalid/missing rating
-
-    # Escape Markdown in username
-    username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
-
-    # Notify all admins
-    for admin in ADMIN_IDS:
-        bot.send_message(
-            admin,
-            f"⭐ **New Feedback**\n"
-            f"👤 User: @{username} (ID: `{user_id}`)\n"
-            f"📊 Rating: {rating}/5\n"
-            f"📝 Feedback: {feedback}"
-        )
-
-    # Thank user and reset
-    bot.send_message(chat_id, "Thank you! If you need further assistance just type `/start`")
-    if chat_id in PENDING_USERS:
-        del PENDING_USERS[chat_id]
 
 @bot.message_handler(commands=['ping'])
 def handle_ping_command(message):
