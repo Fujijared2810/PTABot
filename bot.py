@@ -13,6 +13,7 @@ import sys
 import pytz
 import pymongo
 from pymongo import MongoClient
+from keep_alive import keep_alive
 
 
 BOT_VERSION = "Alpha Release 2.8"
@@ -1596,6 +1597,8 @@ def remove_self_from_pending(message):
         logging.info(f"Admin {user_id} removed self from pending users (status: {status})")
     else:
         bot.reply_to(message, "✅ You're not in the pending users list.")
+
+keep_alive()
 
 # Function to start the bot with auto-restart
 def start_bot():
