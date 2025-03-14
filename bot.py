@@ -15,7 +15,7 @@ import pymongo
 from pymongo import MongoClient
 
 
-BOT_VERSION = "Alpha Release 2.2"
+BOT_VERSION = "Alpha Release 2.5"
 
 load_dotenv()
 
@@ -1561,6 +1561,28 @@ def check_mongodb_connection(message):
         error_message = f"❌ **MongoDB Connection Error**\n\n{str(e)}"
         bot.reply_to(message, error_message, parse_mode="Markdown")
         logging.error(f"MongoDB connection check: FAILED - {e}")
+
+@bot.message_handler(commands=['remove'])
+def remove_self_from_pending(message):
+    user_id = message.from_user.id
+    
+    # Check if admin or creator
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators and the creator.")
+        return
+    
+    # Remove self from pending users
+    if user_id in PENDING_USERS:
+        status = PENDING_USERS[user_id].get('status', 'unknown')
+        PENDING_USERS.pop(user_id, None)
+        
+        # Remove from MongoDB too
+        delete_pending_user(user_id)
+        
+        bot.reply_to(message, f"✅ You've been removed from pending users. Previous status: {status}")
+        logging.info(f"Admin {user_id} removed self from pending users (status: {status})")
+    else:
+        bot.reply_to(message, "✅ You're not in the pending users list.")
 
 # Function to start the bot with auto-restart
 def start_bot():
