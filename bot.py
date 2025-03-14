@@ -13,10 +13,9 @@ import sys
 import pytz
 import pymongo
 from pymongo import MongoClient
-from keep_alive import keep_alive
 
 
-BOT_VERSION = "Alpha Release 2.5"
+BOT_VERSION = "Alpha Release 2.8"
 
 load_dotenv()
 
@@ -75,6 +74,7 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# Keep your PhilippineTimeFormatter class
 class PhilippineTimeFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         # Convert the time to Philippine time (UTC+8)
@@ -82,16 +82,28 @@ class PhilippineTimeFormatter(logging.Formatter):
         # Format the time in 12-hour format
         return philippine_time.strftime('%Y-%m-%d %I:%M:%S %p')
 
-# Configure logging
-logging.basicConfig(
-    filename='bot.log',  # Log to a file named 'bot.log'
-    level=logging.INFO,  # Log info, warnings, and errors
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configure root logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# Set the custom formatter
-for handler in logging.getLogger().handlers:
-    handler.setFormatter(PhilippineTimeFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+# Create and configure file handler
+file_handler = logging.FileHandler('bot.log')
+file_handler.setLevel(logging.INFO)
+
+# Create and configure console handler (this sends to terminal)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+
+# Create formatter
+formatter = PhilippineTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Add formatter to handlers
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Load confirmed old members from MongoDB
 def load_confirmed_old_members():
@@ -1584,8 +1596,6 @@ def remove_self_from_pending(message):
         logging.info(f"Admin {user_id} removed self from pending users (status: {status})")
     else:
         bot.reply_to(message, "✅ You're not in the pending users list.")
-
-keep_alive()
 
 # Function to start the bot with auto-restart
 def start_bot():
