@@ -19,6 +19,7 @@ from keep_alive import keep_alive
 BOT_VERSION = "Alpha Release 3.0"
 
 load_dotenv()
+heartbeat = keep_alive()  # Get the heartbeat function
 
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
 DB_NAME = os.getenv('DB_NAME', 'PTABotDB')
@@ -829,33 +830,101 @@ def callback_reject_payment(call):
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Unexpected error rejecting payment: {e}")
 
+def safe_markdown_escape(text):
+    """
+    Comprehensive function to safely escape ANY text for Telegram Markdown
+    Returns the escaped text or plain text if the input contains problematic characters
+    """
+    if text is None:
+        return "None"
+        
+    try:
+        # First try with standard escaping pattern
+        special_chars = r'_*[]()~`>#+-=|{}.!'
+        escaped_text = text
+        for char in special_chars:
+            escaped_text = escaped_text.replace(char, f"\\{char}")
+        return escaped_text
+    except Exception:
+        # If anything fails, sanitize by removing problematic characters
+        return ''.join(c for c in text if c.isalnum() or c.isspace() or c in '.-_')
+
 # Handle Cancel Membership Confirmation
 @bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'cancel_membership')
 def handle_cancel_confirmation(message):
     if message.chat.type != 'private':
         return  # Ignore if not in private chat
     chat_id = message.chat.id
-    user_id = message.from_user.id  # Add this line to properly define user_id
+    user_id = message.from_user.id
     confirmation = message.text
 
+    # Check if user actually has an active membership
+    if str(user_id) not in PAYMENT_DATA or not PAYMENT_DATA[str(user_id)].get('haspayed', False):
+        bot.send_message(chat_id, "❌ You don't have an active membership to cancel.")
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+        return
+
+    # Get membership details for better context
+    plan = PAYMENT_DATA[str(user_id)].get('payment_plan', 'Unknown')
+    due_date = PAYMENT_DATA[str(user_id)].get('due_date', 'Unknown')
+    
     if confirmation == "Yes":
         # User confirmed cancellation
         PENDING_USERS[user_id]['status'] = 'membership_cancelled'
         save_pending_users()
 
-        # Forward the cancellation request to admins
+        # Set cancellation flags in payment data
+        PAYMENT_DATA[str(user_id)]['cancelled'] = True
+        PAYMENT_DATA[str(user_id)]['reminder_sent'] = True  # Prevent future reminders
+        PAYMENT_DATA[str(user_id)]['cancellation_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        save_payment_data()
+
+        # Get user's information first
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or f"User {user_id}"
+            username = safe_markdown_escape(username)
+        except Exception as e:
+            username = f"User {user_id}"  # Fallback if we can't get username
+
+        # Forward the cancellation request to admins with additional context
         for admin in ADMIN_IDS:
-            bot.send_message(admin, f"🏷 **Cancelled Membership**\nUsername: @{message.from_user.username}\nID: {message.from_user.id}")
+            bot.send_message(
+                admin, 
+                f"🚫 *MEMBERSHIP CANCELLATION*\n\n"
+                f"👤 Username: @{username}\n"
+                f"🆔 User ID: `{user_id}`\n"
+                f"📅 Plan: {plan}\n"
+                f"⏰ Due date: {due_date}\n"
+                f"📝 Cancelled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                parse_mode="Markdown"
+            )
 
-        # Inform the user that the cancellation has been processed
-        bot.send_message(chat_id, "✅ Your membership is cancelled. You will still have access until the next payment cycle, but will not be charged next month/year. Thank you for being with us!")
-
+        # Provide better information to the user
+        try:
+            due_date_obj = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
+            days_remaining = (due_date_obj - datetime.now()).days
+            
+            bot.send_message(
+                chat_id, 
+                f"✅ Your membership is cancelled. You will still have access until {due_date_obj.strftime('%Y-%m-%d')} "
+                f"({days_remaining} days remaining), but will not be renewed.\n\n"
+                f"Thank you for being with us! If you change your mind before expiration, use /start to reactivate.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            # Fallback if date parsing fails
+            bot.send_message(chat_id, "✅ Your membership is cancelled. You will still have access until the next payment cycle, but will not be charged next month/year. Thank you for being with us!")
+            logging.error(f"Error parsing due date during cancellation: {e}")
+    
     elif confirmation == "No":
         # User did not confirm cancellation
         bot.send_message(chat_id, "❌ No changes have been made to your membership. You will continue with the current payment plan.")
-
+    
     else:
         bot.send_message(chat_id, "❌ Invalid response. Please choose 'Yes' or 'No'.")
+        return  # Don't remove from pending users so they can try again
 
     PENDING_USERS.pop(user_id, None)  # Remove from dictionary
     delete_pending_user(user_id)  # Remove from MongoDB
@@ -883,7 +952,7 @@ def send_payment_reminder():
 
                     # Check if user is approaching due date (within 3 days)
                     days_until_due = (due_date - current_time).days
-                    if 0 <= days_until_due <= 3 and data['haspayed']:
+                    if 0 <= days_until_due <= 3 and data['haspayed'] and not data.get('cancelled', False):
                         # Check if we've already sent a reminder for this payment period
                         if not data.get('reminder_sent', False):
                             try:
@@ -1196,8 +1265,12 @@ def show_user_dashboard(message):
             days_remaining = (due_date - current_date).days
             hours_remaining = int((due_date - current_date).seconds / 3600)
             
-            # Format status based on days remaining
-            if days_remaining > 7:
+            # Check if membership is cancelled first
+            if data.get('cancelled', False):
+                status_icon = "🚫"
+                status_text = "Cancelled"
+            # If not cancelled, format status based on days remaining
+            elif days_remaining > 7:
                 status_icon = "✅"
                 status_text = "Active"
             elif days_remaining > 0:
@@ -1223,11 +1296,18 @@ def show_user_dashboard(message):
                 f"⏳ *Time Remaining:* {days_remaining} days, {hours_remaining} hours\n\n"
             )
             
-            # Add renewal instructions if expiring soon
-            if days_remaining < 7 and days_remaining >= 0:
+            # Add renewal instructions if expiring soon (and not cancelled)
+            if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
                 dashboard_message += (
                     "⚠️ *Your membership expires soon!*\n"
                     "Use /start and select 'Renew Membership' to continue access.\n\n"
+                )
+            # Add special message for cancelled memberships
+            elif data.get('cancelled', False):
+                dashboard_message += (
+                    "🚫 *Your membership has been cancelled*\n"
+                    f"You will still have access until {due_date.strftime('%Y-%m-%d')}.\n"
+                    "To reactivate before expiration, use /start and select 'Renew Membership'.\n\n"
                 )
                 
             # Add help information
@@ -1400,6 +1480,9 @@ def enter_changelog(message):
             "Would you like to also post this changelog in the main group chat?",
             reply_markup=markup
         )
+    # Remove user from pending users after successfully processing the changelog
+    PENDING_USERS.pop(chat_id, None)  # Remove from dictionary
+    delete_pending_user(chat_id)  # Remove from MongoDB
 
 # View changelogs command
 @bot.message_handler(commands=['changelogs'])
@@ -1478,11 +1561,12 @@ def send_admin_changelogs(chat_id):
     # Get the latest 5 changelogs
     recent_logs = CHANGELOGS['admin'][-5:]
     
-    changelog_message = "📋 *ADMIN CHANGELOGS*\n\n"
+    # First try plain text (no markdown) to be safe
+    plain_message = "📋 ADMIN CHANGELOGS\n\n"
     for log in recent_logs:
-        changelog_message += f"🕒 {log['timestamp']}\n{log['content']}\n\n"
+        plain_message += f"🕒 {log['timestamp']}\n{log['content']}\n\n"
     
-    bot.send_message(chat_id, changelog_message, parse_mode="Markdown")
+    bot.send_message(chat_id, plain_message)
 
 def send_user_changelogs(chat_id):
     if not CHANGELOGS['user']:
@@ -1492,11 +1576,12 @@ def send_user_changelogs(chat_id):
     # Get the latest 5 changelogs
     recent_logs = CHANGELOGS['user'][-5:]
     
-    changelog_message = "📋 *RECENT UPDATES*\n\n"
+    # Send as plain text to avoid formatting issues
+    plain_message = "📋 RECENT UPDATES\n\n"
     for log in recent_logs:
-        changelog_message += f"🕒 {log['timestamp']}\n{log['content']}\n\n"
+        plain_message += f"🕒 {log['timestamp']}\n{log['content']}\n\n"
     
-    bot.send_message(chat_id, changelog_message, parse_mode="Markdown")
+    bot.send_message(chat_id, plain_message)
 
 @bot.message_handler(commands=['check'])
 def check_mongodb_connection(message):
@@ -1556,7 +1641,129 @@ def remove_self_from_pending(message):
     else:
         bot.reply_to(message, "✅ You're not in the pending users list.")
 
+@bot.message_handler(commands=['notify'])
+def send_manual_reminders(message):
+    """Admin command to manually trigger payment reminders only to users at specific day thresholds"""
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+        
+    bot.reply_to(message, "🔄 Processing targeted payment reminders for users at 7 days, 3 days, and expiring/expired... Please wait.")
+    
+    notified_users = 0
+    failed_users = 0
+    skipped_users = 0
+    notified_list = []
+    failed_list = []
+    
+    current_time = datetime.now()
+    
+    for user_id_str, data in PAYMENT_DATA.items():
+        try:
+            # Skip users without active payments
+            if not data.get('haspayed', False):
+                skipped_users += 1
+                continue
+                
+            # Skip cancelled memberships
+            if data.get('cancelled', False):
+                skipped_users += 1
+                continue
+                
+            user_id = int(user_id_str)
+            due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+            days_until_due = (due_date - current_time).days
+            username = safe_markdown_escape(data.get('username', None) or f"ID:{user_id}")
+            
+            # ONLY send reminders at specific thresholds: exactly 7 days, exactly 3 days, or 0/negative days
+            if days_until_due == 7:
+                reminder_message = (
+                    f"📝 *Payment Reminder*\n\n"
+                    f"Your membership will expire in *7 days* on {due_date.strftime('%Y-%m-%d')}.\n\n"
+                    f"Thank you for being a member of Prodigy Trading Academy! Please prepare to renew soon."
+                )
+            elif days_until_due == 3:
+                reminder_message = (
+                    f"⚠️ *Payment Reminder - Action Required Soon*\n\n"
+                    f"Your membership will expire in *3 days* on {due_date.strftime('%Y-%m-%d')}.\n\n"
+                    f"Please prepare to renew your membership to avoid losing access."
+                )
+            elif days_until_due <= 0:
+                reminder_message = (
+                    f"🚨 *URGENT: Payment Overdue*\n\n"
+                    f"Your membership has expired or will expire today.\n\n"
+                    f"Please renew immediately to maintain your access to Prodigy Trading Academy services."
+                )
+            else:
+                # Skip users who are not at the targeted day thresholds
+                skipped_users += 1
+                continue
+            
+            # Try to send the message
+            try:
+                bot.send_chat_action(user_id, 'typing')
+                bot.send_message(user_id, reminder_message, parse_mode="Markdown")
+                notified_users += 1
+                notified_list.append(f"@{username} ({days_until_due} days left)")
+                logging.info(f"Manual reminder sent to user {user_id} ({days_until_due} days remaining)")
+            except ApiException as e:
+                failed_users += 1
+                failed_list.append(f"@{username} ({days_until_due} days left)")
+                logging.error(f"Failed to send manual reminder to user {user_id}: {e}")
+                
+        except Exception as e:
+            logging.error(f"Error processing manual reminder for user {user_id_str}: {e}")
+            failed_users += 1
+    
+    # Send summary to admin
+    summary = (
+        f"📊 *Targeted Payment Reminder Summary*\n\n"
+        f"✅ Successfully notified: {notified_users} users\n"
+        f"❌ Failed to notify: {failed_users} users\n"
+        f"⏩ Skipped (inactive/cancelled/not at threshold): {skipped_users} users\n\n"
+    )
+    
+    # Add the lists of notified and failed users
+    if notified_list:
+        summary += "✅ *Notified Users:*\n"
+        for i, user in enumerate(notified_list, 1):
+            if i <= 20:  # Limit to 20 users to avoid message length issues
+                summary += f"  {i}. {user}\n"
+        if len(notified_list) > 20:
+            summary += f"  ...and {len(notified_list) - 20} more\n"
+        summary += "\n"
+    
+    if failed_list:
+        summary += "❌ *Failed Users:*\n"
+        for i, user in enumerate(failed_list, 1):
+            if i <= 20:  # Limit to 20 users to avoid message length issues
+                summary += f"  {i}. {user}\n"
+        if len(failed_list) > 20:
+            summary += f"  ...and {len(failed_list) - 20} more\n"
+    
+    # Send summary message
+    try:
+        bot.send_message(message.chat.id, summary, parse_mode="Markdown")
+    except ApiException:
+        # If markdown parsing fails, send without formatting
+        bot.send_message(message.chat.id, summary.replace('*', ''), parse_mode=None)
+
 keep_alive()
+
+# Start a thread to periodically send heartbeats
+def send_heartbeat():
+    while True:
+        try:
+            heartbeat()  # Call the heartbeat function
+            time.sleep(30)  # Send heartbeat every 30 seconds
+        except Exception as e:
+            logging.error(f"Heartbeat error: {e}")
+            time.sleep(60)  # On error, wait a minute and try again
+
+# Start the heartbeat thread
+heartbeat_thread = threading.Thread(target=send_heartbeat)
+heartbeat_thread.daemon = True
+heartbeat_thread.start()
 
 # Function to start the bot with auto-restart
 def start_bot():
