@@ -377,6 +377,7 @@ def choose_option(message):
             return
 
         PENDING_USERS[chat_id]['status'] = 'old_member_request'
+        PENDING_USERS[chat_id]['request_time'] = datetime.now()  # Add timestamp
         save_pending_users()
 
         # Escape Markdown characters in username
@@ -667,6 +668,7 @@ def handle_payment_screenshot(message):
         )
 
     PENDING_USERS[chat_id]['status'] = 'waiting_approval'
+    PENDING_USERS[chat_id]['request_time'] = datetime.now()  # Add timestamp
     save_pending_users()
     bot.send_message(chat_id, "✅ Your payment confirmation is under review. We will notify you once verified.")
 
@@ -1746,6 +1748,120 @@ def send_manual_reminders(message):
     except ApiException:
         # If markdown parsing fails, send without formatting
         bot.send_message(message.chat.id, summary.replace('*', ''), parse_mode=None)
+
+# Function to handle payment proof and old member verification requests
+def send_pending_request_reminders():
+    while True:
+        try:
+            logging.info("Checking for pending requests needing reminders...")
+            current_time = datetime.now()
+            
+            for user_id, data in PENDING_USERS.items():
+                # Check for payment verification requests
+                if data.get('status') == 'waiting_approval':
+                    # Check if submission timestamp exists
+                    if 'request_time' not in data:
+                        # Add timestamp now for existing requests
+                        PENDING_USERS[user_id]['request_time'] = current_time
+                        save_pending_users()
+                        continue
+                        
+                    # Calculate time elapsed since request
+                    request_time = data['request_time']
+                    if isinstance(request_time, str):
+                        request_time = datetime.strptime(request_time, '%Y-%m-%d %H:%M:%S')
+                    
+                    time_elapsed = (current_time - request_time).total_seconds() / 60  # in minutes
+                    
+                    # Check if it's been more than 10 minutes and reminder not sent yet
+                    if time_elapsed > 10 and not data.get('reminder_sent', False):
+                        # Send reminder to user
+                        try:
+                            bot.send_message(
+                                user_id,
+                                "⏳ Your payment verification request is still pending. The admins might be busy at the moment. "
+                                "Please be patient as they review your submission."
+                            )
+                            logging.info(f"Sent waiting reminder to user {user_id} for payment verification")
+                        except Exception as e:
+                            logging.error(f"Failed to send wait reminder to user {user_id}: {e}")
+                        
+                        # Send reminder to all admins
+                        for admin_id in ADMIN_IDS:
+                            try:
+                                user_info = bot.get_chat(user_id)
+                                username = user_info.username or f"User {user_id}"
+                                escaped_username = safe_markdown_escape(username)  # Properly escape the username
+                                bot.send_message(
+                                    admin_id,
+                                    f"⚠️ *Reminder:* @{escaped_username} has been waiting for payment verification for over 10 minutes.",
+                                    parse_mode="Markdown"
+                                )
+                            except Exception as e:
+                                logging.error(f"Failed to send admin reminder to {admin_id} about user {user_id}: {e}")
+                        
+                        # Mark reminder as sent
+                        PENDING_USERS[user_id]['reminder_sent'] = True
+                        save_pending_users()
+                
+                # Check for old member verification requests
+                if data.get('status') == 'old_member_request':
+                    # Check if submission timestamp exists
+                    if 'request_time' not in data:
+                        # Add timestamp now for existing requests
+                        PENDING_USERS[user_id]['request_time'] = current_time
+                        save_pending_users()
+                        continue
+                    
+                    # Calculate time elapsed since request
+                    request_time = data['request_time']
+                    if isinstance(request_time, str):
+                        request_time = datetime.strptime(request_time, '%Y-%m-%d %H:%M:%S')
+                    
+                    time_elapsed = (current_time - request_time).total_seconds() / 60  # in minutes
+                    
+                    # Check if it's been more than 10 minutes and reminder not sent yet
+                    if time_elapsed > 10 and not data.get('reminder_sent', False):
+                        # Send reminder to user
+                        try:
+                            bot.send_message(
+                                user_id,
+                                "⏳ Your old member verification request is still pending. The admins might be busy at the moment. "
+                                "Please be patient as they review your submission."
+                            )
+                            logging.info(f"Sent waiting reminder to user {user_id} for old member verification")
+                        except Exception as e:
+                            logging.error(f"Failed to send wait reminder to user {user_id}: {e}")
+                        
+                        # Send reminder to all admins
+                        for admin_id in ADMIN_IDS:
+                            try:
+                                user_info = bot.get_chat(user_id)
+                                username = user_info.username or f"User {user_id}"
+                                escaped_username = safe_markdown_escape(username)  # Properly escape the username
+                                bot.send_message(
+                                    admin_id,
+                                    f"⚠️ *Reminder:* @{escaped_username} has been waiting for old member verification for over 10 minutes.",
+                                    parse_mode="Markdown"
+                                )
+                            except Exception as e:
+                                logging.error(f"Failed to send admin reminder to {admin_id} about user {user_id}: {e}")
+                        
+                        # Mark reminder as sent
+                        PENDING_USERS[user_id]['reminder_sent'] = True
+                        save_pending_users()
+            
+            # Sleep for 1 minute before next check
+            time.sleep(60)
+            
+        except Exception as e:
+            logging.error(f"Error in pending request reminder thread: {e}")
+            time.sleep(60)  # Wait a minute on error before trying again
+
+# Start reminder thread
+pending_reminder_thread = threading.Thread(target=send_pending_request_reminders)
+pending_reminder_thread.daemon = True
+pending_reminder_thread.start()
 
 keep_alive()
 # Function to start the bot with auto-restart
