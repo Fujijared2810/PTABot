@@ -1863,6 +1863,50 @@ pending_reminder_thread = threading.Thread(target=send_pending_request_reminders
 pending_reminder_thread.daemon = True
 pending_reminder_thread.start()
 
+def refresh_mongodb_data():
+    """Refresh all data from MongoDB to ensure it's up to date."""
+    global PAYMENT_DATA, CONFIRMED_OLD_MEMBERS, PENDING_USERS, CHANGELOGS
+    
+    logging.info("Refreshing data from MongoDB...")
+    
+    try:
+        PAYMENT_DATA = load_payment_data()
+        logging.info(f"Refreshed payment data: {len(PAYMENT_DATA)} records")
+        
+        CONFIRMED_OLD_MEMBERS = load_confirmed_old_members()
+        logging.info(f"Refreshed old members: {len(CONFIRMED_OLD_MEMBERS)} records")
+        
+        PENDING_USERS = load_pending_users()
+        logging.info(f"Refreshed pending users: {len(PENDING_USERS)} records")
+        
+        CHANGELOGS = load_changelogs()
+        user_logs = len(CHANGELOGS.get('user', []))
+        admin_logs = len(CHANGELOGS.get('admin', []))
+        logging.info(f"Refreshed changelogs: {user_logs} user, {admin_logs} admin records")
+        
+        logging.info("MongoDB data refresh completed successfully")
+    except Exception as e:
+        logging.error(f"Error refreshing MongoDB data: {e}")
+
+def mongodb_refresh_thread():
+    """Background thread to periodically refresh MongoDB data."""
+    while True:
+        try:
+            # Sleep first to avoid immediate refresh after startup
+            time.sleep(1800)  # 30 minutes = 1800 seconds
+            
+            # Refresh all data from MongoDB
+            refresh_mongodb_data()
+            
+        except Exception as e:
+            logging.error(f"Error in MongoDB refresh thread: {e}")
+            time.sleep(300)  # Wait 5 minutes on error before trying again
+
+# Start MongoDB refresh thread
+refresh_thread = threading.Thread(target=mongodb_refresh_thread)
+refresh_thread.daemon = True
+refresh_thread.start()
+
 keep_alive()
 # Function to start the bot with auto-restart
 def start_bot():
