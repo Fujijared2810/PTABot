@@ -953,42 +953,33 @@ def send_payment_reminder():
 
                     # Check if user is approaching due date (within 3 days)
                     days_until_due = (due_date - current_time).days
+                    
+                    # Send reminders for all users within 3 days of expiry - EVERY cycle
+                    # Remove the reminder_sent check so it sends every 12 hours
                     if 0 <= days_until_due <= 3 and data['haspayed'] and not data.get('cancelled', False):
-                        # Check if we've already sent a reminder for this payment period
-                        if not data.get('reminder_sent', False):
-                            try:
-                                # Send reminder to user
-                                bot.send_chat_action(user_id, 'typing')
-                                bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
-                                logging.info(f"Sent payment reminder to user {user_id}")
-                                
-                                # Send notification to admins (only once)
-                                for admin_id in ADMIN_IDS:
-                                    bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
-                                
-                                # Mark that we've sent a reminder
-                                PAYMENT_DATA[user_id_str]['reminder_sent'] = True
-                                save_payment_data()
+                        try:
+                            # Send reminder to user
+                            bot.send_chat_action(user_id, 'typing')
+                            bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
+                            logging.info(f"Sent payment reminder to user {user_id}")
                             
-                            except ApiException as e:
-                                logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
-                                
-                                # Only notify admins if we haven't already sent a reminder
-                                if not data.get('reminder_sent', False):
-                                    for admin_id in ADMIN_IDS:
-                                        bot.send_message(
-                                            admin_id, 
-                                            f"⚠️ *Failed to send payment reminder*\n\n"
-                                            f"Could not send payment reminder to {user_display}.\n"
-                                            f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
-                                            f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
-                                            f"Please contact them manually.",
-                                            parse_mode="Markdown"
-                                        )
-                                    
-                                    # Mark that we've sent a reminder to admins
-                                    PAYMENT_DATA[user_id_str]['reminder_sent'] = True
-                                    save_payment_data()
+                            # Send notification to admins
+                            for admin_id in ADMIN_IDS:
+                                bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
+                            
+                        except ApiException as e:
+                            logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
+                            
+                            for admin_id in ADMIN_IDS:
+                                bot.send_message(
+                                    admin_id, 
+                                    f"⚠️ *Failed to send payment reminder*\n\n"
+                                    f"Could not send payment reminder to {user_display}.\n"
+                                    f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
+                                    f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
+                                    f"Please contact them manually.",
+                                    parse_mode="Markdown"
+                                )
                     
                     # Check if membership has expired
                     elif due_date < current_time and data['haspayed']:
@@ -1753,7 +1744,6 @@ def send_manual_reminders(message):
 def send_pending_request_reminders():
     while True:
         try:
-            logging.info("Checking for pending requests needing reminders...")
             current_time = datetime.now()
             
             for user_id, data in PENDING_USERS.items():
@@ -1913,11 +1903,9 @@ def start_bot():
     while True:
         try:
             logging.info("Starting the bot...")
-            
             # Add these lines to help prevent the 409 conflict error
             bot.delete_webhook()  # Ensure no webhooks are active
-            time.sleep(3)  # Wait a moment to ensure previous connections are closed
-            
+            time.sleep(10)  # Wait a moment to ensure previous connections are closed
             bot.polling()
             logging.info("Bot is online")
         except Exception as e:
