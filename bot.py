@@ -935,100 +935,119 @@ def escape_markdown(text):
     return re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', text)
 
 def send_payment_reminder():
-    while True:  # Add infinite loop to continuously check
+    """Payment reminder function using scheduled times for consistency."""
+    logging.info("Payment reminder thread started")
+    
+    # Define specific times of day to send reminders (24-hour format in Philippines timezone)
+    REMINDER_TIMES = ["09:00", "21:00"]  # 9:00 AM and 9:00 PM
+    
+    # Track the last day we sent reminders to avoid duplicate sends
+    last_reminder_dates = {time: None for time in REMINDER_TIMES}
+    
+    while True:
         try:
-            logging.info("Checking for payment reminders...")
-            current_time = datetime.now()
-            for user_id_str, data in PAYMENT_DATA.items():
-                try:
-                    user_id = int(user_id_str)
-                    due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
-                    username = data.get('username', None)
-                    
-                    if username:
-                        username = escape_markdown(username)
-                        user_display = f"@{username}"
-                    else:
-                        user_display = f"User {user_id}"
-
-                    # Check if user is approaching due date (within 3 days)
-                    days_until_due = (due_date - current_time).days
-                    
-                    # Send reminders for all users within 3 days of expiry - EVERY cycle
-                    # Remove the reminder_sent check so it sends every 12 hours
-                    if 0 <= days_until_due <= 3 and data['haspayed'] and not data.get('cancelled', False):
-                        try:
-                            # Send reminder to user
-                            bot.send_chat_action(user_id, 'typing')
-                            bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
-                            logging.info(f"Sent payment reminder to user {user_id}")
-                            
-                            # Send notification to admins
-                            for admin_id in ADMIN_IDS:
-                                bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
-                            
-                        except ApiException as e:
-                            logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
-                            
-                            for admin_id in ADMIN_IDS:
-                                bot.send_message(
-                                    admin_id, 
-                                    f"⚠️ *Failed to send payment reminder*\n\n"
-                                    f"Could not send payment reminder to {user_display}.\n"
-                                    f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
-                                    f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
-                                    f"Please contact them manually.",
-                                    parse_mode="Markdown"
-                                )
-                    
-                    # Check if membership has expired
-                    elif due_date < current_time and data['haspayed']:
-                        try:
-                            bot.send_chat_action(user_id, 'typing')
-                            bot.send_message(user_id, "❌ Your membership has expired. Please renew your membership to continue accessing our services.")
-                            logging.info(f"Sent expiry notice to user {user_id}")
-                            
-                            PAYMENT_DATA[user_id_str]['haspayed'] = False
-                            # Reset the reminder flag when payment expires
-                            PAYMENT_DATA[user_id_str]['reminder_sent'] = False
-                            save_payment_data()
-                            
-                            for admin_id in ADMIN_IDS:
-                                bot.send_message(admin_id, f"Admin Notice: {user_display}'s membership has expired.")
-                        
-                        except ApiException as e:
-                            logging.error(f"Failed to send expiry notice to user {user_id}: {e}")
-                            PAYMENT_DATA[user_id_str]['haspayed'] = False
-                            # Reset the reminder flag when payment expires
-                            PAYMENT_DATA[user_id_str]['reminder_sent'] = False
-                            save_payment_data()
-                            
-                            for admin_id in ADMIN_IDS:
-                                bot.send_message(
-                                    admin_id, 
-                                    f"⚠️ *Failed to send expiry notice*\n\n"
-                                    f"Could not notify {user_display} about their expired membership.\n"
-                                    f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
-                                    f"Their membership has been marked as expired in the system.\n\n"
-                                    f"Please contact them manually.",
-                                    parse_mode="Markdown"
-                                )
+            # Get current time in Philippines timezone
+            now = datetime.now(pytz.timezone('Asia/Manila'))
+            current_time = now.strftime('%H:%M')
+            current_date = now.strftime('%Y-%m-%d')
+            
+            # Check if it's time to send reminders and we haven't sent them today at this time
+            if current_time in REMINDER_TIMES and last_reminder_dates[current_time] != current_date:
+                logging.info(f"Scheduled time {current_time} reached - sending payment reminders...")
                 
-                except Exception as e:
-                    logging.error(f"Error processing payment reminder for user {user_id_str}: {e}")
-                    for admin_id in ADMIN_IDS:
-                        bot.send_message(admin_id, f"⚠️ Error processing payment reminder for {user_id_str}: {str(e)}")
+                # Process all users for payment reminders
+                for user_id_str, data in PAYMENT_DATA.items():
+                    try:
+                        user_id = int(user_id_str)
+                        due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                        username = data.get('username', None)
+                        
+                        if username:
+                            username = escape_markdown(username)
+                            user_display = f"@{username}"
+                        else:
+                            user_display = f"User {user_id}"
+
+                        # Check if user is approaching due date (within 3 days)
+                        days_until_due = (due_date - now).days
+                        
+                        # Send reminders for all users within 3 days of expiry
+                        if 0 <= days_until_due <= 3 and data['haspayed'] and not data.get('cancelled', False):
+                            try:
+                                # Send reminder to user
+                                bot.send_chat_action(user_id, 'typing')
+                                bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
+                                logging.info(f"Sent payment reminder to user {user_id}")
+                                
+                                # Send notification to admins
+                                for admin_id in ADMIN_IDS:
+                                    bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
+                            
+                            except ApiException as e:
+                                logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
+                                
+                                for admin_id in ADMIN_IDS:
+                                    bot.send_message(
+                                        admin_id, 
+                                        f"⚠️ *Failed to send payment reminder*\n\n"
+                                        f"Could not send payment reminder to {user_display}.\n"
+                                        f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
+                                        f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
+                                        f"Please contact them manually.",
+                                        parse_mode="Markdown"
+                                    )
+                        
+                        # Check if membership has expired
+                        elif due_date < now and data['haspayed']:
+                            try:
+                                bot.send_chat_action(user_id, 'typing')
+                                bot.send_message(user_id, "❌ Your membership has expired. Please renew your membership to continue accessing our services.")
+                                logging.info(f"Sent expiry notice to user {user_id}")
+                                
+                                PAYMENT_DATA[user_id_str]['haspayed'] = False
+                                # Reset the reminder flag when payment expires
+                                PAYMENT_DATA[user_id_str]['reminder_sent'] = False
+                                save_payment_data()
+                                
+                                # Make sure admins are notified about expired memberships
+                                for admin_id in ADMIN_IDS:
+                                    bot.send_message(admin_id, f"⚠️ EXPIRED: {user_display}'s membership has expired and has been marked as unpaid in the system.")
+                            
+                            except ApiException as e:
+                                logging.error(f"Failed to send expiry notice to user {user_id}: {e}")
+                                PAYMENT_DATA[user_id_str]['haspayed'] = False
+                                # Reset the reminder flag when payment expires
+                                PAYMENT_DATA[user_id_str]['reminder_sent'] = False
+                                save_payment_data()
+                                
+                                for admin_id in ADMIN_IDS:
+                                    bot.send_message(
+                                        admin_id, 
+                                        f"⚠️ *Failed to send expiry notice*\n\n"
+                                        f"Could not notify {user_display} about their expired membership.\n"
+                                        f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
+                                        f"Their membership has been marked as expired in the system.\n\n"
+                                        f"Please contact them manually.",
+                                        parse_mode="Markdown"
+                                    )
+                                    
+                    except Exception as e:
+                        logging.error(f"Error processing payment reminder for user {user_id_str}: {e}")
+                        for admin_id in ADMIN_IDS:
+                            bot.send_message(admin_id, f"⚠️ Error processing payment reminder for {user_id_str}: {str(e)}")
+                
+                # Record that we've sent reminders for this scheduled time today
+                last_reminder_dates[current_time] = current_date
+                logging.info(f"Completed sending payment reminders at scheduled time {current_time}")
             
-            # Log completion of check cycle
-            logging.info("Payment reminder check completed.")
-            
-            # Sleep for a certain period before checking again
-            # Check once every 12 hours (43200 seconds)
-            time.sleep(43200)
+            # Calculate the time to sleep until the start of the next minute
+            now = datetime.now(pytz.timezone('Asia/Manila'))
+            sleep_time = 60 - now.second - now.microsecond / 1_000_000
+            time.sleep(sleep_time)
             
         except Exception as e:
             logging.error(f"Error in payment reminder main loop: {e}")
-            time.sleep(3600)  # Wait an hour on main loop error
+            time.sleep(60)  # Wait a minute on error before trying again
 
 # Start reminder thread
 reminder_thread = threading.Thread(target=send_payment_reminder)
