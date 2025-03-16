@@ -959,7 +959,13 @@ def send_payment_reminder():
                 for user_id_str, data in PAYMENT_DATA.items():
                     try:
                         user_id = int(user_id_str)
-                        due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                        # Get the naive datetime first
+                        naive_due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                        
+                        # Make it timezone-aware by adding Manila timezone
+                        manila_tz = pytz.timezone('Asia/Manila')
+                        due_date = manila_tz.localize(naive_due_date)
+                        
                         username = data.get('username', None)
                         
                         if username:
@@ -968,7 +974,7 @@ def send_payment_reminder():
                         else:
                             user_display = f"User {user_id}"
 
-                        # Check if user is approaching due date (within 3 days)
+                        # Now both dates are timezone-aware, subtraction will work
                         days_until_due = (due_date - now).days
                         
                         # Send reminders for all users within 3 days of expiry
