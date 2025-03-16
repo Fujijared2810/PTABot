@@ -706,9 +706,16 @@ def callback_approve_payment(call):
 
         save_pending_users()
 
-        # Save payment data
+        # Get user info directly from Telegram to ensure correct username
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or "No Username"
+        except Exception:
+            username = "No Username"  # Fallback if can't get username
+
+        # Save payment data with USER'S username (not admin's)
         PAYMENT_DATA[str(user_id)] = {
-            "username": call.from_user.username or "No Username",
+            "username": username,  # Use the user's username instead of admin's
             "payment_plan": plan,
             "payment_mode": payment_mode,
             "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
@@ -764,7 +771,7 @@ def callback_approve_payment(call):
 
             # ⏳ Step 5: Delay revocation and notify admins
             def revoke_link_later(chat_id, invite_link, admin_ids):
-                time.sleep(15)  # Wait 5 seconds before revoking
+                time.sleep(15)  # Wait 15 seconds before revoking
                 try:
                     bot.revoke_chat_invite_link(chat_id, invite_link)
                     for admin_id in admin_ids:
@@ -778,8 +785,10 @@ def callback_approve_payment(call):
             bot.send_message(call.message.chat.id, f"❌ Link generation failed: {e.result_json['description']}")
             return
         
-        bot.send_message(user_id, "Thank you for using our bot!\nCan you give me a rate of 1-5 stars? And leave a feedback.")
-        PENDING_USERS[user_id] = {'status': 'awaiting_feedback'}
+        # Send thank you message instead of requesting feedback
+        bot.send_message(user_id, "Thank you for joining Prodigy Trading Academy! If you have any questions, feel free to ask our admins.")
+        # Don't add them to PENDING_USERS for feedback - removed this line:
+        # PENDING_USERS[user_id] = {'status': 'awaiting_feedback'}
 
         # 🔒 Step 6: Ensure bot is an admin before adding restrictions
         try:
@@ -789,47 +798,6 @@ def callback_approve_payment(call):
 
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Unexpected error approving payment: {e}")
-
-# Admin Rejects Payment
-@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_payment_"))
-def callback_reject_payment(call):
-    user_id = int(call.data.split("_")[2])
-    if call.message.chat.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
-        return
-
-    try:
-        # Check if the user already has an approved payment
-        if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)]['haspayed']:
-            bot.answer_callback_query(call.id, "⚠️ This user has already been approved. Cannot reject.")
-            return
-
-        # Check if user is actually waiting for payment verification
-        if user_id not in PENDING_USERS or PENDING_USERS[user_id].get('status') != 'waiting_approval':
-            bot.answer_callback_query(call.id, "❌ This user is not waiting for payment verification.")
-            return
-
-        # Completely remove the user from pending instead of just marking as rejected
-        PENDING_USERS.pop(user_id, None)  # Remove from dictionary
-        delete_pending_user(user_id)  # Remove from MongoDB
-        
-        bot.send_message(user_id, "We were unable to verify your payment. Please ensure your submission meets our requirements and try again with /start.")
-        bot.answer_callback_query(call.id, "❌ Payment rejected successfully.")
-
-        # Log admin activity and notify all admins
-        admin_username = call.from_user.username or f"Admin ({call.message.chat.id})"
-        user_info = bot.get_chat(user_id)
-        username = user_info.username or f"ID: {user_id}"
-
-        # Escape Markdown characters in the usernames
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
-        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
-
-        for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has rejected payment from PTA member @{username}.", parse_mode="Markdown")
-
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Unexpected error rejecting payment: {e}")
 
 def safe_markdown_escape(text):
     """
