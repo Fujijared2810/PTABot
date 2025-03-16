@@ -1913,8 +1913,12 @@ def start_bot():
     while True:
         try:
             logging.info("Starting the bot...")
+            
+            # Add these lines to help prevent the 409 conflict error
+            bot.delete_webhook()  # Ensure no webhooks are active
+            time.sleep(3)  # Wait a moment to ensure previous connections are closed
+            
             bot.polling()
-            time.sleep(3)
             logging.info("Bot is online")
         except Exception as e:
             logging.error(f"Error occurred: {e}")
