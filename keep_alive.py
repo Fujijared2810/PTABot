@@ -1684,7 +1684,7 @@ DASHBOARD_TEMPLATE = '''
         // Add export button loading state
         document.addEventListener('DOMContentLoaded', function() {
             // Export duration in milliseconds - can be adjusted as needed
-            const exportDuration = 9000; // 2 seconds for faster feedback
+            const exportDuration = 3000; // 2 seconds for faster feedback
             
             const exportBtn = document.querySelector('a[href="/export/members.csv"]');
             
