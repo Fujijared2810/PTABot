@@ -2037,9 +2037,9 @@ def login():
         username = request.form['username']
         password = request.form['password']
         
-        # Get admin credentials from environment variables
-        admin_usernames = os.getenv('ADMIN_USERNAMES').split(',')
-        admin_passwords = os.getenv('ADMIN_PASSWORDS').split(',')
+        # Get admin credentials from environment variables using the SINGULAR names
+        admin_usernames = os.getenv('ADMIN_USERNAME', 'admin').split(',')
+        admin_passwords = os.getenv('ADMIN_PASSWORD', '1234').split(',')
         
         # Create a dictionary of valid username-password pairs
         valid_credentials = {
