@@ -16,7 +16,7 @@ from pymongo import MongoClient
 from keep_alive import keep_alive
 
 
-BOT_VERSION = "Alpha Release 3.0"
+BOT_VERSION = "Alpha Release 4.0"
 
 load_dotenv()
 
@@ -907,7 +907,7 @@ def send_payment_reminder():
     logging.info("Payment reminder thread started")
     
     # Define specific times of day to send reminders (24-hour format in Philippines timezone)
-    REMINDER_TIMES = ["09:00", "21:00"]  # 9:00 AM and 9:00 PM
+    REMINDER_TIMES = ["09:00"]  # 9:00 AM and 9:00 PM
     
     # Track the last day we sent reminders to avoid duplicate sends
     last_reminder_dates = {time: None for time in REMINDER_TIMES}
@@ -1850,23 +1850,14 @@ def refresh_mongodb_data():
     """Refresh all data from MongoDB to ensure it's up to date."""
     global PAYMENT_DATA, CONFIRMED_OLD_MEMBERS, PENDING_USERS, CHANGELOGS
     
-    logging.info("Refreshing data from MongoDB...")
-    
     try:
         PAYMENT_DATA = load_payment_data()
-        logging.info(f"Refreshed payment data: {len(PAYMENT_DATA)} records")
         
         CONFIRMED_OLD_MEMBERS = load_confirmed_old_members()
-        logging.info(f"Refreshed old members: {len(CONFIRMED_OLD_MEMBERS)} records")
         
         PENDING_USERS = load_pending_users()
-        logging.info(f"Refreshed pending users: {len(PENDING_USERS)} records")
         
         CHANGELOGS = load_changelogs()
-        user_logs = len(CHANGELOGS.get('user', []))
-        admin_logs = len(CHANGELOGS.get('admin', []))
-        logging.info(f"Refreshed changelogs: {user_logs} user, {admin_logs} admin records")
-        
         logging.info("MongoDB data refresh completed successfully")
     except Exception as e:
         logging.error(f"Error refreshing MongoDB data: {e}")
