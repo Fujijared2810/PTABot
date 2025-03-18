@@ -13,6 +13,9 @@ import sys
 import pytz
 import pymongo
 from pymongo import MongoClient
+import random
+import secrets  # Using secrets module for more secure randomness
+from datetime import datetime
 from keep_alive import keep_alive
 
 
@@ -36,6 +39,7 @@ payment_collection = db['payments']
 old_members_collection = db['old_members']
 pending_collection = db['pending']
 changelog_collection = db['changelogs']
+settings_collection = db['settings']
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -79,6 +83,28 @@ console_handler.setFormatter(formatter)
 # Add handlers to logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+def load_settings():
+    """Load bot settings from MongoDB."""
+    try:
+        settings = settings_collection.find_one({'_id': 'bot_settings'})
+        if settings:
+            return {k: v for k, v in settings.items() if k != '_id'}
+        return {}  # Return empty dict if no settings found
+    except Exception as e:
+        logging.error(f"MongoDB error loading settings: {e}")
+        return {}
+
+# Add this function to save settings to MongoDB
+def save_settings(settings):
+    """Save bot settings to MongoDB."""
+    try:
+        doc = {'_id': 'bot_settings'}
+        doc.update(settings)
+        settings_collection.replace_one({'_id': 'bot_settings'}, doc, upsert=True)
+        logging.info("Bot settings saved to MongoDB")
+    except Exception as e:
+        logging.error(f"MongoDB save error for settings: {e}")
 
 # Load confirmed old members from MongoDB
 def load_confirmed_old_members():
@@ -184,6 +210,9 @@ PAYMENT_DATA = load_payment_data()
 CONFIRMED_OLD_MEMBERS = load_confirmed_old_members()
 PENDING_USERS = load_pending_users() 
 CHANGELOGS = load_changelogs()
+BOT_SETTINGS = load_settings()
+DAILY_CHALLENGE_TOPIC_ID = BOT_SETTINGS.get('daily_challenge_topic_id', None)
+ANNOUNCEMENT_TOPIC_ID = BOT_SETTINGS.get('announcement_topic_id', None)
 #migrate_data_to_mongodb()
 
 ### COMMAND HANDLERS ###
@@ -799,6 +828,57 @@ def callback_approve_payment(call):
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Unexpected error approving payment: {e}")
 
+
+@bot.message_handler(content_types=['new_chat_members'])
+def welcome_new_members(message):
+    """Welcome new members when they join the group"""
+    try:
+        # Only activate in the paid group
+        if message.chat.id != PAID_GROUP_ID:
+            return
+            
+        # Process all new members (in case multiple users join at once)
+        for new_member in message.new_chat_members:
+            # Skip the bot itself
+            if new_member.id == bot.get_me().id:
+                continue
+                
+            # Get user's name - use first name, or username as fallback
+            user_name = new_member.first_name or new_member.username or "New member"
+            # Escape any special Markdown characters
+            user_name = safe_markdown_escape(user_name)
+            
+            # Send welcome message
+            welcome_message = (
+                f"🎉 *Welcome to Prodigy Trading Academy, {user_name}!* 🎉\n\n"
+                f"We're excited to have you join our trading community. "
+                f"Here you'll find valuable insights, daily challenges, and a supportive network of fellow traders.\n\n"
+                f"📊 *Daily challenges* are posted at 8:00 AM PH time\n"
+                f"💡 *Expert guidance* from our community\n"
+                f"📚 *Learning resources* to improve your skills\n\n"
+                f"If you have any questions, our mentors are here to help!\n"
+                f"Happy Trading! 📈"
+            )
+            
+            # Send the welcome message directly to the group
+            try:
+                bot.send_message(
+                    message.chat.id, 
+                    welcome_message,
+                    parse_mode="Markdown"
+                )
+                    
+                logging.info(f"Sent welcome message for new member {new_member.id} ({user_name})")
+            except ApiException as e:
+                # If Markdown fails, try without formatting
+                logging.error(f"Failed to send welcome with Markdown: {e}")
+                bot.send_message(
+                    message.chat.id, 
+                    welcome_message.replace('*', '')
+                )
+    except Exception as e:
+        logging.error(f"Error in welcome_new_members: {e}")
+
 def safe_markdown_escape(text):
     """
     Comprehensive function to safely escape ANY text for Telegram Markdown
@@ -1030,129 +1110,27 @@ reminder_thread.start()
 
 @bot.message_handler(commands=['admin_dashboard'])
 def admin_dashboard(message):
-    if message.chat.id not in ADMIN_IDS:
+    """Send link to the web-based admin dashboard"""
+    # Check if user is authorized (admin or creator)
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
         bot.send_message(message.chat.id, "❌ You are not authorized to use this command.")
         return
 
-    username = message.from_user.username
+    # Get username for logging purposes
+    username = message.from_user.username or f"User {message.from_user.id}"
+    
+    # Send the dashboard link with a simple button
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📋 List Members", callback_data='list_members'))
-    markup.add(InlineKeyboardButton("🔍 Check Payment Status", callback_data='check_payment_status'))
-    markup.add(InlineKeyboardButton("🔄 Update Payment Status", callback_data='update_payment_status'))
-    bot.send_message(message.chat.id, f"👋 Welcome to the Admin Dashboard, @{username}. Choose an option:", reply_markup=markup)
-    PENDING_USERS[message.chat.id] = {'status': 'admin_dashboard'}
-    save_pending_users()
-
-@bot.callback_query_handler(func=lambda call: PENDING_USERS.get(call.message.chat.id, {}).get('status') == 'admin_dashboard')
-def handle_admin_dashboard(call):
-    chat_id = call.message.chat.id
-    option = call.data
-
-    if option == 'list_members':
-        # Build member list with proper escaping
-        members_list = []
-        for user_id, data in PAYMENT_DATA.items():
-            # Get username and escape special Markdown characters
-            username = data.get('username', 'No Username')
-            if username:
-                username = username.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
-            
-            # Format member info
-            member_info = f"🔹 User ID: `{user_id}`\n   Username: @{username}\n   Paid: {'✅' if data.get('haspayed', False) else '❌'}"
-            members_list.append(member_info)
-        
-        # Split into chunks to avoid message size limits
-        MAX_LENGTH = 3000  # Safe limit for Telegram messages
-        members_text = "\n\n".join(members_list)
-        
-        if len(members_text) <= MAX_LENGTH:
-            bot.send_message(chat_id, f"📋 **Members List**:\n\n{members_text}", parse_mode='Markdown')
-        else:
-            # Send in multiple messages if too long
-            chunks = []
-            current_chunk = []
-            current_length = 0
-            
-            for member in members_list:
-                if current_length + len(member) + 2 > MAX_LENGTH:
-                    chunks.append("\n\n".join(current_chunk))
-                    current_chunk = [member]
-                    current_length = len(member)
-                else:
-                    current_chunk.append(member)
-                    current_length += len(member) + 2  # +2 for "\n\n"
-            
-            if current_chunk:
-                chunks.append("\n\n".join(current_chunk))
-            
-            for i, chunk in enumerate(chunks):
-                bot.send_message(
-                    chat_id, 
-                    f"📋 **Members List (Part {i+1}/{len(chunks)}):**\n\n{chunk}", 
-                    parse_mode='Markdown'
-                )
-    elif option == 'check_payment_status':
-        bot.send_message(chat_id, "🔍 Please enter the user ID to check payment status:")
-        PENDING_USERS[chat_id]['status'] = 'check_payment_status'
-        save_pending_users()
-    elif option == 'update_payment_status':
-        bot.send_message(chat_id, "🔄 Please enter the user ID to update payment status:")
-        PENDING_USERS[chat_id]['status'] = 'update_payment_status'
-        save_pending_users()
-    else:
-        bot.send_message(chat_id, "❌ Invalid option. Please select from the available options.")
-
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'check_payment_status')
-def check_payment_status(message):
-    chat_id = message.chat.id
-    user_id = message.text
-
-    if user_id in PAYMENT_DATA:
-        data = PAYMENT_DATA[user_id]
-        # Escape any markdown characters in the username
-        username = data.get('username', 'No Username')
-        if username:
-            username = username.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
-            
-        bot.send_message(
-            chat_id, 
-            f"🔍 **User ID**: `{user_id}`\n**Username**: @{username}\n**Paid**: {'✅' if data.get('haspayed', False) else '❌'}\n**Due Date**: {data.get('due_date', 'Not set')}", 
-            parse_mode='Markdown'
-        )
-    else:
-        bot.send_message(chat_id, "❌ User not found.")
-    PENDING_USERS.pop(chat_id, None)
-    save_pending_users()
-
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'update_payment_status')
-def update_payment_status(message):
-    chat_id = message.chat.id
-    user_id = message.text
-
-    if user_id in PAYMENT_DATA:
-        PAYMENT_DATA[user_id]['haspayed'] = not PAYMENT_DATA[user_id].get('haspayed', False)
-        save_payment_data()
-        # Escape user_id for markdown if needed
-        safe_user_id = user_id.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`').replace('[', '\\[')
-        bot.send_message(chat_id, f"✅ Payment status for user ID `{safe_user_id}` has been updated.", parse_mode='Markdown')
-    else:
-        bot.send_message(chat_id, "❌ User not found.")
-    PENDING_USERS.pop(chat_id, None)
-    save_pending_users()
-
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'update_payment_status')
-def update_payment_status(message):
-    chat_id = message.chat.id
-    user_id = message.text
-
-    if user_id in PAYMENT_DATA:
-        PAYMENT_DATA[user_id]['haspayed'] = not PAYMENT_DATA[user_id]['haspayed']
-        save_payment_data()
-        bot.send_message(chat_id, f"✅ Payment status for user ID `{user_id}` has been updated.", parse_mode='Markdown')
-    else:
-        bot.send_message(chat_id, "❌ User not found.")
-    PENDING_USERS.pop(chat_id, None)
-    save_pending_users()
+    markup.add(InlineKeyboardButton("🔐 Open Admin Dashboard", url="https://ptabot.onrender.com/dashboard"))
+    
+    bot.send_message(
+        message.chat.id,
+        "Click the button below to access the admin dashboard:",
+        reply_markup=markup
+    )
+    
+    # Log the access
+    logging.info(f"Admin dashboard accessed by {username} ({message.from_user.id})")
 
 @bot.message_handler(commands=['ping'])
 def handle_ping_command(message):
@@ -1220,8 +1198,8 @@ def handle_tip_command(message):
             "💸 *Crypto Payments*:\n\n"
             "*USDT (TRC20)*: `TV9K3DwWLufYU5yeyXZYCtB3QNX1s983wD`\n\n"
             "*Bitcoin*: `3H7uF4H29cqDiUGNd7M9tpWashEfN8a3wP`\n\n"
-            "☕ *Buy Me a Coffee*:\n"
-            "[Buy Me a Coffee](buymeacoffee.com/fujii)"
+            "📱 *GCash*:\n"
+            "GCash Number: `09763624531` (J. M.)"
         )
         bot.send_message(message.chat.id, tip_message, parse_mode='Markdown')
     else:
@@ -1499,20 +1477,39 @@ def post_changelog_to_group(call):
     changelog = CHANGELOGS["user"][changelog_index]
     
     try:
-        bot.send_message(
-            PAID_GROUP_ID,
-            f"📢 *IMPORTANT UPDATE*\n\n{changelog['content']}\n\n🕒 Posted: {changelog['timestamp']}",
-            parse_mode="Markdown"
-        )
-        bot.answer_callback_query(call.id, "✅ Posted to group successfully!")
-        bot.edit_message_text(
-            "Changelog posted to group successfully!",
-            call.message.chat.id,
-            call.message.message_id
-        )
+        # Send to the announcement topic if configured, otherwise to main group
+        if ANNOUNCEMENT_TOPIC_ID:
+            bot.send_message(
+                PAID_GROUP_ID,
+                f"📢 *IMPORTANT UPDATE*\n\n{changelog['content']}\n\n🕒 Posted: {changelog['timestamp']}",
+                parse_mode="Markdown",
+                message_thread_id=ANNOUNCEMENT_TOPIC_ID
+            )
+            bot.answer_callback_query(call.id, f"✅ Posted to announcements topic (ID: {ANNOUNCEMENT_TOPIC_ID}) successfully!")
+            bot.edit_message_text(
+                f"Changelog posted to announcements topic (ID: {ANNOUNCEMENT_TOPIC_ID}) successfully!",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            logging.info(f"Posted changelog to announcement topic {ANNOUNCEMENT_TOPIC_ID}")
+        else:
+            # Original behavior - post to main group
+            bot.send_message(
+                PAID_GROUP_ID,
+                f"📢 *IMPORTANT UPDATE*\n\n{changelog['content']}\n\n🕒 Posted: {changelog['timestamp']}",
+                parse_mode="Markdown"
+            )
+            bot.answer_callback_query(call.id, "✅ Posted to group successfully!")
+            bot.edit_message_text(
+                "Changelog posted to main group successfully!",
+                call.message.chat.id,
+                call.message.message_id
+            )
+            logging.info("Posted changelog to main group (no topic ID set)")
     except Exception as e:
         bot.answer_callback_query(call.id, "❌ Failed to post to group.")
         bot.send_message(call.message.chat.id, f"Error: {str(e)}")
+        logging.error(f"Error posting changelog: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel_group_post")
 def cancel_group_post(call):
@@ -1567,6 +1564,93 @@ def send_user_changelogs(chat_id):
         plain_message += f"🕒 {log['timestamp']}\n{log['content']}\n\n"
     
     bot.send_message(chat_id, plain_message)
+
+@bot.message_handler(commands=['setannouncementtopic'])
+def set_announcement_topic(message):
+    """Set or change the topic ID for announcements"""
+    global ANNOUNCEMENT_TOPIC_ID
+    
+    # Only allow the creator to use this command
+    if message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to the bot creator.")
+        return
+    
+    # Extract topic ID from command arguments
+    args = message.text.split()
+    
+    # Show current setting if no arguments provided
+    if len(args) == 1:
+        current_topic = ANNOUNCEMENT_TOPIC_ID if ANNOUNCEMENT_TOPIC_ID else "Not set (using main group)"
+        bot.reply_to(message, f"Current announcement topic ID: `{current_topic}`\n\nTo change, use: `/setannouncementtopic ID`", parse_mode="Markdown")
+        return
+        
+    try:
+        # Handle "clear" or "reset" to remove topic ID
+        if args[1].lower() in ["clear", "reset", "none"]:
+            ANNOUNCEMENT_TOPIC_ID = None
+            # Save to database
+            BOT_SETTINGS['announcement_topic_id'] = None
+            save_settings(BOT_SETTINGS)
+            bot.reply_to(message, "✅ Announcements will now be sent to the main group chat.")
+            return
+            
+        # Try to parse as integer
+        new_topic_id = int(args[1])
+        ANNOUNCEMENT_TOPIC_ID = new_topic_id
+        
+        # Save to database
+        BOT_SETTINGS['announcement_topic_id'] = new_topic_id
+        save_settings(BOT_SETTINGS)
+        
+        bot.reply_to(message, f"✅ Announcements will now be sent to topic ID: `{new_topic_id}`\nThis setting has been saved to the database.", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid topic ID. Please provide a numeric ID or 'clear' to reset.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error setting topic ID: {str(e)}")
+
+# Modify the post_changelog_to_group function to use the announcement topic ID
+@bot.callback_query_handler(func=lambda call: call.data.startswith("post_group_changelog_"))
+def post_changelog_to_group(call):
+    if call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ Only the creator can post changelogs to the group.")
+        return
+        
+    changelog_index = int(call.data.split("_")[3])
+    changelog = CHANGELOGS["user"][changelog_index]
+    
+    try:
+        # Send to the announcement topic if configured, otherwise to main group
+        if ANNOUNCEMENT_TOPIC_ID:
+            bot.send_message(
+                PAID_GROUP_ID,
+                f"📢 *IMPORTANT UPDATE*\n\n{changelog['content']}\n\n🕒 Posted: {changelog['timestamp']}",
+                parse_mode="Markdown",
+                message_thread_id=ANNOUNCEMENT_TOPIC_ID
+            )
+            bot.answer_callback_query(call.id, "✅ Posted to announcements topic successfully!")
+            bot.edit_message_text(
+                f"Changelog posted to announcements topic (ID: {ANNOUNCEMENT_TOPIC_ID}) successfully!",
+                call.message.chat.id,
+                call.message.message_id
+            )
+        else:
+            # Original behavior - post to main group
+            bot.send_message(
+                PAID_GROUP_ID,
+                f"📢 *IMPORTANT UPDATE*\n\n{changelog['content']}\n\n🕒 Posted: {changelog['timestamp']}",
+                parse_mode="Markdown"
+            )
+            bot.answer_callback_query(call.id, "✅ Posted to group successfully!")
+            bot.edit_message_text(
+                "Changelog posted to group successfully!",
+                call.message.chat.id,
+                call.message.message_id
+            )
+    except Exception as e:
+        bot.answer_callback_query(call.id, "❌ Failed to post to group.")
+        bot.send_message(call.message.chat.id, f"Error: {str(e)}")
+
 
 @bot.message_handler(commands=['check'])
 def check_mongodb_connection(message):
@@ -1880,6 +1964,385 @@ def mongodb_refresh_thread():
 refresh_thread = threading.Thread(target=mongodb_refresh_thread)
 refresh_thread.daemon = True
 refresh_thread.start()
+
+
+# Define challenge content
+SELF_IMPROVEMENT_CHALLENGES = [
+    {"type": "ACTION", "content": "Meditate for 10 minutes today"},
+    {"type": "ACTION", "content": "Practice mindful breathing (5 minute deep breathing)"},
+    {"type": "QUESTION", "content": "What is one habit you want to build, and why?"},
+    {"type": "QUESTION", "content": "Give 5 things you are grateful for today (no repeats)"},
+    {"type": "QUESTION", "content": "What did you learn about yourself this week?"},
+    {"type": "QUESTION", "content": "What is one small win you can celebrate today?"}
+]
+
+TRADING_CHALLENGES = [
+    {"type": "ACTION", "content": "Watch the movements of a pair for at least 5 minutes"},
+    {"type": "ACTION", "content": "Revisit your trading rules for 3 minutes"},
+    {"type": "QUESTION", "content": "Review your last trade (profits, pips, tell us how it went)"},
+    {"type": "QUESTION", "content": "Journal one key takeaway from today or yesterday's session"},
+    {"type": "QUESTION", "content": "Write about how you felt after your latest win / loss"},
+    {"type": "QUESTION", "content": "Write about how you felt during your latest trade"},
+    {"type": "QUESTION", "content": "Review your latest loss and what you can learn"}
+]
+
+TRADING_PAIRS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "NZD/USD", "USD/CAD", 
+    "EUR/GBP", "EUR/JPY", "EUR/CHF", "GBP/JPY", "GBP/CHF", "AUD/JPY", "NZD/JPY",
+    "USD/SGD", "EUR/AUD", "AUD/CAD", "CAD/JPY", "CHF/JPY", "AUD/NZD", "XAU/USD", "XAG/USD"
+]
+
+CHART_ANALYSIS_INSTRUCTIONS = """
+Look for:
+- Key support / resistance areas
+- Trends in the market
+- Current market sentiment (bullish, bearish, or stagnant?)
+- Possible buy areas
+- Possible sell areas
+Check in the 5m, 15m, and 1h timeframe. Send the screenshot of the 15M timeframe of your analysis.
+"""
+
+def generate_daily_challenge():
+    """Generate a truly random daily challenge from the predefined lists."""
+    
+    # Get today's date with enhanced formatting including day of week
+    now = datetime.now(pytz.timezone('Asia/Manila'))
+    today = now.strftime("%A, %B %d, %Y").upper()  # Adds day of week (e.g., "MONDAY, MARCH 18, 2025")
+    
+    # For true randomization, reseed the random generator each time
+    random.seed(secrets.randbits(128))
+    
+    # Select a random self-improvement challenge
+    self_improvement = random.choice(SELF_IMPROVEMENT_CHALLENGES)
+    
+    # Select a random trading challenge
+    trading = random.choice(TRADING_CHALLENGES)
+    
+    # Select a random trading pair for chart analysis
+    pair = random.choice(TRADING_PAIRS)
+    
+    # Format the message with enhanced styling
+    message = f"📆 {today}\n"
+    message += f"𝗗𝗔𝗜𝗟𝗬 𝗖𝗛𝗔𝗟𝗟𝗘𝗡𝗚𝗘𝗦\n\n"
+    
+    message += f"💪 *SELF-IMPROVEMENT* (10 POINTS)\n"
+    message += f"▫️ *{self_improvement['type']}:* {self_improvement['content']}\n\n"
+    
+    message += f"📈 *TRADING-RELATED* (10 POINTS)\n"
+    message += f"▫️ *{trading['type']}:* {trading['content']}\n\n"
+    
+    message += f"💻 *DAILY CHARTING* (20 POINTS)\n"
+    message += f"▫️ *Pair:* {pair}\n"
+    message += CHART_ANALYSIS_INSTRUCTIONS
+    
+    message += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    message += f"⭐ Complete all challenges for 40 TOTAL POINTS!\n"
+    message += f"📸 Share your progress in the chat to earn points!"
+    
+    return message
+
+def send_daily_challenges():
+    """Send daily challenges to the group at a specified time."""
+    logging.info("Daily challenges thread started")
+    
+    # Track the last day we sent a challenge to avoid duplicates
+    last_challenge_date = None
+    
+    while True:
+        try:
+            now = datetime.now(pytz.timezone('Asia/Manila'))
+            current_time = now.strftime('%H:%M')
+            current_date = now.strftime('%Y-%m-%d')
+            
+            # Send challenge at 8:00 AM Philippine time every day
+            # Only if we haven't already sent one today
+            if current_time == '08:00' and last_challenge_date != current_date:
+                # Only proceed if it's a weekday (Monday=0, Sunday=6)
+                is_weekday = now.weekday() < 5  # 0-4 are Monday to Friday
+                
+                if is_weekday:
+                    challenge_message = generate_daily_challenge()
+                    
+                    # Send to specific topic if configured, otherwise to main group
+                    # Add parse_mode="Markdown" to both cases
+                    if DAILY_CHALLENGE_TOPIC_ID:
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            challenge_message, 
+                            message_thread_id=DAILY_CHALLENGE_TOPIC_ID,
+                            parse_mode="Markdown"  # Add this parameter for formatting
+                        )
+                        logging.info(f"Sent daily challenge to topic {DAILY_CHALLENGE_TOPIC_ID} at {current_time} Philippine time.")
+                    else:
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            challenge_message,
+                            parse_mode="Markdown"  # Add this parameter for formatting
+                        )
+                        logging.info(f"Sent daily challenge to main group at {current_time} Philippine time.")
+                    
+                    # Update the last challenge date
+                    last_challenge_date = current_date
+                else:
+                    logging.info(f"Skipped daily challenge: Weekend.")
+            
+            # Calculate the time to sleep until the start of the next minute
+            sleep_time = 60 - now.second - now.microsecond / 1_000_000
+            time.sleep(sleep_time)
+            
+        except Exception as e:
+            logging.error(f"Failed to send daily challenge: {e}")
+            time.sleep(60)  # Wait a minute on error before trying again
+
+# Command to manually trigger a daily challenge (for testing or admin use)
+@bot.message_handler(commands=['challenge'])
+def manual_challenge(message):
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    try:
+        challenge_message = generate_daily_challenge()
+        
+        # Send to the group chat if command is used in a group
+        if message.chat.type in ['group', 'supergroup']:
+            # Check if we should send to a specific topic
+            if DAILY_CHALLENGE_TOPIC_ID and message.chat.id == PAID_GROUP_ID:
+                bot.send_message(
+                    message.chat.id, 
+                    challenge_message,
+                    message_thread_id=DAILY_CHALLENGE_TOPIC_ID,
+                    parse_mode="Markdown"  # Add this parameter for formatting
+                )
+            else:
+                # Send to whatever chat or topic the command was used in
+                thread_id = message.message_thread_id if hasattr(message, 'message_thread_id') else None
+                bot.send_message(
+                    message.chat.id, 
+                    challenge_message,
+                    message_thread_id=thread_id,
+                    parse_mode="Markdown"  # Add this parameter for formatting
+                )
+        # Otherwise send to the admin who requested it
+        else:
+            bot.send_message(
+                message.chat.id, 
+                challenge_message,
+                parse_mode="Markdown"  # Add this parameter for formatting
+            )
+            
+        bot.reply_to(message, "✅ Challenge generated and sent successfully!")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error generating challenge: {e}")
+
+# Command to set the daily challenge topic ID
+@bot.message_handler(commands=['setchallengetopic'])
+def set_challenge_topic(message):
+    """Set or change the topic ID for daily challenges"""
+    global DAILY_CHALLENGE_TOPIC_ID
+    
+    # Only allow the creator to use this command
+    if message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to the bot creator.")
+        return
+    
+    # Extract topic ID from command arguments
+    args = message.text.split()
+    
+    # Show current setting if no arguments provided
+    if len(args) == 1:
+        current_topic = DAILY_CHALLENGE_TOPIC_ID if DAILY_CHALLENGE_TOPIC_ID else "Not set (using main group)"
+        bot.reply_to(message, f"Current daily challenge topic ID: `{current_topic}`\n\nTo change, use: `/setchallengetopic ID`", parse_mode="Markdown")
+        return
+        
+    try:
+        # Handle "clear" or "reset" to remove topic ID
+        if args[1].lower() in ["clear", "reset", "none"]:
+            DAILY_CHALLENGE_TOPIC_ID = None
+            # Save to database
+            BOT_SETTINGS['daily_challenge_topic_id'] = None
+            save_settings(BOT_SETTINGS)
+            bot.reply_to(message, "✅ Daily challenges will now be sent to the main group chat.")
+            return
+            
+        # Try to parse as integer
+        new_topic_id = int(args[1])
+        DAILY_CHALLENGE_TOPIC_ID = new_topic_id
+        
+        # Save to database
+        BOT_SETTINGS['daily_challenge_topic_id'] = new_topic_id
+        save_settings(BOT_SETTINGS)
+        
+        bot.reply_to(message, f"✅ Daily challenges will now be sent to topic ID: `{new_topic_id}`\nThis setting has been saved to the database.", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid topic ID. Please provide a numeric ID or 'clear' to reset.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error setting topic ID: {str(e)}")
+
+@bot.message_handler(commands=['gettopic'])
+def get_topic_id(message):
+    """Command to get the topic ID of the current chat or topic."""
+    # Check if user is the creator (not available to admins)
+    if message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to the bot creator.")
+        return
+    
+    try:
+        # Check if message was sent in a group
+        if message.chat.type not in ['group', 'supergroup']:
+            bot.reply_to(message, "❌ This command only works in group chats with topics enabled.")
+            return
+            
+        # Get the chat ID and topic ID
+        chat_id = message.chat.id
+        topic_id = message.message_thread_id if hasattr(message, 'message_thread_id') else None
+        
+        # Get chat title
+        chat_title = message.chat.title
+        
+        # Send a brief acknowledgment in the group
+        bot.reply_to(message, "📝 Topic information has been sent to your DM for privacy.")
+        
+        # Send the detailed information in a direct message
+        if topic_id:
+            bot.send_message(
+                message.from_user.id, 
+                f"📌 *Topic Information*\n\n"
+                f"*Chat Title:* {chat_title}\n"
+                f"*Chat ID:* `{chat_id}`\n\n"
+                f"*Topic ID:* `{topic_id}`\n\n",
+                parse_mode="Markdown"
+            )
+        else:
+            bot.send_message(
+                message.from_user.id,
+                f"📌 *Main Group Information*\n\n"
+                f"*Chat Title:* {chat_title}\n"
+                f"*Chat ID:* `{chat_id}`\n\n"
+                f"This message is in the main group chat (not in a topic).\n\n",
+                parse_mode="Markdown"
+            )
+            
+    except ApiException as e:
+        logging.error(f"Error in get_topic_id: {e}")
+        if "bot can't initiate conversation with a user" in str(e):
+            bot.reply_to(message, "❌ I couldn't send you a DM. Please start a conversation with me first by messaging me directly.")
+        else:
+            bot.reply_to(message, f"❌ Error retrieving topic information: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error in get_topic_id: {e}")
+        bot.reply_to(message, f"❌ Error retrieving topic information: {str(e)}")
+        
+
+# Start the daily challenge thread
+daily_challenge_thread = threading.Thread(target=send_daily_challenges, daemon=True)
+daily_challenge_thread.start()
+
+@bot.message_handler(commands=['jarvis'])
+def handle_jarvis_command(message):
+    """Send a Jarvis image to the group chat"""
+    if message.chat.type not in ['group', 'supergroup']:
+        bot.reply_to(message, "❌ This command can only be used in group chats.")
+        return
+        
+    try:
+        # Path to the Jarvis image
+        jarvis_image = "gifs/jarvis.png"  # Using existing GIFs directory
+        
+        # Send the image without caption
+        with open(jarvis_image, 'rb') as photo:
+            bot.send_photo(message.chat.id, photo)
+            logging.info(f"Sent Jarvis image in chat {message.chat.id} (requested by {message.from_user.id})")
+    except FileNotFoundError:
+        bot.reply_to(message, "❌ Image not found.")
+        logging.warning(f"Jarvis image not found (requested by {message.from_user.id})")
+    except Exception as e:
+        bot.reply_to(message, "❌ Error sending image.")
+        logging.error(f"Error in Jarvis command: {e}")
+
+@bot.message_handler(commands=['commands'])
+def list_available_commands(message):
+    """Send the user a list of available commands based on their permission level"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Define commands by permission level
+    user_commands = [
+        ("/start", "Begin the bot interaction or return to main menu"),
+        ("/verify", "Submit payment proof for verification"),
+        ("/dashboard", "View your membership status and details"),
+        ("/ping", "Check if the bot is online"),
+        ("/tip", "Support the bot creator"),
+        ("/jarvis", "Display the Jarvis AI image"),
+        ("/changelogs", "View recent updates to the bot/academy")
+    ]
+    
+    admin_commands = [
+        ("/notify", "Send payment reminders to users near expiration"),
+        ("/challenge", "Manually trigger a daily challenge"),
+        ("/admin_dashboard", "Access admin controls"),
+    ]
+    
+    creator_commands = [
+        ("/post_changelog", "Create and post a new changelog"),
+        ("/gettopic", "Get the topic ID of the current chat topic"),
+        ("/setchallengetopic", "Set the topic ID for daily challenges"),
+        ("/setannouncementtopic", "Set the topic ID for announcements"),
+        ("/remove", "Remove yourself from pending users list"),
+        ("/check", "Check MongoDB connection status")
+    ]
+    
+    # Check if we're in a group chat - if so, tell the user we've sent a DM
+    if message.chat.type in ['group', 'supergroup']:
+        bot.reply_to(message, "📝 I've sent you a list of available commands in a private message.")
+    
+    try:
+        # Determine which commands to show based on permission level
+        is_admin = user_id in ADMIN_IDS
+        is_creator = user_id == CREATOR_ID
+        
+        # Format the command list message
+        message_text = "🤖 *AVAILABLE COMMANDS*\n\n"
+        
+        # Add user commands for everyone
+        message_text += "*General User Commands:*\n"
+        for cmd, desc in user_commands:
+            message_text += f"`{cmd}` - {desc}\n"
+        
+        # For admins and creator, show ALL commands for transparency
+        if is_admin or is_creator:
+            message_text += "\n*Admin Commands:*\n"
+            for cmd, desc in admin_commands:
+                message_text += f"`{cmd}` - {desc}\n"
+            
+            message_text += "\n*Creator Commands:*\n"
+            for cmd, desc in creator_commands:
+                message_text += f"`{cmd}` - {desc}\n"
+            
+            # Additional note for admins
+            if is_admin and not is_creator:
+                message_text += "\n*Note:* Creator commands are shown for transparency but can only be used by the bot creator."
+        
+        # Send the message
+        bot.send_message(
+            user_id,  # Send as DM to the user
+            message_text,
+            parse_mode="Markdown"
+        )
+        
+        logging.info(f"Sent command list to user {user_id}")
+        
+    except ApiException as e:
+        # Handle case where bot can't DM the user
+        if "bot can't initiate conversation with a user" in str(e):
+            bot.reply_to(message, "❌ I couldn't send you a DM. Please start a conversation with me first by sending /start in a private chat.")
+        else:
+            bot.reply_to(message, f"❌ Error sending command list: {str(e)}")
+        logging.error(f"Failed to send command list to user {user_id}: {e}")
+    except Exception as e:
+        bot.reply_to(message, "❌ An error occurred while processing your request.")
+        logging.error(f"Error in list_available_commands: {e}")
 
 keep_alive()
 # Function to start the bot with auto-restart
