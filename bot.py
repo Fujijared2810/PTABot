@@ -43,6 +43,7 @@ changelog_collection = db['changelogs']
 settings_collection = db['settings']
 scores_collection = db['scores']  # For storing user scores
 accountability_collection = db['accountability']  # For tracking submissions
+reminder_messages_collection = db['reminder_messages']
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -86,6 +87,46 @@ console_handler.setFormatter(formatter)
 # Add handlers to logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+def load_reminder_messages():
+    """Load reminder messages from MongoDB."""
+    try:
+        messages = {}
+        for doc in reminder_messages_collection.find():
+            user_id = int(doc['_id'])
+            messages[user_id] = {
+                'user_msg_id': doc.get('user_msg_id'),
+                'admin_msg_ids': doc.get('admin_msg_ids', {})
+            }
+        logging.info(f"Loaded {len(messages)} reminder messages from MongoDB")
+        return messages
+    except Exception as e:
+        logging.error(f"MongoDB error loading reminder messages: {e}")
+        return {}
+
+def save_reminder_message(user_id, data):
+    """Save a single reminder message to MongoDB."""
+    try:
+        # Convert user_id to string for MongoDB _id
+        doc = {'_id': str(user_id)}
+        doc.update(data)
+        
+        # Use upsert to update if exists or insert if new
+        reminder_messages_collection.replace_one({'_id': str(user_id)}, doc, upsert=True)
+        logging.info(f"Saved reminder message for user {user_id}")
+    except Exception as e:
+        logging.error(f"MongoDB error saving reminder message for user {user_id}: {e}")
+
+def delete_reminder_message(user_id):
+    """Delete a reminder message from MongoDB."""
+    try:
+        result = reminder_messages_collection.delete_one({'_id': str(user_id)})
+        if result.deleted_count > 0:
+            logging.info(f"Deleted reminder message for user {user_id} from MongoDB")
+        else:
+            logging.info(f"No reminder message for user {user_id} found to delete in MongoDB")
+    except Exception as e:
+        logging.error(f"Error deleting reminder message for user {user_id} from MongoDB: {e}")
 
 def load_settings():
     """Load bot settings from MongoDB."""
@@ -857,8 +898,8 @@ def callback_approve_payment(call):
         username = user_info.username or f"ID: {user_id}"
 
         # Escape Markdown characters in the usernames
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
         username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
 
         for admin_id in ADMIN_IDS:
             bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has approved payment from PTA member @{username}.", parse_mode="Markdown")
@@ -1106,6 +1147,7 @@ def handle_cancel_confirmation(message):
 
     PENDING_USERS.pop(user_id, None)  # Remove from dictionary
     delete_pending_user(user_id)  # Remove from MongoDB
+    
 
 # Function to remind users 3 days before payment deadline
 def escape_markdown(text):
@@ -1116,10 +1158,14 @@ def send_payment_reminder():
     logging.info("Payment reminder thread started")
     
     # Define specific times of day to send reminders (24-hour format in Philippines timezone)
-    REMINDER_TIMES = ["09:00"]  # 9:00 AM and 9:00 PM
+    REMINDER_TIMES = ["09:00"]  # 9:00 AM
     
     # Track the last day we sent reminders to avoid duplicate sends
     last_reminder_dates = {time: None for time in REMINDER_TIMES}
+    
+    # Load reminder messages from MongoDB for persistence
+    global reminder_messages
+    reminder_messages = load_reminder_messages()
     
     while True:
         try:
@@ -1154,23 +1200,144 @@ def send_payment_reminder():
                         # Now both dates are timezone-aware, subtraction will work
                         days_until_due = (due_date - now).days
                         
+                        # Check for users in grace period
+                        if data.get('grace_period', False):
+                            grace_end_date = datetime.strptime(data.get('grace_end_date'), '%Y-%m-%d %H:%M:%S')
+                            grace_end_date = manila_tz.localize(grace_end_date)
+                            
+                            # If grace period has expired
+                            if now >= grace_end_date:
+                                # Delete previous reminders for this user
+                                if user_id in reminder_messages:
+                                    try:
+                                        # Delete previous user reminder
+                                        if 'user_msg_id' in reminder_messages[user_id]:
+                                            bot.delete_message(user_id, reminder_messages[user_id]['user_msg_id'])
+                                    except Exception as e:
+                                        logging.error(f"Failed to delete previous user reminder: {e}")
+                                    
+                                    # Delete previous admin reminders
+                                    for admin_id, msg_id in reminder_messages[user_id].get('admin_msg_ids', {}).items():
+                                        try:
+                                            bot.delete_message(admin_id, msg_id)
+                                        except Exception as e:
+                                            logging.error(f"Failed to delete previous admin reminder: {e}")
+                                
+                                # Notify admins about expired grace period
+                                admin_messages = {}
+                                for admin_id in ADMIN_IDS:
+                                    markup = InlineKeyboardMarkup()
+                                    markup.add(
+                                        InlineKeyboardButton("✓ Kick Member", callback_data=f"kick_{user_id}"),
+                                        InlineKeyboardButton("✗ Keep Member", callback_data=f"keep_{user_id}")
+                                    )
+                                    
+                                    sent_msg = bot.send_message(
+                                        admin_id,
+                                        f"⚠️ *GRACE PERIOD EXPIRED*\n\n"
+                                        f"{user_display}'s grace period has now expired. "
+                                        f"Their membership expired on {due_date.strftime('%Y/%m/%d')}.\n\n"
+                                        f"What would you like to do with this member?",
+                                        parse_mode="Markdown",
+                                        reply_markup=markup
+                                    )
+                                    admin_messages[admin_id] = sent_msg.message_id
+                                
+                                # Store new message IDs
+                                reminder_messages[user_id] = {
+                                    'admin_msg_ids': admin_messages
+                                }
+                                # Save to MongoDB
+                                save_reminder_message(user_id, reminder_messages[user_id])
+                                
+                                # Remove grace period flag after notifying
+                                PAYMENT_DATA[user_id_str]['grace_period'] = False
+                                PAYMENT_DATA[user_id_str]['grace_end_date'] = None
+                                save_payment_data()
+                                
+                                # Skip to next user since we've handled this case
+                                continue
+                        
                         # Send reminders for all users within 3 days of expiry
                         if 0 <= days_until_due <= 3 and data['haspayed'] and not data.get('cancelled', False):
+                            # Debug information about the existing messages for this user
+                            logging.info(f"Processing payment reminder for user {user_id} with {days_until_due} days until due")
+                            if user_id in reminder_messages:
+                                logging.info(f"Found existing reminder messages for user {user_id}: {reminder_messages[user_id]}")
+                            else:
+                                logging.info(f"No existing reminder messages for user {user_id}")
+
+                            # Delete previous reminders for this user
+                            if user_id in reminder_messages:
+                                try:
+                                    # Delete previous user reminder
+                                    if 'user_msg_id' in reminder_messages[user_id]:
+                                        msg_id = reminder_messages[user_id]['user_msg_id']
+                                        logging.info(f"Attempting to delete user message {msg_id} for user {user_id}")
+                                        try:
+                                            bot.delete_message(user_id, msg_id)
+                                            logging.info(f"Successfully deleted message {msg_id} for user {user_id}")
+                                        except ApiException as e:
+                                            error_msg = str(e)
+                                            if "message to delete not found" in error_msg:
+                                                logging.warning(f"Message {msg_id} for user {user_id} already deleted")
+                                            elif "bot was blocked by the user" in error_msg:
+                                                logging.warning(f"Cannot delete message for user {user_id} - user blocked the bot")
+                                            else:
+                                                logging.error(f"Failed to delete previous user reminder: {e}")
+                                except Exception as e:
+                                    logging.error(f"General error in user message deletion for {user_id}: {e}")
+                                
+                                # Delete previous admin reminders
+                                for admin_id, msg_id in reminder_messages[user_id].get('admin_msg_ids', {}).items():
+                                    try:
+                                        logging.info(f"Attempting to delete admin message {msg_id} for admin {admin_id}")
+                                        bot.delete_message(admin_id, msg_id)
+                                        logging.info(f"Successfully deleted admin message {msg_id} for admin {admin_id}")
+                                    except ApiException as e:
+                                        error_msg = str(e)
+                                        if "message to delete not found" in error_msg:
+                                            logging.warning(f"Admin message {msg_id} for admin {admin_id} already deleted")
+                                        else:
+                                            logging.error(f"Failed to delete admin reminder for admin {admin_id}: {e}")
+                                    except Exception as e:
+                                        logging.error(f"General error in admin message deletion for admin {admin_id}: {e}")
+                            
                             try:
                                 # Send reminder to user
                                 bot.send_chat_action(user_id, 'typing')
-                                bot.send_message(user_id, f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
-                                logging.info(f"Sent payment reminder to user {user_id}")
+                                user_msg = bot.send_message(
+                                    user_id, 
+                                    f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}."
+                                )
+                                logging.info(f"Sent payment reminder to user {user_id}, message ID: {user_msg.message_id}")
                                 
                                 # Send notification to admins
+                                admin_messages = {}
                                 for admin_id in ADMIN_IDS:
-                                    bot.send_message(admin_id, f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days.")
+                                    admin_msg = bot.send_message(
+                                        admin_id, 
+                                        f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days."
+                                    )
+                                    admin_messages[admin_id] = admin_msg.message_id
+                                    logging.info(f"Sent admin notification to {admin_id}, message ID: {admin_msg.message_id}")
+                                
+                                # Store new message IDs with explicit logging
+                                reminder_messages[user_id] = {
+                                    'user_msg_id': user_msg.message_id,
+                                    'admin_msg_ids': admin_messages
+                                }
+                                # Save to MongoDB
+                                save_reminder_message(user_id, reminder_messages[user_id])
+                                logging.info(f"Updated reminder_messages for user {user_id}: {reminder_messages[user_id]}")
                             
                             except ApiException as e:
                                 logging.error(f"Failed to send payment reminder to user {user_id}: {e}")
                                 
+                                # For failed user notifications, still notify admins
+                                admin_messages = {}
                                 for admin_id in ADMIN_IDS:
-                                    bot.send_message(
+                                    admin_msg = bot.send_message(
                                         admin_id, 
                                         f"⚠️ *Failed to send payment reminder*\n\n"
                                         f"Could not send payment reminder to {user_display}.\n"
@@ -1179,40 +1346,107 @@ def send_payment_reminder():
                                         f"Please contact them manually.",
                                         parse_mode="Markdown"
                                     )
+                                    admin_messages[admin_id] = admin_msg.message_id
+                                
+                                # Store only admin message IDs
+                                reminder_messages[user_id] = {
+                                    'admin_msg_ids': admin_messages
+                                }
+                                # Save to MongoDB
+                                save_reminder_message(user_id, reminder_messages[user_id])
                         
                         # Check if membership has expired
-                        elif due_date < now and data['haspayed']:
+                        elif due_date < now and data['haspayed'] and not data.get('grace_period', False):
+                            # Delete previous reminders for this user
+                            if user_id in reminder_messages:
+                                try:
+                                    # Delete previous user reminder
+                                    if 'user_msg_id' in reminder_messages[user_id]:
+                                        bot.delete_message(user_id, reminder_messages[user_id]['user_msg_id'])
+                                except Exception as e:
+                                    logging.error(f"Failed to delete previous user reminder: {e}")
+                                
+                                # Delete previous admin reminders
+                                for admin_id, msg_id in reminder_messages[user_id].get('admin_msg_ids', {}).items():
+                                    try:
+                                        bot.delete_message(admin_id, msg_id)
+                                    except Exception as e:
+                                        logging.error(f"Failed to delete previous admin reminder: {e}")
+                            
                             try:
+                                # Send expiry notice to user
                                 bot.send_chat_action(user_id, 'typing')
-                                bot.send_message(user_id, "❌ Your membership has expired. Please renew your membership to continue accessing our services.")
+                                user_msg = bot.send_message(
+                                    user_id, 
+                                    "❌ Your membership has expired. Please renew your membership to continue accessing our services."
+                                )
                                 logging.info(f"Sent expiry notice to user {user_id}")
                                 
+                                # Update payment data
                                 PAYMENT_DATA[user_id_str]['haspayed'] = False
-                                # Reset the reminder flag when payment expires
                                 PAYMENT_DATA[user_id_str]['reminder_sent'] = False
                                 save_payment_data()
                                 
-                                # Make sure admins are notified about expired memberships
+                                # Send notification to admins with action buttons
+                                admin_messages = {}
                                 for admin_id in ADMIN_IDS:
-                                    bot.send_message(admin_id, f"⚠️ EXPIRED: {user_display}'s membership has expired and has been marked as unpaid in the system.")
+                                    markup = InlineKeyboardMarkup()
+                                    markup.add(
+                                        InlineKeyboardButton("⏳ Give 2 Days Grace", callback_data=f"grace_{user_id}"),
+                                        InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}")
+                                    )
+                                    
+                                    admin_msg = bot.send_message(
+                                        admin_id, 
+                                        f"⚠️ *MEMBERSHIP EXPIRED*\n\n"
+                                        f"{user_display}'s membership has expired and has been marked as unpaid in the system.\n\n"
+                                        f"What would you like to do with this member?",
+                                        parse_mode="Markdown",
+                                        reply_markup=markup
+                                    )
+                                    admin_messages[admin_id] = admin_msg.message_id
+                                
+                                # Store new message IDs
+                                reminder_messages[user_id] = {
+                                    'user_msg_id': user_msg.message_id,
+                                    'admin_msg_ids': admin_messages
+                                }
+                                # Save to MongoDB
+                                save_reminder_message(user_id, reminder_messages[user_id])
                             
                             except ApiException as e:
                                 logging.error(f"Failed to send expiry notice to user {user_id}: {e}")
                                 PAYMENT_DATA[user_id_str]['haspayed'] = False
-                                # Reset the reminder flag when payment expires
                                 PAYMENT_DATA[user_id_str]['reminder_sent'] = False
                                 save_payment_data()
                                 
+                                # Still notify admins with action buttons
+                                admin_messages = {}
                                 for admin_id in ADMIN_IDS:
-                                    bot.send_message(
+                                    markup = InlineKeyboardMarkup()
+                                    markup.add(
+                                        InlineKeyboardButton("⏳ Give 2 Days Grace", callback_data=f"grace_{user_id}"),
+                                        InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}")
+                                    )
+                                    
+                                    admin_msg = bot.send_message(
                                         admin_id, 
-                                        f"⚠️ *Failed to send expiry notice*\n\n"
+                                        f"⚠️ *FAILED TO NOTIFY USER & MEMBERSHIP EXPIRED*\n\n"
                                         f"Could not notify {user_display} about their expired membership.\n"
                                         f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
                                         f"Their membership has been marked as expired in the system.\n\n"
-                                        f"Please contact them manually.",
-                                        parse_mode="Markdown"
+                                        f"What would you like to do with this member?",
+                                        parse_mode="Markdown",
+                                        reply_markup=markup
                                     )
+                                    admin_messages[admin_id] = admin_msg.message_id
+                                
+                                # Store only admin message IDs
+                                reminder_messages[user_id] = {
+                                    'admin_msg_ids': admin_messages
+                                }
+                                # Save to MongoDB
+                                save_reminder_message(user_id, reminder_messages[user_id])
                                     
                     except Exception as e:
                         logging.error(f"Error processing payment reminder for user {user_id_str}: {e}")
@@ -1230,6 +1464,290 @@ def send_payment_reminder():
             
         except Exception as e:
             logging.error(f"Error in payment reminder main loop: {e}")
+            time.sleep(60)  # Wait a minute on error before trying again
+
+# Handle admin clicking "Give Grace Period" button
+@bot.callback_query_handler(func=lambda call: call.data.startswith("grace_"))
+def handle_grace_period(call):
+    """Handle admin clicking the 'Give 2 Days Grace' button"""
+    admin_id = call.from_user.id
+    
+    # Verify the user is an admin
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[1])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', None)
+        else:
+            try:
+                user_info = bot.get_chat(user_id)
+                username = user_info.username
+            except:
+                username = None
+                
+        user_display = f"@{username}" if username else f"User {user_id}"
+        
+        # Calculate grace period end date (2 days from now)
+        now = datetime.now(pytz.timezone('Asia/Manila'))
+        grace_end_date = now + timedelta(days=2)
+        
+        # Update payment data to add grace period
+        if user_id_str in PAYMENT_DATA:
+            PAYMENT_DATA[user_id_str]['grace_period'] = True
+            PAYMENT_DATA[user_id_str]['grace_end_date'] = grace_end_date.strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[user_id_str]['haspayed'] = True  # Temporarily mark as paid during grace period
+            save_payment_data()
+        
+        # Notify the user about the grace period
+        try:
+            bot.send_message(
+                user_id,
+                "⏳ *Grace Period Granted*\n\n"
+                "You have been given a 2-day grace period to renew your membership. "
+                f"Please renew before {grace_end_date.strftime('%Y-%m-%d %I:%M:%S %p')} to avoid being removed from the group.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except:
+            user_notified = False
+        
+        # Update the button to show action was taken
+        bot.edit_message_text(
+            f"✅ *ACTION TAKEN: GRACE PERIOD*\n\n"
+            f"{user_display} has been given a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify ALL admins about this action using direct regex escaping
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} gave {user_display} a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.", parse_mode="Markdown")
+        
+        bot.answer_callback_query(call.id, f"Grace period granted to {user_display} until {grace_end_date.strftime('%Y-%m-%d')}")
+        
+    except Exception as e:
+        logging.error(f"Error in handle_grace_period: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+# Handle admin clicking "Kick Member" button
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kick_"))
+def handle_kick_member(call):
+    """Handle admin clicking the 'Kick Member' button"""
+    admin_id = call.from_user.id
+    
+    # Verify the user is an admin
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract user ID to kick
+    user_id = int(call.data.split("_")[1])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', None)
+        else:
+            try:
+                user_info = bot.get_chat(user_id)
+                username = user_info.username
+            except:
+                username = None
+                
+        user_display = f"@{username}" if username else f"User {user_id}"
+        
+        # First notify the user that they're being removed
+        try:
+            bot.send_message(
+                user_id,
+                "❌ *Your membership has expired*\n\n"
+                "You are being removed from the group because your membership has expired. "
+                "To rejoin, please renew your membership using the /start command.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except:
+            user_notified = False
+        
+        # Try to kick the user from the group
+        try:
+            bot.ban_chat_member(PAID_GROUP_ID, user_id)
+            bot.unban_chat_member(PAID_GROUP_ID, user_id)  # Immediately unban so they can rejoin later
+            kick_successful = True
+        except Exception as e:
+            logging.error(f"Failed to kick user {user_id}: {e}")
+            kick_successful = False
+        
+        # Update the button to show action was taken
+        bot.edit_message_text(
+            f"{'✅' if kick_successful else '❌'} *ACTION TAKEN: KICK MEMBER*\n\n"
+            f"{user_display} has {'been removed from' if kick_successful else 'FAILED to be removed from'} the group.\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify ALL admins about this action using direct regex escaping
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} kicked {user_display} from the group.", parse_mode="Markdown")
+        
+        bot.answer_callback_query(
+            call.id, 
+            f"User {user_display} has {'been kicked' if kick_successful else 'FAILED to be kicked'} from the group."
+        )
+        
+    except Exception as e:
+        logging.error(f"Error in handle_kick_member: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+# Handle admin decision to keep member after grace period expires
+@bot.callback_query_handler(func=lambda call: call.data.startswith("keep_"))
+def handle_keep_member(call):
+    """Handle admin clicking 'Keep Member' after grace period expiry"""
+    admin_id = call.from_user.id
+    
+    # Verify the user is an admin
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[1])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', None)
+        else:
+            try:
+                user_info = bot.get_chat(user_id)
+                username = user_info.username
+            except:
+                username = None
+                
+        user_display = f"@{username}" if username else f"User {user_id}"
+        
+        # Update the button to show action was taken
+        bot.edit_message_text(
+            f"✅ *ACTION TAKEN: KEPT MEMBER*\n\n"
+            f"{user_display} has been allowed to remain in the group despite expired membership.\n"
+            f"Their account is still marked as unpaid in the system.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify ALL admins about this action using direct regex escaping
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} allowed {user_display} to remain in the group despite expired membership.", parse_mode="Markdown")
+        
+        bot.answer_callback_query(call.id, f"Decision recorded: {user_display} will remain in the group")
+        
+    except Exception as e:
+        logging.error(f"Error in handle_keep_member: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+
+def delete_all_reminders():
+    """Function to delete all payment reminder messages at midnight."""
+    logging.info("Midnight cleanup: Deleting all payment reminder messages")
+    
+    global reminder_messages
+    
+    # Make a copy of the keys to avoid modifying dictionary during iteration
+    user_ids = list(reminder_messages.keys())
+    
+    deleted_count = 0
+    failed_count = 0
+    
+    for user_id in user_ids:
+        try:
+            # Delete user message if it exists
+            if 'user_msg_id' in reminder_messages[user_id]:
+                try:
+                    bot.delete_message(user_id, reminder_messages[user_id]['user_msg_id'])
+                    logging.info(f"Midnight cleanup: Deleted user message for {user_id}")
+                    deleted_count += 1
+                except Exception as e:
+                    logging.error(f"Midnight cleanup: Failed to delete user message for {user_id}: {e}")
+                    failed_count += 1
+            
+            # Delete admin messages if they exist
+            for admin_id, msg_id in reminder_messages[user_id].get('admin_msg_ids', {}).items():
+                try:
+                    bot.delete_message(admin_id, msg_id)
+                    logging.info(f"Midnight cleanup: Deleted admin message for admin {admin_id}")
+                    deleted_count += 1
+                except Exception as e:
+                    logging.error(f"Midnight cleanup: Failed to delete admin message for admin {admin_id}: {e}")
+                    failed_count += 1
+                    
+            # Delete from MongoDB
+            delete_reminder_message(user_id)
+            
+        except Exception as e:
+            logging.error(f"Midnight cleanup: Error processing user {user_id}: {e}")
+            failed_count += 1
+    
+    # Clear the reminder_messages dictionary
+    reminder_messages.clear()
+    
+    # Also clear the entire MongoDB collection for a fresh start
+    try:
+        reminder_messages_collection.delete_many({})
+        logging.info("Cleared all reminder messages from MongoDB")
+    except Exception as e:
+        logging.error(f"Error clearing reminder messages from MongoDB: {e}")
+        
+    logging.info(f"Midnight cleanup complete: {deleted_count} messages deleted, {failed_count} failures")
+
+def midnight_cleanup_thread():
+    """Thread to run at midnight and delete all reminder messages."""
+    logging.info("Midnight cleanup thread started")
+    
+    # Track the last day we performed cleanup
+    last_cleanup_date = None
+    
+    while True:
+        try:
+            # Get current time in Philippines timezone
+            now = datetime.now(pytz.timezone('Asia/Manila'))
+            current_time = now.strftime('%H:%M')
+            current_date = now.strftime('%Y-%m-%d')
+            
+            # Check if it's midnight and we haven't cleaned up today
+            if current_time == '00:00' and last_cleanup_date != current_date:
+                logging.info("Midnight reached - cleaning up all reminder messages")
+                delete_all_reminders()
+                last_cleanup_date = current_date
+            
+            # Calculate the time to sleep until the start of the next minute
+            sleep_time = 60 - now.second - now.microsecond / 1_000_000
+            time.sleep(sleep_time)
+            
+        except Exception as e:
+            logging.error(f"Error in midnight cleanup thread: {e}")
             time.sleep(60)  # Wait a minute on error before trying again
 
 @bot.message_handler(commands=['admin_dashboard'])
@@ -3223,7 +3741,9 @@ pending_reminder_thread.start()
 leaderboard_thread = threading.Thread(target=send_daily_leaderboard, daemon=True)
 leaderboard_thread.start()
 
-
+# Add this to your bot startup code
+midnight_thread = threading.Thread(target=midnight_cleanup_thread, daemon=True)
+midnight_thread.start()
 # Function to start the bot with auto-restart
 def start_bot():
     while True:
