@@ -17,9 +17,10 @@ import random
 import secrets  # Using secrets module for more secure randomness
 from datetime import datetime
 from keep_alive import keep_alive
+import calendar
 
 
-BOT_VERSION = "Alpha Release 4.0"
+BOT_VERSION = "Alpha Release 4.1"
 
 load_dotenv()
 
@@ -40,6 +41,8 @@ old_members_collection = db['old_members']
 pending_collection = db['pending']
 changelog_collection = db['changelogs']
 settings_collection = db['settings']
+scores_collection = db['scores']  # For storing user scores
+accountability_collection = db['accountability']  # For tracking submissions
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -213,7 +216,8 @@ CHANGELOGS = load_changelogs()
 BOT_SETTINGS = load_settings()
 DAILY_CHALLENGE_TOPIC_ID = BOT_SETTINGS.get('daily_challenge_topic_id', None)
 ANNOUNCEMENT_TOPIC_ID = BOT_SETTINGS.get('announcement_topic_id', None)
-#migrate_data_to_mongodb()
+ACCOUNTABILITY_TOPIC_ID = BOT_SETTINGS.get('accountability_topic_id', None)
+LEADERBOARD_TOPIC_ID = BOT_SETTINGS.get('leaderboard_topic_id', None)
 
 ### COMMAND HANDLERS ###
 
@@ -1103,11 +1107,6 @@ def send_payment_reminder():
             logging.error(f"Error in payment reminder main loop: {e}")
             time.sleep(60)  # Wait a minute on error before trying again
 
-# Start reminder thread
-reminder_thread = threading.Thread(target=send_payment_reminder)
-reminder_thread.daemon = True  # This ensures the thread will exit when the main program exits
-reminder_thread.start()
-
 @bot.message_handler(commands=['admin_dashboard'])
 def admin_dashboard(message):
     """Send link to the web-based admin dashboard"""
@@ -1184,9 +1183,6 @@ def send_scheduled_gifs():
         now = datetime.now(pytz.timezone('Asia/Manila'))
         sleep_time = 60 - now.second - now.microsecond / 1_000_000
         time.sleep(sleep_time)
-
-scheduled_gif_thread = threading.Thread(target=send_scheduled_gifs, daemon=True)
-scheduled_gif_thread.start()
 
 CREATOR_USERNAME = "FujiiiiiPTA" 
 
@@ -1925,11 +1921,6 @@ def send_pending_request_reminders():
             logging.error(f"Error in pending request reminder thread: {e}")
             time.sleep(60)  # Wait a minute on error before trying again
 
-# Start reminder thread
-pending_reminder_thread = threading.Thread(target=send_pending_request_reminders)
-pending_reminder_thread.daemon = True
-pending_reminder_thread.start()
-
 def refresh_mongodb_data():
     """Refresh all data from MongoDB to ensure it's up to date."""
     global PAYMENT_DATA, CONFIRMED_OLD_MEMBERS, PENDING_USERS, CHANGELOGS
@@ -1959,12 +1950,6 @@ def mongodb_refresh_thread():
         except Exception as e:
             logging.error(f"Error in MongoDB refresh thread: {e}")
             time.sleep(300)  # Wait 5 minutes on error before trying again
-
-# Start MongoDB refresh thread
-refresh_thread = threading.Thread(target=mongodb_refresh_thread)
-refresh_thread.daemon = True
-refresh_thread.start()
-
 
 # Define challenge content
 SELF_IMPROVEMENT_CHALLENGES = [
@@ -2035,14 +2020,16 @@ def generate_daily_challenge():
     message += f"▫️ *Pair:* {pair}\n"
     message += CHART_ANALYSIS_INSTRUCTIONS
     
-    message += f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     message += f"⭐ Complete all challenges for 40 TOTAL POINTS!\n"
     message += f"📸 Share your progress in the chat to earn points!"
     
     return message
 
+last_reminder_date = None
+
 def send_daily_challenges():
     """Send daily challenges to the group at a specified time."""
+    global last_reminder_date
     logging.info("Daily challenges thread started")
     
     # Track the last day we sent a challenge to avoid duplicates
@@ -2064,34 +2051,71 @@ def send_daily_challenges():
                     challenge_message = generate_daily_challenge()
                     
                     # Send to specific topic if configured, otherwise to main group
-                    # Add parse_mode="Markdown" to both cases
                     if DAILY_CHALLENGE_TOPIC_ID:
                         bot.send_message(
                             PAID_GROUP_ID, 
                             challenge_message, 
                             message_thread_id=DAILY_CHALLENGE_TOPIC_ID,
-                            parse_mode="Markdown"  # Add this parameter for formatting
+                            parse_mode="Markdown"
                         )
                         logging.info(f"Sent daily challenge to topic {DAILY_CHALLENGE_TOPIC_ID} at {current_time} Philippine time.")
                     else:
                         bot.send_message(
                             PAID_GROUP_ID, 
                             challenge_message,
-                            parse_mode="Markdown"  # Add this parameter for formatting
+                            parse_mode="Markdown"
                         )
                         logging.info(f"Sent daily challenge to main group at {current_time} Philippine time.")
                     
                     # Update the last challenge date
                     last_challenge_date = current_date
+                    # Reset reminder flag for the new day
+                    last_reminder_date = None
                 else:
                     logging.info(f"Skipped daily challenge: Weekend.")
+                    
+            # Send reminder at 8:30 AM if we sent a challenge today but haven't sent a reminder
+            if current_time == '08:30' and last_challenge_date == current_date and last_reminder_date != current_date:
+                is_weekday = now.weekday() < 5
+                
+                if is_weekday:
+                    # Create a friendly, conversational reminder
+                    reminder_messages = [
+                        "Hey everyone! 👋 Just a friendly reminder to complete today's challenge. Share your work in the accountability roster to earn points for the leaderboard! 📊",
+                        
+                        "Good morning traders! ☕ Don't forget to tackle today's challenge - it only takes a few minutes and helps build consistent trading habits. Post your response in the accountability roster!",
+                        
+                        "Rise and shine, traders! ✨ Have you done today's challenge yet? Remember to post in the accountability roster to get your points for the day!",
+                        
+                        "Time check! ⏰ The daily challenge is waiting for your participation! Share your insights in the accountability roster and climb the leaderboard."
+                    ]
+                    
+                    reminder = random.choice(reminder_messages)
+                    
+                    # Send to the same topic as the challenge
+                    if DAILY_CHALLENGE_TOPIC_ID:
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            reminder, 
+                            message_thread_id=DAILY_CHALLENGE_TOPIC_ID
+                        )
+                        logging.info(f"Sent challenge reminder to topic {DAILY_CHALLENGE_TOPIC_ID} at {current_time}.")
+                    else:
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            reminder
+                        )
+                        logging.info(f"Sent challenge reminder to main group at {current_time}.")
+                        
+                    # Update reminder date
+                    last_reminder_date = current_date
             
             # Calculate the time to sleep until the start of the next minute
             sleep_time = 60 - now.second - now.microsecond / 1_000_000
             time.sleep(sleep_time)
             
         except Exception as e:
-            logging.error(f"Failed to send daily challenge: {e}")
+            logging.error(f"Failed to send daily challenge or reminder: {e}")
             time.sleep(60)  # Wait a minute on error before trying again
 
 # Command to manually trigger a daily challenge (for testing or admin use)
@@ -2234,11 +2258,6 @@ def get_topic_id(message):
         logging.error(f"Error in get_topic_id: {e}")
         bot.reply_to(message, f"❌ Error retrieving topic information: {str(e)}")
         
-
-# Start the daily challenge thread
-daily_challenge_thread = threading.Thread(target=send_daily_challenges, daemon=True)
-daily_challenge_thread.start()
-
 @bot.message_handler(commands=['jarvis'])
 def handle_jarvis_command(message):
     """Send a Jarvis image to the group chat"""
@@ -2289,6 +2308,8 @@ def list_available_commands(message):
         ("/gettopic", "Get the topic ID of the current chat topic"),
         ("/setchallengetopic", "Set the topic ID for daily challenges"),
         ("/setannouncementtopic", "Set the topic ID for announcements"),
+        ("/setaccountabilitytopic", "Set the topic ID for accountability roster"),
+        ("/setleaderboardtopic", "Set the topic ID for leaderboards"),
         ("/remove", "Remove yourself from pending users list"),
         ("/check", "Check MongoDB connection status")
     ]
@@ -2344,7 +2365,740 @@ def list_available_commands(message):
         bot.reply_to(message, "❌ An error occurred while processing your request.")
         logging.error(f"Error in list_available_commands: {e}")
 
+@bot.message_handler(commands=['setaccountabilitytopic'])
+def set_accountability_topic(message):
+    """Set or change the topic ID for accountability posts"""
+    global ACCOUNTABILITY_TOPIC_ID
+    
+    # Only allow the creator to use this command
+    if message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to the bot creator.")
+        return
+    
+    args = message.text.split()
+    
+    # Show current setting if no arguments provided
+    if len(args) == 1:
+        current_topic = ACCOUNTABILITY_TOPIC_ID if ACCOUNTABILITY_TOPIC_ID else "Not set"
+        bot.reply_to(message, f"Current accountability topic ID: `{current_topic}`\n\nTo change, use: `/setaccountabilitytopic ID`", parse_mode="Markdown")
+        return
+        
+    try:
+        # Handle "clear" or "reset" to remove topic ID
+        if args[1].lower() in ["clear", "reset", "none"]:
+            ACCOUNTABILITY_TOPIC_ID = None
+            BOT_SETTINGS['accountability_topic_id'] = None
+            save_settings(BOT_SETTINGS)
+            bot.reply_to(message, "✅ Accountability topic ID has been cleared.")
+            return
+            
+        # Try to parse as integer
+        new_topic_id = int(args[1])
+        ACCOUNTABILITY_TOPIC_ID = new_topic_id
+        
+        # Save to database
+        BOT_SETTINGS['accountability_topic_id'] = new_topic_id
+        save_settings(BOT_SETTINGS)
+        
+        bot.reply_to(message, f"✅ Accountability submissions will now be monitored in topic ID: `{new_topic_id}`", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid topic ID. Please provide a numeric ID or 'clear' to reset.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error setting topic ID: {str(e)}")
+
+@bot.message_handler(commands=['setleaderboardtopic'])
+def set_leaderboard_topic(message):
+    """Set or change the topic ID for leaderboard posts"""
+    global LEADERBOARD_TOPIC_ID
+    
+    # Only allow the creator to use this command
+    if message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to the bot creator.")
+        return
+    
+    args = message.text.split()
+    
+    # Show current setting if no arguments provided
+    if len(args) == 1:
+        current_topic = LEADERBOARD_TOPIC_ID if LEADERBOARD_TOPIC_ID else "Not set"
+        bot.reply_to(message, f"Current leaderboard topic ID: `{current_topic}`\n\nTo change, use: `/setleaderboardtopic ID`", parse_mode="Markdown")
+        return
+        
+    try:
+        # Handle "clear" or "reset" to remove topic ID
+        if args[1].lower() in ["clear", "reset", "none"]:
+            LEADERBOARD_TOPIC_ID = None
+            BOT_SETTINGS['leaderboard_topic_id'] = None
+            save_settings(BOT_SETTINGS)
+            bot.reply_to(message, "✅ Leaderboard topic ID has been cleared.")
+            return
+            
+        # Try to parse as integer
+        new_topic_id = int(args[1])
+        LEADERBOARD_TOPIC_ID = new_topic_id
+        
+        # Save to database
+        BOT_SETTINGS['leaderboard_topic_id'] = new_topic_id
+        save_settings(BOT_SETTINGS)
+        
+        bot.reply_to(message, f"✅ Leaderboard will now be posted in topic ID: `{new_topic_id}`", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid topic ID. Please provide a numeric ID or 'clear' to reset.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error setting topic ID: {str(e)}")
+
+def save_user_score(user_id, username, first_name, message_id, points, submission_date):
+    """Save a user's score for a submission"""
+    try:
+        # Create a unique identifier for each submission
+        submission_id = f"{user_id}_{submission_date.strftime('%Y-%m-%d')}"
+        
+        # Store the submission data
+        submission_data = {
+            "_id": submission_id,
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "message_id": message_id,
+            "points": points,
+            "date": submission_date.strftime('%Y-%m-%d'),
+            "timestamp": submission_date.strftime('%Y-%m-%d %H:%M:%S'),
+            "month_year": submission_date.strftime('%Y-%m')
+        }
+        
+        # Use upsert to update if exists or insert if new
+        scores_collection.replace_one({"_id": submission_id}, submission_data, upsert=True)
+        logging.info(f"Saved score for user {user_id}: {points} points")
+        return True
+    except Exception as e:
+        logging.error(f"Error saving score for user {user_id}: {e}")
+        return False
+
+def get_daily_leaderboard(date):
+    """Get the leaderboard for a specific day"""
+    try:
+        # Find all scores for the given date
+        date_str = date.strftime('%Y-%m-%d')
+        scores = list(scores_collection.find({"date": date_str}))
+        
+        # Sort by points (highest first)
+        scores.sort(key=lambda x: x.get('points', 0), reverse=True)
+        
+        return scores
+    except Exception as e:
+        logging.error(f"Error getting daily leaderboard: {e}")
+        return []
+
+def get_monthly_leaderboard(year_month):
+    """Get the leaderboard for a specific month"""
+    try:
+        # Find all submissions for the given month
+        submissions = list(scores_collection.find({"month_year": year_month}))
+        
+        # Group by user_id and sum points
+        user_scores = {}
+        for submission in submissions:
+            user_id = submission.get('user_id')
+            points = submission.get('points', 0)
+            
+            if user_id not in user_scores:
+                user_scores[user_id] = {
+                    'user_id': user_id,
+                    'username': submission.get('username'),
+                    'first_name': submission.get('first_name'),
+                    'total_points': 0,
+                    'submissions': 0
+                }
+            
+            user_scores[user_id]['total_points'] += points
+            user_scores[user_id]['submissions'] += 1
+        
+        # Convert to list and sort by total points
+        leaderboard = list(user_scores.values())
+        leaderboard.sort(key=lambda x: x.get('total_points', 0), reverse=True)
+        
+        return leaderboard
+    except Exception as e:
+        logging.error(f"Error getting monthly leaderboard: {e}")
+        return []
+
+@bot.message_handler(func=lambda message: message.chat.id == PAID_GROUP_ID and 
+                    hasattr(message, 'message_thread_id') and 
+                    message.message_thread_id == ACCOUNTABILITY_TOPIC_ID)
+def handle_accountability_submission(message):
+    """Handle messages posted in the accountability roster topic"""
+    try:
+        # Only process if accountability topic is configured
+        if not ACCOUNTABILITY_TOPIC_ID:
+            return
+            
+        user_id = message.from_user.id
+        username = message.from_user.username or "No_Username"
+        first_name = message.from_user.first_name or username
+        
+        # Save information about this submission to track it
+        submission_date = datetime.now(pytz.timezone('Asia/Manila'))
+        submission_id = f"{user_id}_{submission_date.strftime('%Y-%m-%d')}"
+        
+        # Check if user already submitted today
+        existing_submission = accountability_collection.find_one({"_id": submission_id})
+        if existing_submission:
+            # If they've already been graded, don't allow another submission
+            if existing_submission.get("graded", False):
+                try:
+                    # Try to delete the duplicate message
+                    bot.delete_message(message.chat.id, message.message_id)
+                    
+                    # Send a DM to inform the user
+                    bot.send_message(
+                        user_id,
+                        "⚠️ *You've already submitted today's challenge*\n\n"
+                        "I noticed you tried to submit another entry for today's challenge, but you're already "
+                        "graded for today. You can only submit once per day.\n\n"
+                        "Your earlier submission has been counted and will appear in today's leaderboard.",
+                        parse_mode="Markdown"
+                    )
+                    logging.info(f"Removed duplicate submission from user {user_id}")
+                except ApiException as e:
+                    # If we can't delete (maybe bot isn't admin), just log it
+                    logging.error(f"Failed to delete duplicate submission: {e}")
+                
+                return
+                
+            # User already submitted but not graded - update their submission
+            accountability_collection.update_one(
+                {"_id": submission_id},
+                {"$set": {"message_id": message.message_id, "timestamp": submission_date.strftime('%Y-%m-%d %H:%M:%S')}}
+            )
+            logging.info(f"Updated submission for user {user_id}")
+        else:
+            # New submission for today
+            submission_data = {
+                "_id": submission_id,
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "message_id": message.message_id,
+                "graded": False,
+                "points": 0,
+                "date": submission_date.strftime('%Y-%m-%d'),
+                "timestamp": submission_date.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            accountability_collection.insert_one(submission_data)
+            logging.info(f"New submission from user {user_id}")
+        
+        # Add more compact grading buttons
+        markup = InlineKeyboardMarkup(row_width=5)  # Make buttons fit in one row if possible
+        markup.add(
+            InlineKeyboardButton("❌", callback_data=f"grade_{user_id}_0"),
+            InlineKeyboardButton("10", callback_data=f"grade_{user_id}_10"),
+            InlineKeyboardButton("20", callback_data=f"grade_{user_id}_20"),
+            InlineKeyboardButton("30", callback_data=f"grade_{user_id}_30"),
+            InlineKeyboardButton("40", callback_data=f"grade_{user_id}_40")
+        )
+        
+        # Send a more minimal message with just the grade buttons
+        bot.send_message(
+            message.chat.id,
+            f"Grade @{username}'s submission: ⤴️",  # Arrow pointing up to indicate this is for the message above
+            reply_to_message_id=message.message_id,
+            reply_markup=markup,
+            message_thread_id=ACCOUNTABILITY_TOPIC_ID
+        )
+        
+    except Exception as e:
+        logging.error(f"Error handling accountability submission: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("grade_"))
+def handle_grading(call):
+    """Handle grading button presses"""
+    try:
+        # Parse the callback data (format: grade_userId_points)
+        parts = call.data.split("_")
+        if len(parts) != 3:
+            bot.answer_callback_query(call.id, "❌ Invalid callback data")
+            return
+            
+        submission_user_id = int(parts[1])
+        points = int(parts[2])
+        grader_id = call.from_user.id
+        
+        # Check if grader is admin or creator
+        if grader_id not in ADMIN_IDS and grader_id != CREATOR_ID:
+            # User is not authorized - send troll message
+            bot.answer_callback_query(call.id, "Nice try! You can't grade yourself, bozo! 🤡", show_alert=True)
+            return
+        
+        # Get the submission from the original message
+        original_msg = call.message.reply_to_message
+        if not original_msg:
+            bot.answer_callback_query(call.id, "❌ Could not find the original submission", show_alert=True)
+            return
+            
+        user_info = original_msg.from_user
+        username = user_info.username or "No_Username"
+        first_name = user_info.first_name or username
+        
+        # Get today's date in Manila timezone for the submission ID
+        manila_tz = pytz.timezone('Asia/Manila')
+        submission_date = datetime.now(manila_tz)
+        submission_id = f"{submission_user_id}_{submission_date.strftime('%Y-%m-%d')}"
+        
+        # Add more debugging
+        logging.info(f"Updating accountability for user {submission_user_id}, submission ID: {submission_id}")
+
+        # First, verify if the document exists
+        existing_doc = accountability_collection.find_one({"_id": submission_id})
+        if not existing_doc:
+            logging.warning(f"No document found for submission ID: {submission_id}")
+            # Try using the original document submission date
+            msg_date = datetime.fromtimestamp(original_msg.date).replace(tzinfo=pytz.UTC)
+            alt_submission_date = msg_date.astimezone(manila_tz)
+            alt_submission_id = f"{submission_user_id}_{alt_submission_date.strftime('%Y-%m-%d')}"
+            logging.info(f"Trying alternative submission ID: {alt_submission_id}")
+            submission_id = alt_submission_id
+        
+        # Update with explicit result verification
+        update_result = accountability_collection.update_one(
+            {"_id": submission_id},
+            {"$set": {"graded": True, "points": points, "graded_by": grader_id}}
+        )
+        
+        if update_result.matched_count == 0:
+            logging.error(f"Failed to match document with ID: {submission_id}")
+            # Try to find any document for this user today
+            today_str = submission_date.strftime('%Y-%m-%d')
+            docs = list(accountability_collection.find({"user_id": submission_user_id, "date": today_str}))
+            if docs:
+                doc_id = docs[0].get("_id")
+                logging.info(f"Found alternative document with ID: {doc_id}")
+                update_result = accountability_collection.update_one(
+                    {"_id": doc_id},
+                    {"$set": {"graded": True, "points": points, "graded_by": grader_id}}
+                )
+                logging.info(f"Update result with alternative ID: matched={update_result.matched_count}, modified={update_result.modified_count}")
+        else:
+            logging.info(f"Updated accountability document: matched={update_result.matched_count}, modified={update_result.modified_count}")
+        
+        # Save the score
+        save_result = save_user_score(
+            submission_user_id, 
+            username, 
+            first_name,
+            original_msg.message_id, 
+            points,
+            submission_date
+        )
+        logging.info(f"Score save result: {save_result}")
+        
+        # Update the accountability collection to mark as graded
+        accountability_collection.update_one(
+            {"_id": submission_id},
+            {"$set": {"graded": True, "points": points, "graded_by": grader_id}}
+        )
+        
+        # After successfully saving the grade, delete the grading buttons message
+        try:
+            # Delete the original grading message to reduce clutter
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            
+            # Send a small confirmation in the thread that will auto-delete
+            if points > 0:
+                confirm_msg = f"✅ @{username}'s submission graded: {points} pts"
+            else:
+                confirm_msg = f"❌ @{username}'s submission rejected"
+                
+            temp_msg = bot.send_message(
+                call.message.chat.id,
+                confirm_msg,
+                reply_to_message_id=original_msg.message_id,
+                message_thread_id=ACCOUNTABILITY_TOPIC_ID
+            )
+            
+            # Schedule this confirmation to be deleted after 5 seconds
+            def delete_later(chat_id, message_id):
+                time.sleep(5)
+                try:
+                    bot.delete_message(chat_id, message_id)
+                except:
+                    pass  # Ignore errors if message can't be deleted
+                
+            threading.Thread(target=delete_later, 
+                         args=(temp_msg.chat.id, temp_msg.message_id)).start()
+            
+            bot.answer_callback_query(call.id, f"Successfully graded with {points} points!")
+            
+        except ApiException as e:
+            logging.error(f"Error cleaning up grading UI: {e}")
+            # If we can't delete, fall back to just editing the message
+            markup = InlineKeyboardMarkup()
+            if points > 0:
+                btn_text = f"Graded: {points} pts ✅"
+            else:
+                btn_text = "Rejected ❌"
+                
+            markup.add(InlineKeyboardButton(btn_text, callback_data="already_graded"))
+            
+            bot.edit_message_text(
+                f"@{username}'s submission graded: {points} pts",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup
+            )
+            
+            bot.answer_callback_query(call.id, f"Graded with {points} points")
+        
+        # Notify the user via DM
+        try:
+            # Random delay to simulate human typing (1-3 seconds)
+            time.sleep(1 + random.random() * 2)
+            
+            # Show typing indicator first
+            bot.send_chat_action(submission_user_id, 'typing')
+            time.sleep(1.5)  # Simulate thinking time
+            
+            if points > 0:
+                # Add variety to positive notifications
+                positive_messages = [
+                    f"✅ *Great job on your daily challenge submission!*\n\n"
+                    f"Your hard work has been noticed by our admin team. Keep up the excellent work and check the leaderboard at midnight to see where you rank!",
+                    
+                    f"✅ *Challenge submission graded!*\n\n"
+                    f"Thanks for participating in today's challenge! Your submission has been reviewed and points have been awarded. The daily rankings will be posted at midnight - good luck!",
+                    
+                    f"✅ *Daily challenge completed!*\n\n"
+                    f"One of our admins has reviewed your work for today's challenge. Well done on your submission! Daily rankings are posted at midnight."
+                ]
+                notification_message = random.choice(positive_messages)
+            else:
+                # Add variety to rejection messages
+                rejection_messages = [
+                    f"❌ *About your challenge submission...*\n\n"
+                    f"Unfortunately, your submission didn't meet all the requirements for today's challenge. Take another look at the instructions and try again tomorrow!",
+                    
+                    f"❌ *Challenge submission feedback*\n\n"
+                    f"It looks like there was an issue with your submission for today's challenge. Review the daily challenge criteria and give it another shot tomorrow!",
+                    
+                    f"❌ *Daily challenge feedback*\n\n"
+                    f"Thanks for participating, but your submission wasn't quite what we were looking for today. Check the challenge requirements and try again tomorrow."
+                ]
+                notification_message = random.choice(rejection_messages)
+                
+            bot.send_message(
+                submission_user_id,
+                notification_message,
+                parse_mode="Markdown"
+            )
+        except ApiException:
+            logging.error(f"Could not send grade notification to user {submission_user_id}")
+            
+    except Exception as e:
+        logging.error(f"Error handling grading callback: {e}")
+        bot.answer_callback_query(call.id, "❌ Error processing grade", show_alert=True)
+
+# Handle "already graded" button to prevent further clicks
+@bot.callback_query_handler(func=lambda call: call.data == "already_graded")
+def handle_already_graded(call):
+    bot.answer_callback_query(call.id, "This submission has already been graded!")
+
+
+def generate_daily_leaderboard_text(date):
+    """Generate formatted text for daily leaderboard with proper tie handling"""
+    scores = get_daily_leaderboard(date)
+    
+    if not scores:
+        return f"📊 *DAILY LEADERBOARD: {date.strftime('%B %d, %Y')}*\n\nNo entries for today!"
+    
+    # Format the leaderboard message
+    leaderboard_text = f"📊 *DAILY LEADERBOARD: {date.strftime('%B %d, %Y')}*\n\n"
+    
+    # Keep track of the current rank and last score for tie detection
+    current_rank = 1
+    last_score = None
+    
+    for i, entry in enumerate(scores):
+        points = entry.get('points', 0)
+        username = entry.get('username', 'No_Username')
+        
+        # If this score is different from the previous one, update the rank
+        if last_score is not None and points != last_score:
+            current_rank = i + 1
+        
+        last_score = points
+        
+        # Create emoji for ranks
+        if current_rank == 1:
+            rank_emoji = "🥇"
+        elif current_rank == 2:
+            rank_emoji = "🥈"
+        elif current_rank == 3:
+            rank_emoji = "🥉"
+        else:
+            rank_emoji = f"{current_rank}."
+        
+        leaderboard_text += f"{rank_emoji} @{username}: *{points} points*\n"
+    
+    return leaderboard_text
+
+def generate_monthly_leaderboard_text(year_month_str):
+    """Generate formatted text for monthly leaderboard with proper tie handling"""
+    # Parse year-month string into a date object to get month name
+    try:
+        date = datetime.strptime(year_month_str, '%Y-%m')
+        month_name = date.strftime('%B %Y')
+    except:
+        month_name = year_month_str
+    
+    scores = get_monthly_leaderboard(year_month_str)
+    
+    if not scores:
+        return f"📊 *MONTHLY LEADERBOARD: {month_name}*\n\nNo entries this month!"
+    
+    # Format the leaderboard message
+    leaderboard_text = f"📊 *MONTHLY LEADERBOARD: {month_name}*\n\n"
+    
+    # Keep track of the current rank and last score for tie detection
+    current_rank = 1
+    last_score = None
+    
+    for i, entry in enumerate(scores):
+        total_points = entry.get('total_points', 0)
+        username = entry.get('username', 'No_Username')
+        submissions = entry.get('submissions', 0)
+        
+        # If this score is different from the previous one, update the rank
+        if last_score is not None and total_points != last_score:
+            current_rank = i + 1
+            
+        last_score = total_points
+        
+        # Create emoji for ranks
+        if current_rank == 1:
+            rank_emoji = "🥇"
+        elif current_rank == 2:
+            rank_emoji = "🥈"
+        elif current_rank == 3:
+            rank_emoji = "🥉"
+        else:
+            rank_emoji = f"{current_rank}."
+        
+        leaderboard_text += f"{rank_emoji} @{username}: *{total_points} points* ({submissions} submissions)\n"
+    
+    leaderboard_text += f"\n🏆 Congratulations to all participants! Keep up the great work!"
+    
+    return leaderboard_text
+
+def generate_monthly_leaderboard_text(year_month_str):
+    """Generate formatted text for monthly leaderboard"""
+    # Parse year-month string into a date object to get month name
+    try:
+        date = datetime.strptime(year_month_str, '%Y-%m')
+        month_name = date.strftime('%B %Y')
+    except:
+        month_name = year_month_str
+    
+    scores = get_monthly_leaderboard(year_month_str)
+    
+    if not scores:
+        return f"📊 *MONTHLY LEADERBOARD: {month_name}*\n\nNo entries this month!"
+    
+    # Format the leaderboard message
+    leaderboard_text = f"📊 *MONTHLY LEADERBOARD: {month_name}*\n\n"
+    
+    for i, entry in enumerate(scores):
+        # Create emoji for top 3
+        if i == 0:
+            rank_emoji = "🥇"
+        elif i == 1:
+            rank_emoji = "🥈"
+        elif i == 2:
+            rank_emoji = "🥉"
+        else:
+            rank_emoji = f"{i+1}."
+            
+        username = entry.get('username', 'No_Username')
+        total_points = entry.get('total_points', 0)
+        submissions = entry.get('submissions', 0)
+        
+        leaderboard_text += f"{rank_emoji} @{username}: *{total_points} points* ({submissions} submissions)\n"
+    
+    leaderboard_text += f"\n🏆 Congratulations to all participants! Keep up the great work!"
+    
+    return leaderboard_text
+
+def send_daily_leaderboard():
+    """Send the daily leaderboard at midnight"""
+    logging.info("Daily leaderboard thread started")
+    
+    # Track last leaderboard sent date
+    last_leaderboard_date = None
+    
+    while True:
+        try:
+            now = datetime.now(pytz.timezone('Asia/Manila'))
+            
+            # Check if it's midnight (00:00) and we haven't sent a leaderboard today
+            if now.strftime('%H:%M') == '00:00' and now.strftime('%Y-%m-%d') != last_leaderboard_date:
+                logging.info("It's midnight - generating daily leaderboard")
+                
+                # Get yesterday's date (since we're sending at midnight)
+                yesterday = now - timedelta(days=1)
+                
+                # Generate leaderboard text
+                leaderboard_text = generate_daily_leaderboard_text(yesterday)
+                
+                # Send the leaderboard to the designated topic
+                if LEADERBOARD_TOPIC_ID:
+                    bot.send_message(
+                        PAID_GROUP_ID, 
+                        leaderboard_text,
+                        parse_mode="Markdown",
+                        message_thread_id=LEADERBOARD_TOPIC_ID
+                    )
+                    logging.info(f"Sent daily leaderboard to topic {LEADERBOARD_TOPIC_ID}")
+                else:
+                    logging.warning("No leaderboard topic ID configured - skipping leaderboard")
+                
+                # Check if it's also month-end
+                if yesterday.day == calendar.monthrange(yesterday.year, yesterday.month)[1]:
+                    # It's the last day of the month - send monthly leaderboard too
+                    month_year = yesterday.strftime('%Y-%m')
+                    monthly_leaderboard = generate_monthly_leaderboard_text(month_year)
+                    
+                    # Send after a short delay
+                    time.sleep(3)
+                    
+                    if LEADERBOARD_TOPIC_ID:
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            monthly_leaderboard,
+                            parse_mode="Markdown",
+                            message_thread_id=LEADERBOARD_TOPIC_ID
+                        )
+                        logging.info(f"Sent monthly leaderboard to topic {LEADERBOARD_TOPIC_ID}")
+                
+                # Update last leaderboard date
+                last_leaderboard_date = now.strftime('%Y-%m-%d')
+            
+            # Sleep until the next minute
+            sleep_time = 60 - now.second - now.microsecond / 1_000_000
+            time.sleep(sleep_time)
+            
+        except Exception as e:
+            logging.error(f"Error sending leaderboard: {e}")
+            time.sleep(60)  # Wait for a minute before trying again
+
+@bot.message_handler(commands=['leaderboard'])
+def manual_leaderboard(message):
+    """Command to manually generate and send leaderboards for testing"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    args = message.text.split()
+    
+    try:
+        # Default to today's leaderboard
+        now = datetime.now(pytz.timezone('Asia/Manila'))
+        
+        if len(args) > 1 and args[1].lower() == "monthly":
+            # Generate monthly leaderboard
+            if len(args) > 2:
+                # Parse specified month
+                try:
+                    year_month = args[2]  # Format YYYY-MM
+                    leaderboard_text = generate_monthly_leaderboard_text(year_month)
+                except:
+                    bot.reply_to(message, "❌ Invalid month format. Use YYYY-MM (e.g., 2025-03)")
+                    return
+            else:
+                # Use current month
+                year_month = now.strftime('%Y-%m')
+                leaderboard_text = generate_monthly_leaderboard_text(year_month)
+                
+            board_type = "monthly"
+        else:
+            # Generate daily leaderboard
+            if len(args) > 1:
+                # Parse specified date
+                try:
+                    date = datetime.strptime(args[1], '%Y-%m-%d')
+                    date = date.replace(tzinfo=pytz.timezone('Asia/Manila'))
+                except:
+                    bot.reply_to(message, "❌ Invalid date format. Use YYYY-MM-DD")
+                    return
+            else:
+                # Use today's date
+                date = now
+                
+            leaderboard_text = generate_daily_leaderboard_text(date)
+            board_type = "daily"
+        
+        # Send the leaderboard
+        if message.chat.type in ['group', 'supergroup'] and message.chat.id == PAID_GROUP_ID:
+            # If in the group chat, respect topic configuration
+            if LEADERBOARD_TOPIC_ID:
+                bot.send_message(
+                    PAID_GROUP_ID,
+                    leaderboard_text,
+                    parse_mode="Markdown",
+                    message_thread_id=LEADERBOARD_TOPIC_ID
+                )
+            else:
+                # Send to current topic if in a topic, or main group
+                thread_id = message.message_thread_id if hasattr(message, 'message_thread_id') else None
+                bot.send_message(
+                    message.chat.id,
+                    leaderboard_text,
+                    parse_mode="Markdown",
+                    message_thread_id=thread_id
+                )
+        else:
+            # Send directly to the user
+            bot.send_message(
+                message.chat.id,
+                leaderboard_text,
+                parse_mode="Markdown"
+            )
+            
+        bot.reply_to(message, f"✅ {board_type.capitalize()} leaderboard generated successfully!")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error generating leaderboard: {str(e)}")
+        logging.error(f"Error in manual_leaderboard: {e}")
+
 keep_alive()
+
+# Start reminder thread
+reminder_thread = threading.Thread(target=send_payment_reminder)
+reminder_thread.daemon = True  # This ensures the thread will exit when the main program exits
+reminder_thread.start()
+
+# Start the scheduled GIF thread
+scheduled_gif_thread = threading.Thread(target=send_scheduled_gifs, daemon=True)
+scheduled_gif_thread.start()
+
+# Start the daily challenge thread
+daily_challenge_thread = threading.Thread(target=send_daily_challenges, daemon=True)
+daily_challenge_thread.start()
+
+# Start MongoDB refresh thread
+refresh_thread = threading.Thread(target=mongodb_refresh_thread)
+refresh_thread.daemon = True
+refresh_thread.start()
+
+# Start reminder thread
+pending_reminder_thread = threading.Thread(target=send_pending_request_reminders)
+pending_reminder_thread.daemon = True
+pending_reminder_thread.start()
+
+# Start the leaderboard thread
+leaderboard_thread = threading.Thread(target=send_daily_leaderboard, daemon=True)
+leaderboard_thread.start()
+
+
 # Function to start the bot with auto-restart
 def start_bot():
     while True:
