@@ -219,6 +219,93 @@ ANNOUNCEMENT_TOPIC_ID = BOT_SETTINGS.get('announcement_topic_id', None)
 ACCOUNTABILITY_TOPIC_ID = BOT_SETTINGS.get('accountability_topic_id', None)
 LEADERBOARD_TOPIC_ID = BOT_SETTINGS.get('leaderboard_topic_id', None)
 
+
+### Different types of messages for the bot ###
+
+already_confirmed_messages = [
+    "❗ You are already confirmed as an old member of PTA.",
+    "✅ Your status as an old PTA member is already verified in our system!",
+    "ℹ️ No need to verify again - you're already confirmed as an original PTA member.",
+    "👍 Great news! You're already verified as a legacy PTA member in our database.",
+    "🔄 Your old member status is already active in our system - no further verification needed."
+]
+
+confirmation_success_messages = [
+    "✅ You have been confirmed as an old member of PTA!",
+    "🎉 Great news! Your old member status has been verified successfully.",
+    "✅ Verification complete! You've been confirmed as an original PTA member.",
+    "🌟 Success! Your long-term membership has been recognized in our system.",
+    "✅ Congratulations! Your status as an original PTA member has been verified."
+]
+
+admin_confirm_messages = [
+    "✅ User confirmed successfully.",
+    "✅ Old member status verified!",
+    "✅ User has been granted legacy member status.",
+    "✅ Member verification completed successfully.",
+    "✅ Confirmation process completed - user verified as old member."
+]
+
+rejection_messages = [
+    "❌ Your request to be an old member has been rejected. Please reach out to the admins for more details or use /start to try again.",
+    "❌ Unfortunately, we couldn't verify your old member status at this time. Please contact an admin for clarification or use /start to continue.",
+    "❌ Your old member verification was not approved. For more information, please contact the admin team or use /start to explore other options.",
+    "❌ We were unable to confirm your previous membership status. Please reach out to our team for assistance or use /start to begin again.",
+    "❌ Your legacy membership verification was unsuccessful. Please contact an admin for more details or use /start to see available options."
+]
+
+payment_review_messages = [
+    "✅ *Verification in progress*\n\nYour payment confirmation is under review. Our admin team will verify it shortly and notify you once complete.",
+    
+    "✅ *Thank you for your submission*\n\nWe've received your payment proof and it's being reviewed by our team. You'll be notified as soon as it's verified.",
+    
+    "✅ *Processing payment verification*\n\nYour screenshot has been sent to our admin team for review. We'll update you when the verification is complete.",
+    
+    "✅ *Payment proof received*\n\nThank you for submitting your payment information. Our team is reviewing it and will notify you once verified.",
+    
+    "✅ *Verification pending*\n\nWe've received your payment details and they are currently under review. You'll receive a notification once the process is complete."
+]
+
+payment_approval_messages = [
+    "✅ *Verification Successful!*\n\nWelcome to Prodigy Trading Academy. We're delighted to have you as part of our community!",
+    
+    "✅ *Great news!* Your payment has been verified successfully! Welcome to the Prodigy Trading Academy family. We're thrilled to have you join us!",
+    
+    "✅ *Payment verified!*\n\nYour membership has been activated. Welcome to Prodigy Trading Academy! We're excited to have you as part of our trading community.",
+    
+    "✅ *You're all set!*\n\nYour payment has been verified and your membership is now active. Welcome aboard the Prodigy Trading Academy!",
+    
+    "✅ *Payment confirmed!*\n\nThank you for joining Prodigy Trading Academy. Your membership has been successfully activated and we're looking forward to helping you on your trading journey!"
+]
+
+payment_rejection_messages = [
+    "❌ *Verification Failed*\n\nUnfortunately, we couldn't verify your payment. Please check your payment details and try again, or contact our admin team for assistance.",
+    
+    "❌ *Payment Verification Issue*\n\nWe were unable to confirm your payment. Please ensure you've sent the correct amount and try submitting your proof again.",
+    
+    "❌ *Payment Not Verified*\n\nThere seems to be an issue with your payment verification. Please submit a clearer screenshot or contact our admin team for help.",
+    
+    "❌ *Verification Unsuccessful*\n\nYour payment proof couldn't be verified at this time. Please check the payment details and try again with a clearer screenshot.",
+    
+    "❌ *Payment Rejected*\n\nWe couldn't process your payment verification. Please ensure you've completed the payment correctly and submit a new verification request."
+]
+
+pending_verification_messages = [
+    "⚠️ You have a pending membership verification request. Admins are reviewing your request. Please wait for their response.",
+    "⏳ Your membership verification is still being reviewed by our admin team. We'll notify you as soon as they've made a decision.",
+    "📝 We've received your membership verification request and it's currently under review. Our team will get back to you shortly.",
+    "⌛ Your verification request is in our admin queue. Thanks for your patience while they review your details.",
+    "🔍 Our admin team is still reviewing your membership verification. We'll notify you as soon as there's an update."
+]
+
+pending_payment_messages = [
+    "⚠️ You have a pending payment verification. Admins are reviewing your payment proof. Please wait for their response.",
+    "💼 Your payment is currently being verified by our admin team. We'll notify you once the process is complete.",
+    "📊 Thanks for your patience! Your payment proof is still under review by our admins. You'll receive a notification when verified.",
+    "⏱️ Our team is reviewing your payment submission. We'll let you know as soon as it's verified.",
+    "💳 Your payment verification is in progress. Our admin team is reviewing your submission and will notify you shortly."
+]
+
 ### COMMAND HANDLERS ###
 
 @bot.message_handler(commands=['dm'])
@@ -283,24 +370,24 @@ def send_welcome(message):
     
     # Handle pending requests first - don't show intro message again
     if pending_verification:
-        bot.send_message(chat_id, "⚠️ You have a pending membership verification request. Admins are reviewing your request. Please wait for their response.")
+        bot.send_message(chat_id, random.choice(pending_verification_messages))
         return  # Exit the function here - don't show the intro message again
     elif pending_payment:
-        bot.send_message(chat_id, "⚠️ You have a pending payment verification. Admins are reviewing your payment proof. Please wait for their response.")
+        bot.send_message(chat_id, random.choice(pending_payment_messages))
         return  # Exit the function here - don't show the intro message again
     
     # Only show the intro message and options if there are no pending requests
     bot.send_message(chat_id, f"""
-🏫 Prodigy Trading Academy Enrollment ({BOT_VERSION})
+    🏫 Prodigy Trading Academy Enrollment ({BOT_VERSION})
 
-Welcome to Prodigy Trading Academy! 🎉
+    Welcome to Prodigy Trading Academy! 🎉
 
-We're pleased to assist you with joining our academy. This marks a significant step in enhancing your trading expertise.
+    We're pleased to assist you with joining our academy. This marks a significant step in enhancing your trading expertise.
 
-📢 Note: This bot is currently in {BOT_VERSION}, so you may experience occasional updates or improvements.
+    📢 Note: This bot is currently in {BOT_VERSION}, so you may experience occasional updates or improvements.
 
-Please select an option below to proceed:
-""")
+    Please select an option below to proceed:
+    """)
     
     # Ask for a payment plan
     markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
@@ -486,7 +573,7 @@ def callback_confirm_old_member(call):
         # Check if user is already confirmed as an old member
         if user_id in CONFIRMED_OLD_MEMBERS:
             bot.answer_callback_query(call.id, "⚠️ This user has already been confirmed as an old member.")
-            bot.send_message(user_id, "❗ You are already confirmed as an old member of PTA.")
+            bot.send_message(user_id, random.choice(already_confirmed_messages))
             return
 
         # Modified check - accept if status is old_member_request OR if user has gone back to menu
@@ -508,8 +595,8 @@ def callback_confirm_old_member(call):
         save_confirmed_old_members()  # Save to JSON file
         save_pending_users()
 
-        bot.send_message(user_id, "✅ You have been confirmed as an old member of PTA!")
-        bot.answer_callback_query(call.id, "✅ User confirmed successfully.")
+        bot.send_message(user_id, random.choice(confirmation_success_messages))
+        bot.answer_callback_query(call.id, random.choice(admin_confirm_messages))
 
         # Log admin activity and notify all admins
         admin_username = call.from_user.username or f"Admin ({call.message.chat.id})"
@@ -543,7 +630,7 @@ def callback_reject_old_member(call):
         PENDING_USERS.pop(user_id, None)  # Remove from dictionary
         delete_pending_user(user_id)  # Remove from MongoDB
         
-        bot.send_message(user_id, "❌ Your request to be an old member has been rejected. Please reach out to the admins for more details or use /start to try again.")
+        bot.send_message(user_id, random.choice(rejection_messages))
         bot.answer_callback_query(call.id, "❌ User rejected successfully.")
 
         # Log admin activity and notify all admins
@@ -703,7 +790,7 @@ def handle_payment_screenshot(message):
     PENDING_USERS[chat_id]['status'] = 'waiting_approval'
     PENDING_USERS[chat_id]['request_time'] = datetime.now()  # Add timestamp
     save_pending_users()
-    bot.send_message(chat_id, "✅ Your payment confirmation is under review. We will notify you once verified.")
+    bot.send_message(chat_id, random.choice(payment_review_messages), parse_mode="Markdown")
 
 # Admin Approves Payment
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve_payment_"))
@@ -777,7 +864,7 @@ def callback_approve_payment(call):
             bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has approved payment from PTA member @{username}.", parse_mode="Markdown")
 
         # ✅ Step 1: Verification successful
-        bot.send_message(user_id, "✅ Verification Successful!\nWelcome to Prodigy Trading Academy. We're delighted to have you.")
+        bot.send_message(user_id, random.choice(payment_approval_messages), parse_mode="Markdown")
         bot.answer_callback_query(call.id, "✅ Payment approved successfully.")
 
         # 📅 Step 2: Determine and send due date
@@ -832,6 +919,44 @@ def callback_approve_payment(call):
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Unexpected error approving payment: {e}")
 
+# Admin Rejects Payment
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_payment_"))
+def callback_reject_payment(call):
+    user_id = int(call.data.split("_")[2])
+    if call.message.chat.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+
+    try:
+        # Check if the user already has an approved payment
+        if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)]['haspayed']:
+            bot.answer_callback_query(call.id, "⚠️ This user has already been approved. Cannot reject.")
+            return
+
+        # Check if user is actually waiting for payment verification
+        if user_id not in PENDING_USERS or PENDING_USERS[user_id].get('status') != 'waiting_approval':
+            bot.answer_callback_query(call.id, "❌ This user is not waiting for payment verification.")
+            return
+
+        bot.send_message(user_id, random.choice(payment_rejection_messages), parse_mode="Markdown")
+        PENDING_USERS.pop(user_id, None)
+        save_pending_users()
+        bot.answer_callback_query(call.id, "❌ Payment rejected successfully.")
+
+        # Log admin activity and notify all admins
+        admin_username = call.from_user.username or f"Admin ({call.message.chat.id})"
+        user_info = bot.get_chat(user_id)
+        username = user_info.username or f"ID: {user_id}"
+
+        # Escape Markdown characters in the usernames
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has rejected payment from PTA member @{username}.", parse_mode="Markdown")
+
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Unexpected error rejecting payment: {e}")
 
 @bot.message_handler(content_types=['new_chat_members'])
 def welcome_new_members(message):
