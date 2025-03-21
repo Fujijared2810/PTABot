@@ -44,6 +44,7 @@ settings_collection = db['settings']
 scores_collection = db['scores']  # For storing user scores
 accountability_collection = db['accountability']  # For tracking submissions
 reminder_messages_collection = db['reminder_messages']
+gif_status_collection = db['gif_status']
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -65,9 +66,13 @@ class PhilippineTimeFormatter(logging.Formatter):
         # Format the time in 12-hour format
         return philippine_time.strftime('%Y-%m-%d %I:%M:%S %p')
 
-# Configure root logger
+# Fix for duplicate logging - clear existing handlers first
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to prevent duplicates
+if logger.hasHandlers():
+    logger.handlers.clear()
 
 # Create and configure file handler
 file_handler = logging.FileHandler('bot.log')
@@ -88,16 +93,47 @@ console_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+def get_last_gif_message():
+    """Get the ID of the last sent GIF message"""
+    try:
+        status = gif_status_collection.find_one({"_id": "last_gif"})
+        if status:
+            return status.get("message_id")
+        return None
+    except Exception as e:
+        logging.error(f"Error getting last GIF message ID: {e}")
+        return None
+
+def save_last_gif_message(message_id):
+    """Save the ID of the last sent GIF message"""
+    try:
+        gif_status_collection.replace_one(
+            {"_id": "last_gif"}, 
+            {"_id": "last_gif", "message_id": message_id, "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, 
+            upsert=True
+        )
+        logging.info(f"Saved last GIF message ID: {message_id}")
+    except Exception as e:
+        logging.error(f"Error saving last GIF message ID: {e}")
+
 def load_reminder_messages():
     """Load reminder messages from MongoDB."""
     try:
         messages = {}
         for doc in reminder_messages_collection.find():
             user_id = int(doc['_id'])
+            
+            # Convert admin_msg_ids from string keys back to integer keys
+            admin_msg_ids = {}
+            if 'admin_msg_ids' in doc:
+                for admin_id_str, msg_id in doc['admin_msg_ids'].items():
+                    admin_msg_ids[int(admin_id_str)] = msg_id
+            
             messages[user_id] = {
                 'user_msg_id': doc.get('user_msg_id'),
-                'admin_msg_ids': doc.get('admin_msg_ids', {})
+                'admin_msg_ids': admin_msg_ids
             }
+            
         logging.info(f"Loaded {len(messages)} reminder messages from MongoDB")
         return messages
     except Exception as e:
@@ -109,7 +145,19 @@ def save_reminder_message(user_id, data):
     try:
         # Convert user_id to string for MongoDB _id
         doc = {'_id': str(user_id)}
-        doc.update(data)
+        
+        # Create a copy of the data to avoid modifying the original
+        mongo_data = data.copy()
+        
+        # Convert admin_msg_ids to use string keys for MongoDB compatibility
+        if 'admin_msg_ids' in mongo_data:
+            string_admin_ids = {}
+            for admin_id, msg_id in mongo_data['admin_msg_ids'].items():
+                string_admin_ids[str(admin_id)] = msg_id
+            mongo_data['admin_msg_ids'] = string_admin_ids
+        
+        # Update the document with the modified data
+        doc.update(mongo_data)
         
         # Use upsert to update if exists or insert if new
         reminder_messages_collection.replace_one({'_id': str(user_id)}, doc, upsert=True)
@@ -1798,6 +1846,10 @@ SCHEDULED_TIMES = {
 }
 
 def send_scheduled_gifs():
+    """Send scheduled GIFs to the group at specific times, deleting previous GIFs before sending new ones"""
+    last_message_id = get_last_gif_message()
+    logging.info(f"Starting GIF scheduler, last message ID: {last_message_id}")
+    
     while True:
         now = datetime.now(pytz.timezone('Asia/Manila'))
         current_time = now.strftime('%H:%M')
@@ -1806,17 +1858,40 @@ def send_scheduled_gifs():
         is_weekday = now.weekday() < 5  # 0-4 are Monday to Friday
         
         if current_time in SCHEDULED_TIMES and is_weekday:
+            # First, delete the previous GIF if available
+            if last_message_id:
+                try:
+                    bot.delete_message(PAID_GROUP_ID, last_message_id)
+                    logging.info(f"Deleted previous GIF message ID: {last_message_id}")
+                except ApiException as e:
+                    if "message to delete not found" in str(e):
+                        logging.warning(f"Previous GIF message {last_message_id} already deleted")
+                    elif "bot was blocked by the user" in str(e):
+                        logging.warning("Cannot delete previous GIF - bot was blocked")
+                    else:
+                        logging.error(f"Failed to delete previous GIF: {e}")
+                except Exception as e:
+                    logging.error(f"General error deleting previous GIF: {e}")
+            
+            # Now send the new GIF
             file_path_or_url = SCHEDULED_TIMES[current_time]
             try:
+                message = None
                 if file_path_or_url.startswith('https'):
-                    bot.send_animation(PAID_GROUP_ID, file_path_or_url)
+                    message = bot.send_animation(PAID_GROUP_ID, file_path_or_url)
                 else:
                     with open(file_path_or_url, 'rb') as file:
                         if file_path_or_url.endswith('.gif'):
-                            bot.send_animation(PAID_GROUP_ID, file)
+                            message = bot.send_animation(PAID_GROUP_ID, file)
                         elif file_path_or_url.endswith('.mp4'):
-                            bot.send_video(PAID_GROUP_ID, file, supports_streaming=True)
-                logging.info(f"Sent scheduled file at {current_time} Philippine time.")
+                            message = bot.send_video(PAID_GROUP_ID, file, supports_streaming=True)
+                
+                if message:
+                    # Store the new message ID for future deletion
+                    last_message_id = message.message_id
+                    save_last_gif_message(last_message_id)
+                    
+                logging.info(f"Sent scheduled file at {current_time} Philippine time. New message ID: {last_message_id}")
             except Exception as e:
                 logging.error(f"Failed to send scheduled file at {current_time}: {e}")
         elif current_time in SCHEDULED_TIMES and not is_weekday:
@@ -2735,20 +2810,12 @@ def send_daily_challenges():
                     
                     reminder = random.choice(reminder_messages)
                     
-                    # Send to the same topic as the challenge
-                    if DAILY_CHALLENGE_TOPIC_ID:
-                        bot.send_message(
-                            PAID_GROUP_ID, 
-                            reminder, 
-                            message_thread_id=DAILY_CHALLENGE_TOPIC_ID
-                        )
-                        logging.info(f"Sent challenge reminder to topic {DAILY_CHALLENGE_TOPIC_ID} at {current_time}.")
-                    else:
-                        bot.send_message(
-                            PAID_GROUP_ID, 
-                            reminder
-                        )
-                        logging.info(f"Sent challenge reminder to main group at {current_time}.")
+                    # MODIFIED: Always send reminder to main group chat
+                    bot.send_message(
+                        PAID_GROUP_ID, 
+                        reminder
+                    )
+                    logging.info(f"Sent challenge reminder to main group at {current_time}.")
                         
                     # Update reminder date
                     last_reminder_date = current_date
