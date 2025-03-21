@@ -2649,7 +2649,7 @@ def ping_server():
     """Send a request to keep the server alive"""
     try:
         # Replace with your actual Render.com URL
-        url = "https://ptabot.onrender.com"  # Replace this with your actual URL
+        url = "https://ptabot.up.railway.app"  # Replace this with your actual URL
         
         # Get current time in Philippines timezone for logging
         manila_time = datetime.now(pytz.timezone('Asia/Manila')).strftime('%Y-%m-%d %I:%M:%S %p')
