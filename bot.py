@@ -70,10 +70,6 @@ class PhilippineTimeFormatter(logging.Formatter):
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Remove any existing handlers to prevent duplicates
-if logger.hasHandlers():
-    logger.handlers.clear()
-
 # Create and configure file handler
 file_handler = logging.FileHandler('bot.log')
 file_handler.setLevel(logging.INFO)
