@@ -3007,6 +3007,7 @@ def list_available_commands(message):
         ("/notify", "Send payment reminders to users near expiration"),
         ("/challenge", "Manually trigger a daily challenge"),
         ("/admin_dashboard", "Access admin controls"),
+        ("/leaderboard", "Manually trigger leaderboard update"),
     ]
     
     creator_commands = [
@@ -3526,7 +3527,7 @@ def generate_daily_leaderboard_text(date):
     
     for i, entry in enumerate(scores):
         points = entry.get('points', 0)
-        username = entry.get('username', 'No_Username')
+        username = safe_markdown_escape(entry.get('username', 'No_Username'))  # <-- Add safe_markdown_escape
         
         # If this score is different from the previous one, update the rank
         if last_score is not None and points != last_score:
@@ -3571,7 +3572,7 @@ def generate_monthly_leaderboard_text(year_month_str):
     
     for i, entry in enumerate(scores):
         total_points = entry.get('total_points', 0)
-        username = entry.get('username', 'No_Username')
+        username = safe_markdown_escape(entry.get('username', 'No_Username'))  # <-- Add safe_markdown_escape
         submissions = entry.get('submissions', 0)
         
         # If this score is different from the previous one, update the rank
@@ -3589,44 +3590,6 @@ def generate_monthly_leaderboard_text(year_month_str):
             rank_emoji = "🥉"
         else:
             rank_emoji = f"{current_rank}."
-        
-        leaderboard_text += f"{rank_emoji} @{username}: *{total_points} points* ({submissions} submissions)\n"
-    
-    leaderboard_text += f"\n🏆 Congratulations to all participants! Keep up the great work!"
-    
-    return leaderboard_text
-
-def generate_monthly_leaderboard_text(year_month_str):
-    """Generate formatted text for monthly leaderboard"""
-    # Parse year-month string into a date object to get month name
-    try:
-        date = datetime.strptime(year_month_str, '%Y-%m')
-        month_name = date.strftime('%B %Y')
-    except:
-        month_name = year_month_str
-    
-    scores = get_monthly_leaderboard(year_month_str)
-    
-    if not scores:
-        return f"📊 *MONTHLY LEADERBOARD: {month_name}*\n\nNo entries this month!"
-    
-    # Format the leaderboard message
-    leaderboard_text = f"📊 *MONTHLY LEADERBOARD: {month_name}*\n\n"
-    
-    for i, entry in enumerate(scores):
-        # Create emoji for top 3
-        if i == 0:
-            rank_emoji = "🥇"
-        elif i == 1:
-            rank_emoji = "🥈"
-        elif i == 2:
-            rank_emoji = "🥉"
-        else:
-            rank_emoji = f"{i+1}."
-            
-        username = entry.get('username', 'No_Username')
-        total_points = entry.get('total_points', 0)
-        submissions = entry.get('submissions', 0)
         
         leaderboard_text += f"{rank_emoji} @{username}: *{total_points} points* ({submissions} submissions)\n"
     
