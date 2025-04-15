@@ -18,6 +18,7 @@ import secrets  # Using secrets module for more secure randomness
 from datetime import datetime
 from keep_alive import keep_alive
 import calendar
+from collections import Counter
 
 
 BOT_VERSION = "Alpha Release 4.1"
@@ -291,14 +292,40 @@ def load_pending_users():
     except Exception as e:
         logging.error(f"MongoDB error loading pending users: {e}")
         return {}
+    
+# Load confession counter from MongoDB on startup
+def load_confession_counter():
+    try:
+        counter_doc = settings_collection.find_one({"_id": "confession_counter"})
+        if counter_doc:
+            return counter_doc.get("value", 0)
+        return 0
+    except Exception as e:
+        logging.error(f"Error loading confession counter: {e}")
+        return 0
+
+# Save confession counter to MongoDB
+def save_confession_counter(value):
+    try:
+        settings_collection.replace_one(
+            {"_id": "confession_counter"},
+            {"_id": "confession_counter", "value": value},
+            upsert=True
+        )
+    except Exception as e:
+        logging.error(f"Error saving confession counter: {e}")
 
 # Dictionaries to store user payment data
 USER_PAYMENT_DUE = {}
+CONFESSION_COUNTER = 0
+USERS_CONFESSING = {}
 PAYMENT_DATA = load_payment_data()
 CONFIRMED_OLD_MEMBERS = load_confirmed_old_members()
 PENDING_USERS = load_pending_users() 
 CHANGELOGS = load_changelogs()
 BOT_SETTINGS = load_settings()
+CONFESSION_COUNTER = load_confession_counter()
+CONFESSION_TOPIC_ID = BOT_SETTINGS.get('confession_topic_id', None)
 DAILY_CHALLENGE_TOPIC_ID = BOT_SETTINGS.get('daily_challenge_topic_id', None)
 ANNOUNCEMENT_TOPIC_ID = BOT_SETTINGS.get('announcement_topic_id', None)
 ACCOUNTABILITY_TOPIC_ID = BOT_SETTINGS.get('accountability_topic_id', None)
@@ -574,7 +601,16 @@ def choose_option(message):
             markup.add(KeyboardButton("NEW MEMBER (Enrolled after November 2024)"), KeyboardButton("OG MEMBER (Enrolled before November 2024)"))
             bot.send_message(chat_id, "Are you a new member or an old member?", reply_markup=markup)
     elif option == "🔍 Existing Member Verification":
-        username = message.from_user.username or "No Username"
+        username = message.from_user.username
+        first_name = message.from_user.first_name or ""
+        last_name = message.from_user.last_name or ""
+        
+        # Create display name using first name and last name when username is not available
+        if not username:
+            display_name = f"{first_name} {last_name}".strip() or "No Name"
+            user_display = f"{display_name} (No Username)"
+        else:
+            user_display = f"@{username}"
 
         # Check if the user is already verified
         if str(user_id) in CONFIRMED_OLD_MEMBERS:
@@ -585,8 +621,8 @@ def choose_option(message):
         PENDING_USERS[chat_id]['request_time'] = datetime.now()  # Add timestamp
         save_pending_users()
 
-        # Escape Markdown characters in username
-        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        # Escape Markdown characters in user display text
+        user_display = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', user_display)
 
         # Forward the request to admins with inline buttons
         for admin in ADMIN_IDS:
@@ -595,7 +631,7 @@ def choose_option(message):
             markup.add(InlineKeyboardButton("Reject", callback_data=f"reject_old_{user_id}"))
             bot.send_message(admin, 
                 f"🔔 *Existing Member Verification Request:*\n"
-                f"🆔 @{username} (ID: `{user_id}`)\n\n"
+                f"🆔 {user_display} (ID: `{user_id}`)\n\n"
                 "Please review and confirm this user's status.",
                 reply_markup=markup,
                 parse_mode="Markdown"
@@ -3737,6 +3773,167 @@ def manual_leaderboard(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Error generating leaderboard: {str(e)}")
         logging.error(f"Error in manual_leaderboard: {e}")
+
+
+# Command handler for /setconfessiontopic
+@bot.message_handler(commands=['setconfessiontopic'])
+def set_confession_topic(message):
+    """Set or change the topic ID for confessions"""
+    global CONFESSION_TOPIC_ID
+    
+    # Only allow the creator to use this command
+    if message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to the bot creator.")
+        return
+    
+    args = message.text.split()
+    
+    # Show current setting if no arguments provided
+    if len(args) == 1:
+        current_topic = CONFESSION_TOPIC_ID if CONFESSION_TOPIC_ID else "Not set (using main group)"
+        bot.reply_to(message, f"Current confession topic ID: `{current_topic}`\n\nTo change, use: `/setconfessiontopic ID`", parse_mode="Markdown")
+        return
+        
+    try:
+        # Handle "clear" or "reset" to remove topic ID
+        if args[1].lower() in ["clear", "reset", "none"]:
+            CONFESSION_TOPIC_ID = None
+            BOT_SETTINGS['confession_topic_id'] = None
+            save_settings(BOT_SETTINGS)
+            bot.reply_to(message, "✅ Confessions will now be sent to the main group chat.")
+            return
+            
+        # Try to parse as integer
+        new_topic_id = int(args[1])
+        CONFESSION_TOPIC_ID = new_topic_id
+        
+        # Save to database
+        BOT_SETTINGS['confession_topic_id'] = new_topic_id
+        save_settings(BOT_SETTINGS)
+        
+        bot.reply_to(message, f"✅ Confessions will now be sent to topic ID: `{new_topic_id}`\nThis setting has been saved to the database.", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid topic ID. Please provide a numeric ID or 'clear' to reset.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error setting topic ID: {str(e)}")
+
+# Command to initiate a confession
+@bot.message_handler(commands=['confess'])
+def start_confession(message):
+    """Start the confession process"""
+    # Only allow in private chats
+    if message.chat.type != 'private':
+        bot.reply_to(message, "🤫 Please send me a direct message to start your confession.")
+        return
+    
+    user_id = message.from_user.id
+    
+    # Check if user is already confessing
+    if user_id in USERS_CONFESSING:
+        bot.send_message(user_id, "⏳ You already have a confession in progress. Please complete it or send /cancel to stop.")
+        return
+    
+    USERS_CONFESSING[user_id] = {'status': 'awaiting_confession'}
+    
+    # Personalize the instruction for better engagement
+    welcome_messages = [
+        "🔒 *Anonymous Confession*\n\nShare your trading frustrations, wins, or anything on your mind. Your identity will remain hidden.\n\nType your confession now or send /cancel to stop.",
+        
+        "🤫 *Secret Sharing*\n\nGot something to get off your chest about your trading journey? No one will know it's you.\n\nType your confession now or send /cancel to stop.",
+        
+        "🎭 *Anonymous Message*\n\nShare your trading experiences, market observations, or personal thoughts anonymously with the community.\n\nType your confession now or send /cancel to stop."
+    ]
+    
+    bot.send_message(user_id, random.choice(welcome_messages), parse_mode="Markdown")
+
+# Command to cancel an in-progress confession
+@bot.message_handler(commands=['cancel'])
+def cancel_confession(message):
+    """Cancel an in-progress confession"""
+    # Only process in private chats
+    if message.chat.type != 'private':
+        return
+        
+    user_id = message.from_user.id
+    
+    if user_id in USERS_CONFESSING:
+        USERS_CONFESSING.pop(user_id)
+        bot.send_message(user_id, "✅ Confession cancelled. Your message wasn't sent.")
+    else:
+        bot.send_message(user_id, "❓ You don't have any active confession to cancel.")
+
+# Handle confession messages
+@bot.message_handler(func=lambda message: message.chat.type == 'private' and 
+                    message.from_user.id in USERS_CONFESSING and 
+                    USERS_CONFESSING[message.from_user.id]['status'] == 'awaiting_confession')
+def handle_confession(message):
+    """Process a user's confession"""
+    user_id = message.from_user.id
+    confession_text = message.text
+    
+    # Some basic moderation/filtering
+    if not confession_text or len(confession_text) < 3:
+        bot.send_message(user_id, "❌ Your confession is too short. Please write something meaningful or use /cancel to stop.")
+        return
+        
+    if len(confession_text) > 2000:
+        bot.send_message(user_id, "❌ Your confession is too long (max 2000 characters). Please shorten it or use /cancel to stop.")
+        return
+    
+    # Check for offensive content (this is a very basic implementation)
+    offensive_words = ["slur1", "slur2", "badword"]  # Replace with actual moderation list
+    if any(word in confession_text.lower() for word in offensive_words):
+        bot.send_message(user_id, "❌ Your confession contains content that violates our community guidelines. Please revise it or use /cancel to stop.")
+        return
+    
+    # Increment the confession counter
+    global CONFESSION_COUNTER
+    CONFESSION_COUNTER += 1
+    save_confession_counter(CONFESSION_COUNTER)
+    
+    # Format the confession message
+    confession_message = f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{confession_text}"
+    
+    try:
+        # Send to the group or topic
+        if CONFESSION_TOPIC_ID:
+            sent_message = bot.send_message(
+                PAID_GROUP_ID,
+                confession_message,
+                parse_mode="Markdown",
+                message_thread_id=CONFESSION_TOPIC_ID
+            )
+        else:
+            sent_message = bot.send_message(
+                PAID_GROUP_ID, 
+                confession_message,
+                parse_mode="Markdown"
+            )
+        
+        # Log the confession (not linking to the user for privacy)
+        logging.info(f"Confession #{CONFESSION_COUNTER} sent to group")
+        
+        # Send confirmation to user
+        confirmation_messages = [
+            "✅ *Confession sent!*\n\nYour message has been posted anonymously. Thank you for sharing.",
+            "🤫 *Secret shared!*\n\nYour anonymous confession has been posted to the group.",
+            "📨 *Message delivered!*\n\nYour thoughts have been shared anonymously with the community."
+        ]
+        
+        bot.send_message(user_id, random.choice(confirmation_messages), parse_mode="Markdown")
+        
+        # Keep admin record of who sent what confession (for moderation purposes)
+        admin_record = f"📝 *Admin Log*\n\nConfession #{CONFESSION_COUNTER} was submitted by User ID: `{user_id}`"
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, admin_record, parse_mode="Markdown")
+        
+    except Exception as e:
+        logging.error(f"Error sending confession: {e}")
+        bot.send_message(user_id, "❌ There was an error sending your confession. Please try again later.")
+    
+    # Remove user from confessing dict
+    USERS_CONFESSING.pop(user_id, None)
 
 keep_alive()
 
