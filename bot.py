@@ -3959,6 +3959,27 @@ def handle_confession(message):
     # Remove user from confessing dict
     USERS_CONFESSING.pop(user_id, None)
 
+@bot.message_handler(commands=['refreshexpired'])
+def refresh_expired_members(message):
+    # Check if user is admin
+    if message.from_user.id not in CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to Creator only.")
+        return
+        
+    count = 0
+    for user_id_str, data in PAYMENT_DATA.items():
+        try:
+            due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+            now = datetime.now()
+            if due_date < now and not data.get('admin_action_pending', False):
+                PAYMENT_DATA[user_id_str]['admin_action_pending'] = True
+                count += 1
+        except Exception as e:
+            logging.error(f"Error processing user {user_id_str}: {e}")
+    
+    save_payment_data()  # Save changes to database
+    bot.reply_to(message, f"✅ Added admin_action_pending flag to {count} expired members.")
+
 keep_alive()
 
 # Start reminder thread
