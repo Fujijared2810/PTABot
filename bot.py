@@ -1436,7 +1436,7 @@ def send_payment_reminder():
                                 save_reminder_message(user_id, reminder_messages[user_id])
                         
                         # Check if membership has expired
-                        elif due_date < now and data['haspayed'] and not data.get('grace_period', False):
+                        elif due_date < now and (data['haspayed'] or data.get('admin_action_pending', False)) and not data.get('grace_period', False):
                             # Delete previous reminders for this user
                             if user_id in reminder_messages:
                                 try:
@@ -1462,8 +1462,9 @@ def send_payment_reminder():
                                 )
                                 logging.info(f"Sent expiry notice to user {user_id}")
                                 
-                                # Update payment data
+                                # Update payment data - mark as pending admin action instead of just setting haspayed=False
                                 PAYMENT_DATA[user_id_str]['haspayed'] = False
+                                PAYMENT_DATA[user_id_str]['admin_action_pending'] = True
                                 PAYMENT_DATA[user_id_str]['reminder_sent'] = False
                                 save_payment_data()
                                 
@@ -1583,6 +1584,7 @@ def handle_grace_period(call):
             PAYMENT_DATA[user_id_str]['grace_period'] = True
             PAYMENT_DATA[user_id_str]['grace_end_date'] = grace_end_date.strftime('%Y-%m-%d %H:%M:%S')
             PAYMENT_DATA[user_id_str]['haspayed'] = True  # Temporarily mark as paid during grace period
+            PAYMENT_DATA[user_id_str]['admin_action_pending'] = False  # Clear the pending flag
             save_payment_data()
         
         # Notify the user about the grace period
@@ -1680,6 +1682,11 @@ def handle_kick_member(call):
             call.message.message_id,
             parse_mode="Markdown"
         )
+
+        # In handle_kick_member function - after successful kick:
+        if kick_successful:
+            PAYMENT_DATA[user_id_str]['admin_action_pending'] = False
+            save_payment_data()
         
         # Notify ALL admins about this action using direct regex escaping
         admin_username = call.from_user.username or f"Admin {admin_id}"
@@ -1711,6 +1718,9 @@ def handle_keep_member(call):
     # Extract user ID
     user_id = int(call.data.split("_")[1])
     user_id_str = str(user_id)
+
+    PAYMENT_DATA[user_id_str]['admin_action_pending'] = False
+    save_payment_data()
     
     try:
         # Get username for display
@@ -1786,9 +1796,23 @@ def delete_all_reminders():
             # Delete from MongoDB
             delete_reminder_message(user_id)
             
+            # Check if this user's membership has expired
+            user_id_str = str(user_id)
+            if user_id_str in PAYMENT_DATA:
+                due_date = datetime.strptime(PAYMENT_DATA[user_id_str]['due_date'], '%Y-%m-%d %H:%M:%S')
+                now = datetime.now()
+                if due_date < now and PAYMENT_DATA[user_id_str].get('haspayed', False):
+                    # Reset admin_action_pending flag to ensure fresh admin notifications will be sent
+                    # at the next scheduled reminder time
+                    PAYMENT_DATA[user_id_str]['admin_action_pending'] = True
+                    logging.info(f"Midnight cleanup: Marked user {user_id} for admin notification")
+            
         except Exception as e:
             logging.error(f"Midnight cleanup: Error processing user {user_id}: {e}")
             failed_count += 1
+    
+    # Save updates to PAYMENT_DATA
+    save_payment_data()
     
     # Clear the reminder_messages dictionary
     reminder_messages.clear()
