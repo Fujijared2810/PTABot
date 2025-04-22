@@ -640,6 +640,30 @@ def choose_option(message):
         bot.send_message(chat_id, "Your request has been sent to the admins for verification. Please wait.")
 
     elif option == "❌ Cancel Membership":
+        # Check if user has an active membership
+        if str(user_id) not in PAYMENT_DATA:
+            bot.send_message(chat_id, "❌ You don't have an active membership to cancel.")
+            return
+            
+        # Check if the membership is already cancelled
+        if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)].get('cancelled', False):
+            due_date = PAYMENT_DATA[str(user_id)].get('due_date', 'Unknown')
+            try:
+                due_date_obj = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
+                days_remaining = (due_date_obj - datetime.now()).days
+                
+                bot.send_message(
+                    chat_id, 
+                    f"ℹ️ Your membership is already cancelled.\n\n"
+                    f"You will still have access until {due_date_obj.strftime('%Y-%m-%d')} "
+                    f"({days_remaining} days remaining).\n\n"
+                    f"If you wish to reactivate your membership, please use /start and select 'Renew Membership'."
+                )
+            except Exception as e:
+                # Fallback if date parsing fails
+                bot.send_message(chat_id, "ℹ️ Your membership is already cancelled. You will still have access until the next payment cycle.")
+            return
+
         PENDING_USERS[chat_id]['status'] = 'cancel_membership'
         save_pending_users()
         markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
@@ -910,6 +934,7 @@ def handle_payment_screenshot(message):
 
     PENDING_USERS[chat_id]['status'] = 'waiting_approval'
     PENDING_USERS[chat_id]['request_time'] = datetime.now()  # Add timestamp
+    delete_pending_user(user_id)
     save_pending_users()
     bot.send_message(chat_id, random.choice(payment_review_messages), parse_mode="Markdown")
 
