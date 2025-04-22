@@ -3972,10 +3972,29 @@ def handle_confession(message):
         
         bot.send_message(user_id, random.choice(confirmation_messages), parse_mode="Markdown")
         
+        # Get user info
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username
+            first_name = user_info.first_name or ""
+            last_name = user_info.last_name or ""
+            
+            if username:
+                user_display = f"@{username}"
+            else:
+                user_display = f"{first_name} {last_name}".strip() or f"User ID: {user_id}"
+                
+            # Escape any Markdown characters in user_display
+            user_display = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', user_display)
+        except Exception as e:
+            # Fallback if we can't get user info
+            logging.error(f"Error getting user info for confession: {e}")
+            user_display = f"User ID: {user_id}"
+
         # Keep admin record of who sent what confession (for moderation purposes)
-        admin_record = f"📝 *Admin Log*\n\nConfession #{CONFESSION_COUNTER} was submitted by User ID: `{user_id}`"
-        for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, admin_record, parse_mode="Markdown")
+        # Only send to CREATOR, not all admins
+        admin_record = f"📝 *Admin Log*\n\nConfession #{CONFESSION_COUNTER} was submitted by {user_display}"
+        bot.send_message(CREATOR_ID, admin_record, parse_mode="Markdown")
         
     except Exception as e:
         logging.error(f"Error sending confession: {e}")
