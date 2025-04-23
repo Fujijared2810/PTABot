@@ -1477,7 +1477,53 @@ def send_payment_reminder():
                                         bot.delete_message(admin_id, msg_id)
                                     except Exception as e:
                                         logging.error(f"Failed to delete previous admin reminder: {e}")
-                            
+
+                                # Update payment data
+                                PAYMENT_DATA[user_id_str]['haspayed'] = False
+                                PAYMENT_DATA[user_id_str]['admin_action_pending'] = True
+                                PAYMENT_DATA[user_id_str]['reminder_sent'] = False
+                                save_payment_data()
+
+                                # Calculate days since expiration
+                                days_expired = (now - due_date).days
+                                
+                                # Send notification to admins with action buttons based on expiration duration
+                                admin_messages = {}
+                                for admin_id in ADMIN_IDS:
+                                    markup = InlineKeyboardMarkup()
+                                    
+                                    # If expired more than 3 days, only offer kick or keep (no grace period)
+                                    if days_expired > 3:
+                                        markup.add(
+                                            InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}"),
+                                            InlineKeyboardButton("✓ Keep Member", callback_data=f"keep_{user_id}")
+                                        )
+                                        
+                                        admin_msg = bot.send_message(
+                                            admin_id, 
+                                            f"⚠️ *LONG-EXPIRED MEMBERSHIP*\n\n"
+                                            f"{user_display}'s membership has been expired for {days_expired} days.\n\n"
+                                            f"What would you like to do with this member?",
+                                            parse_mode="Markdown",
+                                            reply_markup=markup
+                                        )
+                                    else:
+                                        # For recently expired members, offer grace period
+                                        markup.add(
+                                            InlineKeyboardButton("⏳ Give 2 Days Grace", callback_data=f"grace_{user_id}"),
+                                            InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}")
+                                        )
+                                        
+                                        admin_msg = bot.send_message(
+                                            admin_id, 
+                                            f"⚠️ *MEMBERSHIP EXPIRED*\n\n"
+                                            f"{user_display}'s membership has expired and has been marked as unpaid in the system.\n\n"
+                                            f"What would you like to do with this member?",
+                                            parse_mode="Markdown",
+                                            reply_markup=markup
+                                        )
+                                        
+                                    admin_messages[admin_id] = admin_msg.message_id
                             try:
                                 # Send expiry notice to user
                                 bot.send_chat_action(user_id, 'typing')
@@ -4023,6 +4069,208 @@ def refresh_expired_members(message):
     
     save_payment_data()  # Save changes to database
     bot.reply_to(message, f"✅ Added admin_action_pending flag to {count} expired members.")
+
+@bot.message_handler(commands=['resend'])
+def resend_reminders(message):
+    """Force a cleanup and resend of payment reminders"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    try:
+        # First inform that we're starting the process
+        bot.reply_to(message, "🔄 Forcing reminder cleanup and resend... Please wait.")
+        
+        # Perform midnight cleanup to delete all existing reminders
+        delete_all_reminders()
+        
+        # Track counts for notification results
+        upcoming_reminders = 0
+        expired_reminders = 0
+        failed_reminders = 0
+        
+        # Process all users for eligible reminders
+        current_time = datetime.now(pytz.timezone('Asia/Manila'))
+        
+        for user_id_str, data in PAYMENT_DATA.items():
+            try:
+                user_id = int(user_id_str)
+                
+                # Skip users who don't have active payments or have cancelled
+                if not data.get('haspayed', False) or data.get('cancelled', False):
+                    continue
+                
+                # Get user's due date
+                due_date_naive = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                manila_tz = pytz.timezone('Asia/Manila')
+                due_date = manila_tz.localize(due_date_naive)
+                
+                # Calculate days until due
+                days_until_due = (due_date - current_time).days
+                
+                # Get display info
+                username = data.get('username', None)
+                if username:
+                    username = escape_markdown(username)
+                    user_display = f"@{username}"
+                else:
+                    user_display = f"User {user_id}"
+                
+                # Check if this user should get an upcoming payment reminder (3 days or less)
+                if 0 <= days_until_due <= 3:
+                    try:
+                        # Send reminder to user
+                        bot.send_chat_action(user_id, 'typing')
+                        user_msg = bot.send_message(
+                            user_id, 
+                            f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}."
+                        )
+                        
+                        # Send notification to admins
+                        admin_messages = {}
+                        for admin_id in ADMIN_IDS:
+                            admin_msg = bot.send_message(
+                                admin_id, 
+                                f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days."
+                            )
+                            admin_messages[admin_id] = admin_msg.message_id
+                        
+                        # Store new message IDs
+                        reminder_messages[user_id] = {
+                            'user_msg_id': user_msg.message_id,
+                            'admin_msg_ids': admin_messages
+                        }
+                        # Save to MongoDB
+                        save_reminder_message(user_id, reminder_messages[user_id])
+                        
+                        upcoming_reminders += 1
+                        
+                    except ApiException:
+                        # Failed to send to user, still notify admins
+                        admin_messages = {}
+                        for admin_id in ADMIN_IDS:
+                            admin_msg = bot.send_message(
+                                admin_id, 
+                                f"⚠️ *Failed to send payment reminder*\n\n"
+                                f"Could not send payment reminder to {user_display}.\n"
+                                f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
+                                f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
+                                f"Please contact them manually.",
+                                parse_mode="Markdown"
+                            )
+                            admin_messages[admin_id] = admin_msg.message_id
+                        
+                        # Store only admin message IDs
+                        reminder_messages[user_id] = {
+                            'admin_msg_ids': admin_messages
+                        }
+                        # Save to MongoDB
+                        save_reminder_message(user_id, reminder_messages[user_id])
+                        
+                        failed_reminders += 1
+                
+                # Check if membership has expired
+                elif due_date < current_time and not data.get('grace_period', False):
+                    # Handle expired membership
+                    try:
+                        # Calculate days since expiration
+                        days_expired = (current_time - due_date).days
+                        
+                        # Update payment data
+                        PAYMENT_DATA[user_id_str]['haspayed'] = False
+                        PAYMENT_DATA[user_id_str]['admin_action_pending'] = True
+                        PAYMENT_DATA[user_id_str]['reminder_sent'] = False
+                        
+                        # Send notification to admins with action buttons based on expiration duration
+                        admin_messages = {}
+                        for admin_id in ADMIN_IDS:
+                            markup = InlineKeyboardMarkup()
+                            
+                            # If expired more than 3 days, only offer kick or keep (no grace period)
+                            if days_expired > 3:
+                                markup.add(
+                                    InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}"),
+                                    InlineKeyboardButton("✓ Keep Member", callback_data=f"keep_{user_id}")
+                                )
+                                
+                                admin_msg = bot.send_message(
+                                    admin_id, 
+                                    f"⚠️ *LONG-EXPIRED MEMBERSHIP*\n\n"
+                                    f"{user_display}'s membership has been expired for {days_expired} days.\n\n"
+                                    f"What would you like to do with this member?",
+                                    parse_mode="Markdown",
+                                    reply_markup=markup
+                                )
+                            else:
+                                # For recently expired members, offer grace period
+                                markup.add(
+                                    InlineKeyboardButton("⏳ Give 2 Days Grace", callback_data=f"grace_{user_id}"),
+                                    InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}")
+                                )
+                                
+                                admin_msg = bot.send_message(
+                                    admin_id, 
+                                    f"⚠️ *MEMBERSHIP EXPIRED*\n\n"
+                                    f"{user_display}'s membership has expired and has been marked as unpaid in the system.\n\n"
+                                    f"What would you like to do with this member?",
+                                    parse_mode="Markdown",
+                                    reply_markup=markup
+                                )
+                                
+                            admin_messages[admin_id] = admin_msg.message_id
+                            
+                        # Send expiry notice to user
+                        try:
+                            bot.send_chat_action(user_id, 'typing')
+                            user_msg = bot.send_message(
+                                user_id, 
+                                "❌ Your membership has expired. Please renew your membership to continue accessing our services."
+                            )
+                            
+                            # Store new message IDs
+                            reminder_messages[user_id] = {
+                                'user_msg_id': user_msg.message_id,
+                                'admin_msg_ids': admin_messages
+                            }
+                            # Save to MongoDB
+                            save_reminder_message(user_id, reminder_messages[user_id])
+                            
+                        except ApiException:
+                            # Failed to send to user, store only admin messages
+                            reminder_messages[user_id] = {
+                                'admin_msg_ids': admin_messages
+                            }
+                            # Save to MongoDB
+                            save_reminder_message(user_id, reminder_messages[user_id])
+                            
+                        expired_reminders += 1
+                        
+                    except Exception as e:
+                        logging.error(f"Error processing expired membership for user {user_id_str}: {e}")
+                        failed_reminders += 1
+                        
+            except Exception as e:
+                logging.error(f"Error processing user {user_id_str} in resend: {e}")
+                failed_reminders += 1
+        
+        # Save updated payment data
+        save_payment_data()
+        
+        # Send summary to admin
+        summary = (
+            f"✅ *Reminder Resend Complete*\n\n"
+            f"📊 *Results:*\n"
+            f"• Upcoming payment reminders: {upcoming_reminders}\n"
+            f"• Expired membership notifications: {expired_reminders}\n"
+            f"• Failed notifications: {failed_reminders}\n\n"
+            f"All previous reminder messages have been cleaned up."
+        )
+        bot.send_message(message.chat.id, summary, parse_mode="Markdown")
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error during resend operation: {str(e)}")
+        logging.error(f"Error in resend_reminders command: {e}")
 
 keep_alive()
 
