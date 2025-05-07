@@ -33,7 +33,7 @@ DISCOUNTS = {
     'supreme': None   # Discount for Supreme membership
 }
 
-BOT_VERSION = "v5.0.2a"  # v[Major].[Minor].[Build][Status]
+BOT_VERSION = "v5.0.3a"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -1864,8 +1864,8 @@ def choose_mentorship_plan(message):
         duration = "Yearly"
         mentorship_type = "regular"
         plan_image = "graphics/regular_legacy.jpeg"
-    elif "Master" in plan_text and "$899.99" in plan_text:
-        plan = "Master"
+    elif "Legacy" in plan_text and "$899.99" in plan_text:
+        plan = "Legacy"
         price_usd = 899.99
         duration = "Lifetime"
         mentorship_type = "supreme"
