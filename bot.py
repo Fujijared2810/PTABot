@@ -33,7 +33,7 @@ DISCOUNTS = {
     'supreme': None   # Discount for Supreme membership
 }
 
-BOT_VERSION = "v5.0.4a"  # v[Major].[Minor].[Build][Status]
+BOT_VERSION = "v5.0.5a"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -1130,7 +1130,7 @@ def choose_option(message):
 
     if option in ["📅 Purchase Membership", "🔄 Renew Membership"]:
         # Check if this is a new purchase or a renewal
-        is_renewal = (option == "🔄 Renew Membership")
+        is_renewal = option == "🔄 Renew Membership"
         
         # If it's a new purchase, check enrollment status
         if option == "📅 Purchase Membership":
@@ -1139,11 +1139,12 @@ def choose_option(message):
                 bot.send_message(chat_id, "✅ You have already paid for your membership. No further action is required.")
                 return
                 
-            # Check enrollment status for new purchases (not renewals)
-            enrollment_open = BOT_SETTINGS.get('enrollment_open', False)  # Default to open if not set
+            # Check regular and supreme enrollment status for new purchases (not renewals)
+            regular_enrollment_open = BOT_SETTINGS.get('regular_enrollment_open', True)  # Default to open if not set
+            supreme_enrollment_open = BOT_SETTINGS.get('supreme_enrollment_open', True)  # Default to open if not set
                         
-            # Modified condition: Block ALL new purchases (not renewals) when enrollment is closed
-            if not enrollment_open and not is_renewal:
+            # If both enrollment types are closed, show a message
+            if not regular_enrollment_open and not supreme_enrollment_open and not is_renewal:
                 # Enrollment is closed - show message to ALL users trying to purchase (not renew)
                 
                 # Create inline keyboard with Update and FAQ buttons
@@ -1180,11 +1181,10 @@ def choose_option(message):
                 bot.send_photo(
                     chat_id,
                     benefits_img,
-                    caption="Explore our membership benefits and choose the plan that's right for you!",
-                    parse_mode="Markdown"
+                    caption="Explore our membership benefits and choose the plan that's right for you!"
                 )
         except FileNotFoundError:
-            logging.error("Enrollment benefits image not found at graphics/enrollment_benefits.jpg")
+            logging.error("Enrollment benefits image not found at graphics/benefits.jpeg")
         except Exception as e:
             logging.error(f"Error sending enrollment benefits image: {e}")
         
@@ -1195,6 +1195,7 @@ def choose_option(message):
         PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
         PENDING_USERS[chat_id]['is_renewal'] = is_renewal  # Mark as renewal for later handling
         save_pending_users()
+        
         markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
         markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
         markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
@@ -1236,8 +1237,6 @@ def choose_option(message):
             reply_markup=markup,
             parse_mode="Markdown"
         )
-        
-        # No need to change user status since they're just viewing FAQs
 
     elif option == "❌ Cancel Membership":
         # Check if user has an active membership
@@ -1273,7 +1272,7 @@ def choose_option(message):
                     caption="⚠️ Please confirm if you wish to cancel your membership"
                 )
         except FileNotFoundError:
-            logging.error("Cancellation confirmation image not found at graphics/cancel_confirm.jpeg")
+            logging.error("Cancellation confirmation image not found at graphics/cancel_membership.jpeg")
         except Exception as e:
             logging.error(f"Error sending cancellation confirmation image: {e}")
         
@@ -1287,6 +1286,10 @@ def choose_option(message):
         markup.add(KeyboardButton("Yes"), KeyboardButton("No"))
         bot.send_message(chat_id, "Are you sure you want to cancel your membership? You will still have access until next month/year, but you will not be charged. Please confirm.", reply_markup=markup)
 
+    elif option == "⬅️ Go Back":
+        # If user clicks the back button, take them back to main menu
+        show_main_menu(chat_id, user_id)
+        
     else:
         bot.send_message(chat_id, "❌ Invalid option. Please select from the available options.")
 
@@ -1618,8 +1621,6 @@ def choose_mentorship_type(message):
     mentorship_type = message.text
     is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
 
-    # Store whether user is an OG member for pricing
-
     # Check if user wants to go back
     if mentorship_type == "⬅️ Go Back":
         # Return to main menu
@@ -1627,6 +1628,28 @@ def choose_mentorship_type(message):
         return
     
     if mentorship_type == "Regular Mentorship":
+        # Check enrollment status for Regular membership if this is a new purchase
+        if not is_renewal and not BOT_SETTINGS.get('regular_enrollment_open', True):
+            # Create inline keyboard with Get Notified and FAQ buttons
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+            )
+            
+            bot.send_message(
+                chat_id,
+                "⚠️ *Regular Membership enrollment is currently CLOSED*\n\n"
+                "New Regular Membership purchases are temporarily unavailable.\n"
+                "Please wait for the next announcement about when enrollment will open again.\n\n"
+                "• Click *Get Notified* to receive updates when enrollment opens\n"
+                "• Check our *FAQ* section for more information\n\n"
+                "Existing members can still renew their memberships.",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            return
+            
         # First send the Regular Mentorship pricing image
         try:
             with open('graphics/regular.jpeg', 'rb') as pricing_img:
@@ -1716,6 +1739,28 @@ def choose_mentorship_type(message):
                           parse_mode="HTML")
         
     elif mentorship_type == "Supreme Mentorship":
+        # Check enrollment status for Supreme membership if this is a new purchase
+        if not is_renewal and not BOT_SETTINGS.get('supreme_enrollment_open', True):
+            # Create inline keyboard with Get Notified and FAQ buttons
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+            )
+            
+            bot.send_message(
+                chat_id,
+                "⚠️ *Supreme Membership enrollment is currently CLOSED*\n\n"
+                "New Supreme Membership purchases are temporarily unavailable.\n"
+                "Please wait for the next announcement about when enrollment will open again.\n\n"
+                "• Click *Get Notified* to receive updates when enrollment opens\n"
+                "• Check our *FAQ* section for more information\n\n"
+                "Existing members can still renew their memberships.",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            return
+            
         # First send the Supreme Mentorship pricing image
         try:
             with open('graphics/supreme.jpeg', 'rb') as pricing_img:
@@ -10439,28 +10484,36 @@ def export_form_responses(message):
 
 @bot.message_handler(commands=['enrollment'])
 def handle_enrollment_command(message):
-    """Toggle enrollment status (admin only)"""
+    """Manage enrollment status for Regular and Supreme memberships (admin only)"""
     # Check if user is admin or creator
     if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
         bot.reply_to(message, "❌ This command is only available to administrators.")
         return
     
-    # Create a keyboard with enrollment options
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton("🟢 Open Enrollment", callback_data="enrollment_open"),
-        InlineKeyboardButton("🔴 Close Enrollment", callback_data="enrollment_close")
-    )
-    
     # Get current status
-    enrollment_open = BOT_SETTINGS.get('enrollment_open', False)  # Default to open
-    current_status = "🟢 OPEN" if enrollment_open else "🔴 CLOSED"
+    regular_enrollment_open = BOT_SETTINGS.get('regular_enrollment_open', True)  # Default to open
+    supreme_enrollment_open = BOT_SETTINGS.get('supreme_enrollment_open', True)  # Default to open
+    
+    regular_status = "🟢 OPEN" if regular_enrollment_open else "🔴 CLOSED"
+    supreme_status = "🟢 OPEN" if supreme_enrollment_open else "🔴 CLOSED"
+    
+    # Create a keyboard with enrollment options
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🟢 Open Regular", callback_data="enrollment_regular_open"),
+        InlineKeyboardButton("🔴 Close Regular", callback_data="enrollment_regular_close")
+    )
+    markup.add(
+        InlineKeyboardButton("🟢 Open Supreme", callback_data="enrollment_supreme_open"),
+        InlineKeyboardButton("🔴 Close Supreme", callback_data="enrollment_supreme_close")
+    )
     
     bot.reply_to(
         message,
         f"🔄 *ENROLLMENT STATUS CONTROL*\n\n"
-        f"Current Status: *{current_status}*\n\n"
-        f"Select an option to change the status:",
+        f"*Regular Membership:* {regular_status}\n"
+        f"*Supreme Membership:* {supreme_status}\n\n"
+        f"Select an option to change enrollment status:",
         parse_mode="Markdown",
         reply_markup=markup
     )
@@ -10476,76 +10529,103 @@ def handle_enrollment_callback(call):
         bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
         return
     
+    # Parse callback data to determine enrollment type and action
+    parts = call.data.split("_")
+    enrollment_type = parts[1]  # "regular", "supreme", or "both"
+    action = parts[2]           # "open" or "close"
+    
     # Handle the different options
-    if call.data == "enrollment_open":
-        # Open enrollment
-        BOT_SETTINGS['enrollment_open'] = True
+    if enrollment_type == "regular" and action == "open":
+        # Open regular enrollment
+        BOT_SETTINGS['regular_enrollment_open'] = True
         save_settings(BOT_SETTINGS)
+        status_message = "Regular Membership enrollment is now *🟢 OPEN*"
+        admin_message = "has *OPENED* Regular Membership enrollment"
+        action_text = "Regular Membership enrollment is now OPEN"
+        is_open = True
         
-        # Update the message
-        bot.edit_message_text(
-            "✅ *Enrollment Status Updated*\n\n"
-            "Enrollment is now *🟢 OPEN*\n\n"
-            "New users can now purchase memberships.",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown"
-        )
-        
-        bot.answer_callback_query(call.id, "Enrollment is now OPEN")
-        
-        # Log the action
-        admin_username = call.from_user.username or f"Admin {call.from_user.id}"
-        logging.info(f"Enrollment opened by {admin_username}")
-        
-        # Notify other admins
-        for admin_id in ADMIN_IDS:
-            if admin_id != call.from_user.id:  # Don't send to the admin who performed the action
-                bot.send_message(
-                    admin_id,
-                    f"ℹ️ *Enrollment Status Changed*\n\n"
-                    f"@{safe_markdown_escape(admin_username)} has *OPENED* enrollment.\n\n"
-                    f"New users can now purchase memberships.",
-                    parse_mode="Markdown"
-                )
-        
-        # Notify subscribers about the enrollment opening
-        notify_enrollment_change(True)
-        
-    elif call.data == "enrollment_close":
-        # Close enrollment
-        BOT_SETTINGS['enrollment_open'] = False
+    elif enrollment_type == "regular" and action == "close":
+        # Close regular enrollment
+        BOT_SETTINGS['regular_enrollment_open'] = False
         save_settings(BOT_SETTINGS)
+        status_message = "Regular Membership enrollment is now *🔴 CLOSED*"
+        admin_message = "has *CLOSED* Regular Membership enrollment"
+        action_text = "Regular Membership enrollment is now CLOSED"
+        is_open = False
         
-        # Update the message
-        bot.edit_message_text(
-            "✅ *Enrollment Status Updated*\n\n"
-            "Enrollment is now *🔴 CLOSED*\n\n"
-            "Only existing members can renew their memberships.",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown"
-        )
+    elif enrollment_type == "supreme" and action == "open":
+        # Open supreme enrollment
+        BOT_SETTINGS['supreme_enrollment_open'] = True
+        save_settings(BOT_SETTINGS)
+        status_message = "Supreme Membership enrollment is now *🟢 OPEN*"
+        admin_message = "has *OPENED* Supreme Membership enrollment"
+        action_text = "Supreme Membership enrollment is now OPEN"
+        is_open = True
         
-        bot.answer_callback_query(call.id, "Enrollment is now CLOSED")
+    elif enrollment_type == "supreme" and action == "close":
+        # Close supreme enrollment
+        BOT_SETTINGS['supreme_enrollment_open'] = False
+        save_settings(BOT_SETTINGS)
+        status_message = "Supreme Membership enrollment is now *🔴 CLOSED*"
+        admin_message = "has *CLOSED* Supreme Membership enrollment"
+        action_text = "Supreme Membership enrollment is now CLOSED"
+        is_open = False
         
-        # Log the action
-        admin_username = call.from_user.username or f"Admin {call.from_user.id}"
-        logging.info(f"Enrollment closed by {admin_username}")
+    elif enrollment_type == "both" and action == "open":
+        # Open both enrollment types
+        BOT_SETTINGS['regular_enrollment_open'] = True
+        BOT_SETTINGS['supreme_enrollment_open'] = True
+        save_settings(BOT_SETTINGS)
+        status_message = "Regular and Supreme Membership enrollments are now *🟢 OPEN*"
+        admin_message = "has *OPENED* both Regular and Supreme Membership enrollments"
+        action_text = "Both enrollment types are now OPEN"
+        is_open = True
         
-        # Notify other admins
-        for admin_id in ADMIN_IDS:
-            if admin_id != call.from_user.id:  # Don't send to the admin who performed the action
-                bot.send_message(
-                    admin_id,
-                    f"ℹ️ *Enrollment Status Changed*\n\n"
-                    f"@{safe_markdown_escape(admin_username)} has *CLOSED* enrollment.\n\n"
-                    f"Only existing members can renew their memberships.",
-                    parse_mode="Markdown"
-                )
-                
-        # Notify subscribers about the enrollment closing
-        notify_enrollment_change(False)
+    elif enrollment_type == "both" and action == "close":
+        # Close both enrollment types
+        BOT_SETTINGS['regular_enrollment_open'] = False
+        BOT_SETTINGS['supreme_enrollment_open'] = False
+        save_settings(BOT_SETTINGS)
+        status_message = "Regular and Supreme Membership enrollments are now *🔴 CLOSED*"
+        admin_message = "has *CLOSED* both Regular and Supreme Membership enrollments"
+        action_text = "Both enrollment types are now CLOSED"
+        is_open = False
+    
+    # Update the message
+    bot.edit_message_text(
+        f"✅ *Enrollment Status Updated*\n\n"
+        f"{status_message}\n\n"
+        f"{'New users can now purchase this membership type.' if is_open else 'Only existing members can renew this membership type.'}",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown"
+    )
+    
+    bot.answer_callback_query(call.id, action_text)
+    
+    # Log the action
+    admin_username = call.from_user.username or f"Admin {call.from_user.id}"
+    logging.info(f"{enrollment_type.capitalize()} enrollment {action}ed by {admin_username}")
+    
+    # Notify other admins
+    for admin_id in ADMIN_IDS:
+        if admin_id != call.from_user.id:  # Don't send to the admin who performed the action
+            bot.send_message(
+                admin_id,
+                f"ℹ️ *Enrollment Status Changed*\n\n"
+                f"@{safe_markdown_escape(admin_username)} {admin_message}.\n\n"
+                f"{'New users can now purchase this membership type.' if is_open else 'Only existing members can renew this membership type.'}",
+                parse_mode="Markdown"
+            )
+    
+    # Notify subscribers about the enrollment change
+    if enrollment_type == "both":
+        # Notify about both enrollment types changing
+        notify_enrollment_change_specific("regular", is_open)
+        notify_enrollment_change_specific("supreme", is_open)
+    else:
+        # Notify about the specific enrollment type changing
+        notify_enrollment_change_specific(enrollment_type, is_open)
 
 @bot.message_handler(commands=['export_payments'])
 def export_payment_data(message):
@@ -12046,23 +12126,36 @@ def handle_config_callbacks(call):
 
 def show_enrollment_options(call):
     """Show enrollment status options"""
-    # Get current status
-    enrollment_open = BOT_SETTINGS.get('enrollment_open', False)  # Default to open
-    current_status = "🟢 OPEN" if enrollment_open else "🔴 CLOSED"
+    # Get current status for both membership types
+    regular_enrollment_open = BOT_SETTINGS.get('regular_enrollment_open', True)  # Default to open
+    supreme_enrollment_open = BOT_SETTINGS.get('supreme_enrollment_open', True)  # Default to open
     
-    # Create keyboard with options
-    markup = InlineKeyboardMarkup(row_width=1)
+    regular_status = "🟢 OPEN" if regular_enrollment_open else "🔴 CLOSED"
+    supreme_status = "🟢 OPEN" if supreme_enrollment_open else "🔴 CLOSED"
+    
+    # Create keyboard with options for both membership types
+    markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("🟢 Open Enrollment", callback_data="enrollment_open"),
-        InlineKeyboardButton("🔴 Close Enrollment", callback_data="enrollment_close"),
-        InlineKeyboardButton("« Back to Config Menu", callback_data="config_back")
+        InlineKeyboardButton("🟢 Open Regular", callback_data="enrollment_regular_open"),
+        InlineKeyboardButton("🔴 Close Regular", callback_data="enrollment_regular_close")
     )
+    markup.add(
+        InlineKeyboardButton("🟢 Open Supreme", callback_data="enrollment_supreme_open"),
+        InlineKeyboardButton("🔴 Close Supreme", callback_data="enrollment_supreme_close")
+    )
+    # Add buttons to control both enrollment types at once
+    markup.add(
+        InlineKeyboardButton("🟢 Open Both", callback_data="enrollment_both_open"),
+        InlineKeyboardButton("🔴 Close Both", callback_data="enrollment_both_close")
+    )
+    markup.add(InlineKeyboardButton("« Back to Config Menu", callback_data="config_back"))
     
-    # Edit the message with enrollment options
+    # Edit the message with enrollment options for both types
     bot.edit_message_text(
         f"🔓 *ENROLLMENT STATUS*\n\n"
-        f"Current Status: *{current_status}*\n\n"
-        f"Select an option to change the status:",
+        f"*Regular Membership:* {regular_status}\n"
+        f"*Supreme Membership:* {supreme_status}\n\n"
+        f"Select an option to change enrollment status:",
         call.message.chat.id,
         call.message.message_id,
         parse_mode="Markdown",
@@ -13750,24 +13843,26 @@ def handle_update_callback(call):
         bot.answer_callback_query(call.id, "Update notifications disabled")
         logging.info(f"User {user_id} unsubscribed from updates")
 
-def notify_enrollment_change(is_open):
-    """Notify subscribers about enrollment status changes"""
+def notify_enrollment_change_specific(enrollment_type, is_open):
+    """Notify subscribers about enrollment status changes for a specific membership type"""
     status = "🟢 OPEN" if is_open else "🔴 CLOSED"
     action = "opened" if is_open else "closed"
+    membership_name = "Regular Membership" if enrollment_type == "regular" else "Supreme Membership"
+    
     message_text = (
         f"📣 *ENROLLMENT STATUS UPDATE*\n\n"
-        f"Prodigy Trading Academy enrollment is now {status}!\n\n"
+        f"{membership_name} enrollment is now {status}!\n\n"
     )
     
     if is_open:
         message_text += (
-            "🎓 New students can now join the academy!\n\n"
-            "Use the /start command to begin your enrollment process."
+            f"✅ You can now purchase {membership_name} plans through the bot.\n\n"
+            f"Use /start to begin the enrollment process!"
         )
     else:
         message_text += (
-            "🔒 New enrollments are temporarily paused.\n\n"
-            "Existing members can still renew their memberships."
+            f"⚠️ New {membership_name} purchases are temporarily unavailable.\n\n"
+            f"Existing members can still renew their memberships."
         )
     
     # Send to all subscribers
@@ -13776,36 +13871,13 @@ def notify_enrollment_change(is_open):
     
     for user_id in UPDATE_SUBSCRIBERS:
         try:
-            bot.send_chat_action(user_id, 'typing')  # First check if user can receive messages
-            
-            # Try with Markdown first
-            try:
-                bot.send_message(
-                    user_id,
-                    message_text,
-                    parse_mode="Markdown"
-                )
-            except ApiException as e:
-                # If Markdown fails, try with plain text as fallback
-                if "can't parse entities" in str(e):
-                    bot.send_message(
-                        user_id,
-                        message_text.replace('*', ''),  # Remove markdown formatting
-                        parse_mode=None
-                    )
-                    logging.warning(f"Sent enrollment update to user {user_id} without markdown formatting")
-                else:
-                    # Re-raise if it's not a markdown parsing issue
-                    raise
-                    
+            bot.send_message(user_id, message_text, parse_mode="Markdown")
             success_count += 1
-            # Add small delay to prevent hitting rate limits
-            time.sleep(0.05)
         except Exception as e:
-            logging.error(f"Failed to send enrollment update to user {user_id}: {e}")
+            logging.error(f"Failed to notify user {user_id} about enrollment change: {e}")
             fail_count += 1
     
-    logging.info(f"Enrollment {action}: Notified {success_count} subscribers ({fail_count} failed)")
+    logging.info(f"{enrollment_type.capitalize()} enrollment {action}: Notified {success_count} subscribers ({fail_count} failed)")
 
 def notify_discount_created(discount_name, reg_discount, sup_discount):
     """Notify subscribers about new discount offers"""
