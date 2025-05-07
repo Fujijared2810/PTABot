@@ -1,12 +1,8 @@
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for, session, flash
 from threading import Thread
 import logging
-import io
-import sys
 from datetime import datetime
 import pytz
-import json
-import werkzeug.serving
 import os
 import secrets
 from functools import wraps
@@ -1670,11 +1666,19 @@ DASHBOARD_TEMPLATE = '''
                         <span id="member-cancellation" class="detail-value">-</span>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-primary btn-modal-close" data-bs-dismiss="modal">
-                        <i class="bi bi-x-circle me-1"></i> Close
-                    </button>
-                </div>
+                    <div class="modal-footer d-flex justify-content-between">
+                        <div>
+                            <button type="button" class="btn btn-danger" onclick="confirmAction('kick', memberDataCurrent.userId)">
+                                <i class="bi bi-x-circle me-1"></i> Kick Member
+                            </button>
+                            <button type="button" class="btn btn-warning" onclick="confirmAction('grace', memberDataCurrent.userId)">
+                                <i class="bi bi-clock me-1"></i> Give Grace Period
+                            </button>
+                        </div>
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                            <i class="bi bi-x me-1"></i> Close
+                        </button>
+                    </div>
             </div>
         </div>
     </div>
@@ -1883,6 +1887,81 @@ DASHBOARD_TEMPLATE = '''
             
             // Show the modal
             memberModal.show();
+        }
+
+        // Global variable to store currently displayed member data
+        let memberDataCurrent = null;
+
+        // Update the showMemberDetails function
+        function showMemberDetails(category, index) {
+            const member = memberData[category][index];
+            if (!member) return;
+            
+            // Store current member data globally
+            memberDataCurrent = member;
+            
+            // Update modal title
+            document.getElementById('memberDetailsModalLabel').textContent = `Member Details: ${member.name}`;
+            
+            // Populate member details
+            document.getElementById('member-name').textContent = member.name;
+            document.getElementById('member-id').textContent = member.userId;
+            document.getElementById('member-plan').textContent = member.plan;
+            document.getElementById('member-start-date').textContent = member.startDate;
+            document.getElementById('member-end-date').textContent = member.endDate;
+            document.getElementById('member-days-remaining').textContent = 
+                category === 'expired' ? 'Expired' : `${member.daysRemaining} days`;
+            document.getElementById('member-payment-method').textContent = member.paymentMethod;
+            document.getElementById('member-payment-status').textContent = member.hasPaid ? 'Paid' : 'Unpaid';
+            document.getElementById('member-cancellation').textContent = member.cancelled ? 'Cancelled' : 'Active';
+            
+            // Show the modal
+            memberModal.show();
+        }
+
+        // Function to confirm and execute admin actions
+        function confirmAction(action, userId) {
+            let message = '';
+            let endpoint = '';
+            
+            if (action === 'kick') {
+                message = 'Are you sure you want to kick this member? They will be removed from the group.';
+                endpoint = '/api/member/kick';
+            } else if (action === 'grace') {
+                message = 'Give this member a 7-day grace period?';
+                endpoint = '/api/member/grace';
+            }
+            
+            if (confirm(message)) {
+                // Show loading indicator
+                showNotification('Processing', 'Please wait while we process your request...');
+                
+                fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        userId: userId
+                    }),
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showNotification('Success', data.message || 'Action completed successfully');
+                        // Close the modal
+                        bootstrap.Modal.getInstance(document.getElementById('memberDetailsModal')).hide();
+                        // Reload page after short delay
+                        setTimeout(() => window.location.reload(), 1500);
+                    } else {
+                        showNotification('Error', data.message || 'Failed to complete action');
+                    }
+                })
+                .catch(error => {
+                    showNotification('Error', 'An error occurred');
+                    console.error('Error:', error);
+                });
+            }
         }
     </script>
 </body>
@@ -2382,6 +2461,122 @@ CHANGELOGS_TEMPLATE = '''
 </body>
 </html>
 '''
+
+@app.route('/api/member/kick', methods=['POST'])
+@login_required
+def kick_member():
+    """API endpoint to kick a member from the group"""
+    from pymongo import MongoClient
+    import os
+    import requests
+    import json
+    
+    try:
+        data = request.get_json()
+        user_id = data.get('userId')
+        
+        if not user_id:
+            return jsonify({"success": False, "message": "Missing user ID"})
+        
+        # Get MongoDB connection details and BOT_TOKEN
+        MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
+        DB_NAME = os.getenv('DB_NAME', 'PTABotDB')
+        BOT_TOKEN = os.getenv('BOT_TOKEN')
+        PAID_GROUP_ID = int(os.getenv('PAID_GROUP_ID', 0))
+        
+        # Connect to MongoDB
+        client = MongoClient(MONGO_URI)
+        db = client[DB_NAME]
+        payment_collection = db['payments']
+        
+        # Update payment data to mark as cancelled
+        payment_collection.update_one(
+            {"_id": str(user_id)},
+            {"$set": {"cancelled": True}}
+        )
+        
+        # Use Telegram API to ban the user
+        if PAID_GROUP_ID:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/banChatMember"
+            payload = {
+                "chat_id": PAID_GROUP_ID,
+                "user_id": int(user_id)
+            }
+            response = requests.post(url, json=payload)
+            response_data = response.json()
+            
+            if not response_data.get('ok', False):
+                return jsonify({"success": False, "message": f"API Error: {response_data.get('description', 'Unknown error')}"})
+        
+        # Log the action
+        admin_username = session.get('username', 'Admin')
+        logging.info(f"Member {user_id} kicked by {admin_username} via dashboard")
+        
+        return jsonify({
+            "success": True, 
+            "message": "Member has been kicked and their membership marked as cancelled"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error kicking member: {str(e)}")
+        return jsonify({"success": False, "message": str(e)})
+
+@app.route('/api/member/grace', methods=['POST'])
+@login_required
+def give_grace_period():
+    """API endpoint to give a member a grace period"""
+    from pymongo import MongoClient
+    import os
+    from datetime import datetime, timedelta
+    
+    try:
+        data = request.get_json()
+        user_id = data.get('userId')
+        
+        if not user_id:
+            return jsonify({"success": False, "message": "Missing user ID"})
+        
+        # Get MongoDB connection details
+        MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
+        DB_NAME = os.getenv('DB_NAME', 'PTABotDB')
+        
+        # Connect to MongoDB
+        client = MongoClient(MONGO_URI)
+        db = client[DB_NAME]
+        payment_collection = db['payments']
+        
+        # Get the member's data
+        member_data = payment_collection.find_one({"_id": str(user_id)})
+        if not member_data:
+            return jsonify({"success": False, "message": "Member not found"})
+        
+        # Calculate new due date (current + 7 days)
+        try:
+            current_due_date = datetime.strptime(member_data.get('due_date', ''), '%Y-%m-%d %H:%M:%S')
+        except:
+            # If due_date is invalid, use current time
+            current_due_date = datetime.now()
+            
+        new_due_date = (current_due_date + timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Update the due date
+        payment_collection.update_one(
+            {"_id": str(user_id)},
+            {"$set": {"due_date": new_due_date}}
+        )
+        
+        # Log the action
+        admin_username = session.get('username', 'Admin')
+        logging.info(f"Grace period granted to {user_id} by {admin_username} via dashboard")
+        
+        return jsonify({
+            "success": True, 
+            "message": "7-day grace period granted successfully"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error giving grace period: {str(e)}")
+        return jsonify({"success": False, "message": str(e)})
 
 # Add a logout route
 @app.route('/logout')

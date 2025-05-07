@@ -1,5 +1,6 @@
 import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ChatInviteLink, InlineKeyboardMarkup, InlineKeyboardButton
+from telebot import types
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ChatInviteLink, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telebot.apihelper import ApiException
 import time
 import threading
@@ -14,14 +15,25 @@ import pytz
 import pymongo
 from pymongo import MongoClient
 import random
-import secrets  # Using secrets module for more secure randomness
+import secrets
 from datetime import datetime
 from keep_alive import keep_alive
 import calendar
 from collections import Counter
+import requests
+import pandas as pd
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 
-BOT_VERSION = "Alpha Release 4.1"
+DISCOUNTS = {
+    'regular': None,  # Discount for Regular membership
+    'supreme': None   # Discount for Supreme membership
+}
+
+BOT_VERSION = "v5.0.2a"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -31,6 +43,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
 PAID_GROUP_ID = int(os.getenv('PAID_GROUP_ID'))
 CREATOR_ID = int(os.getenv('CREATOR_ID', '0'))
+SUPREME_GROUP_ID = int(os.getenv('SUPREME_GROUP_ID'))
 
 # Initialize MongoDB connection
 client = MongoClient(MONGO_URI)
@@ -46,8 +59,36 @@ scores_collection = db['scores']  # For storing user scores
 accountability_collection = db['accountability']  # For tracking submissions
 reminder_messages_collection = db['reminder_messages']
 gif_status_collection = db['gif_status']
+jarvis_usage_collection = db['jarvis_usage']
+destinations_collection = db['announcement_destinations']
+mentors_collection = db['mentors']
+serial_numbers_collection = db["serial_numbers"]
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+def get_exchange_rates():
+    """Fetch real-time exchange rates for multiple currencies against USD"""
+    try:
+        # Use a free exchange rate API
+        response = requests.get('https://open.er-api.com/v6/latest/USD', timeout=10)
+        data = response.json()
+        
+        if data.get('result') == 'success':
+            # Extract the rates we're interested in
+            rates = {
+                'USD': 1.0,  # Base currency is always 1.0
+                'GBP': data['rates'].get('GBP', 0),
+                'EUR': data['rates'].get('EUR', 0),
+                'IDR': data['rates'].get('IDR', 0),
+                'PHP': data['rates'].get('PHP', 0)
+            }
+            return rates
+        else:
+            logging.error(f"Exchange rate API error: {data}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching exchange rates: {e}")
+        return None
 
 # Function to handle termination signals (Ctrl+C, kill command)
 def signal_handler(sig, frame):
@@ -89,6 +130,278 @@ console_handler.setFormatter(formatter)
 # Add handlers to logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+def load_update_subscribers():
+    """Load the list of users who want updates from MongoDB"""
+    try:
+        subscribers = set()
+        results = db[DB_NAME]["update_subscribers"].find({})
+        for doc in results:
+            subscribers.add(doc["user_id"])
+        logging.info(f"Loaded {len(subscribers)} update subscribers from database")
+        return subscribers
+    except Exception as e:
+        logging.error(f"Error loading update subscribers: {e}")
+        return set()
+
+def save_update_subscriber(user_id):
+    """Save a user who wants updates to MongoDB"""
+    try:
+        db[DB_NAME]["update_subscribers"].update_one(
+            {"user_id": user_id},
+            {"$set": {"user_id": user_id, "subscribed_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')}},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Error saving update subscriber: {e}")
+        return False
+
+def remove_update_subscriber(user_id):
+    """Remove a user from the updates list in MongoDB"""
+    try:
+        db[DB_NAME]["update_subscribers"].delete_one({"user_id": user_id})
+        return True
+    except Exception as e:
+        logging.error(f"Error removing update subscriber: {e}")
+        return False
+
+def load_serial_numbers():
+    """Load serial numbers from MongoDB"""
+    try:
+        serials = {}
+        for doc in serial_numbers_collection.find():
+            serial = doc.get("serial")
+            if serial:
+                serials[serial] = {
+                    "mentorship_type": doc.get("mentorship_type"),
+                    "plan": doc.get("plan"),
+                    "generated_by": doc.get("generated_by"),
+                    "generated_at": doc.get("generated_at"),
+                    "used": doc.get("used", False),
+                    "used_by": doc.get("used_by"),
+                    "used_at": doc.get("used_at")
+                }
+        logging.info(f"Loaded {len(serials)} serial numbers from database")
+        return serials
+    except Exception as e:
+        logging.error(f"Error loading serial numbers: {e}")
+        return {}
+
+def save_serial_number(serial, data):
+    """Save a serial number to MongoDB"""
+    try:
+        serial_numbers_collection.update_one(
+            {"serial": serial},
+            {"$set": data},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Error saving serial number: {e}")
+        return False
+
+def load_mentors():
+    """Load all mentor data from MongoDB"""
+    try:
+        mentors = {}
+        for doc in mentors_collection.find():
+            mentor_id = doc['_id']
+            mentors[mentor_id] = {k: v for k, v in doc.items() if k != '_id'}
+        logging.info(f"Loaded {len(mentors)} mentors from MongoDB")
+        return mentors
+    except Exception as e:
+        logging.error(f"MongoDB error loading mentors: {e}")
+        return {}
+
+def save_mentor(mentor_id, mentor_data):
+    """Save a mentor to the database"""
+    try:
+        doc = {'_id': mentor_id}
+        doc.update(mentor_data)
+        mentors_collection.replace_one({'_id': mentor_id}, doc, upsert=True)
+        logging.info(f"Saved mentor {mentor_id} to MongoDB")
+        return True
+    except Exception as e:
+        logging.error(f"MongoDB save error for mentor {mentor_id}: {e}")
+        return False
+
+def initialize_default_mentors():
+    """Initialize default mentors in the database if they don't exist"""
+    try:
+        # Check if we already have mentors in the database
+        if mentors_collection.count_documents({}) > 0:
+            logging.info("Mentors already initialized in database")
+            return
+            
+        # Default mentor data
+        default_mentors = {
+            "Rom": {
+                "name": "Rom",
+                "full_name": "Rom Mina",
+                "title": "Senior Trading Strategist",
+                "photo_url": "https://example.com/rom-profile.jpg",
+                "expertise": "Price Action & Market Structure",
+                "experience": "7+ years",
+                "style": "Technical Analysis",
+                "description": "Rom specializes in detecting key market reversals using advanced price action techniques. With over 7 years of experience in forex and indices trading, he has helped hundreds of students master the art of reading clean charts and identifying high-probability setups.",
+                "strengths": ["Clean chart analysis", "Entry/exit precision", "Risk management"],
+                "teaching_style": "Visual and example-driven, with a focus on practical application",
+                "availability": "Weekdays 9AM-5PM PHT",
+                "availability_level": "High",
+                "current_status": "Available",
+                "student_testimonial": "Rom's mentorship completely transformed my approach to trading. His clean chart method helped me simplify my analysis and increase my win rate by 30%.",
+                "success_rate": "92%"
+            },
+            "Konfu": {
+                "name": "Konfu",
+                "full_name": "Konfu Trader",
+                "title": "Institutional Order Flow Specialist",
+                "photo_url": "https://example.com/konfu-profile.jpg",
+                "expertise": "ICT & Smart Money Concepts",
+                "experience": "5+ years",
+                "style": "Institutional Trading",
+                "description": "Konfu is an expert in institutional order flow and smart money concepts. He specializes in identifying liquidity areas and understanding how big players move the market. His unique approach combines order flow analysis with statistical probability.",
+                "strengths": ["Order flow analysis", "Liquidity mapping", "Advanced ICT concepts"],
+                "teaching_style": "Detailed and methodical, with emphasis on understanding market structure",
+                "availability": "Mon-Fri 10AM-6PM PHT",
+                "availability_level": "Medium",
+                "current_status": "In Session",
+                "student_testimonial": "Konfu's mentorship completely changed how I view charts. I now understand what's happening behind price movements instead of just following indicators.",
+                "success_rate": "89%"
+            },
+            "Nath": {
+                "name": "Nath",
+                "full_name": "Nathaniel Systems",
+                "title": "Automated Trading Expert",
+                "photo_url": "https://example.com/nath-profile.jpg",
+                "expertise": "Risk Management & Automation",
+                "experience": "6+ years",
+                "style": "Systematic Trading",
+                "description": "Nath specializes in building sustainable trading systems and implementing robust risk management protocols. His background in both discretionary and automated trading gives him a unique perspective on creating reliable systems that work in various market conditions.",
+                "strengths": ["System development", "Risk optimization", "Trading psychology"],
+                "teaching_style": "Structured and data-driven, with focus on creating repeatable processes",
+                "availability": "Weekdays 7PM-12AM PHT",
+                "availability_level": "Limited",
+                "current_status": "Available",
+                "student_testimonial": "Before working with Nath, I was constantly making emotional decisions. His systematic approach helped me create a reliable trading plan that I can stick to even in volatile markets.",
+                "success_rate": "94%"
+            },
+            "Maya": {
+                "name": "Maya",
+                "full_name": "Maya Mindset",
+                "title": "Trading Psychology Coach",
+                "photo_url": "https://example.com/maya-profile.jpg",
+                "expertise": "Psychological Trading & Mindset",
+                "experience": "4+ years",
+                "style": "Mindfulness Trading",
+                "description": "Maya focuses on the psychological aspects of trading, helping traders overcome emotional barriers and develop mental resilience. Her background in both trading and psychology provides a comprehensive approach to mastering the mental game of trading.",
+                "strengths": ["Emotional control", "Mindfulness practices", "Building mental resilience"],
+                "teaching_style": "Compassionate and personalized, with practical exercises for mental growth",
+                "availability": "Weekdays and weekends, flexible hours",
+                "availability_level": "High",
+                "current_status": "Available",
+                "student_testimonial": "Maya helped me identify and overcome self-sabotaging behaviors I wasn't even aware of. My trading consistency has improved dramatically.",
+                "success_rate": "91%"
+            }
+        }
+        
+        # Insert all mentors into the database
+        for mentor_id, mentor_data in default_mentors.items():
+            save_mentor(mentor_id, mentor_data)
+            
+        logging.info(f"Successfully initialized {len(default_mentors)} default mentors in the database")
+    except Exception as e:
+        logging.error(f"Error initializing default mentors: {e}")
+
+# Load announcement destinations from MongoDB
+def load_announcement_destinations():
+    """Load announcement destinations from MongoDB"""
+    try:
+        destinations = {}
+        for doc in destinations_collection.find():
+            dest_id = doc['_id']
+            destinations[dest_id] = {
+                'id': doc.get('id'),
+                'name': doc.get('name'),
+                'topic_id': doc.get('topic_id'),
+                'type': doc.get('type', 'group')  # Default to 'group' if not specified
+            }
+        logging.info(f"Loaded {len(destinations)} announcement destinations from MongoDB")
+        return destinations
+    except Exception as e:
+        logging.error(f"MongoDB error loading announcement destinations: {e}")
+
+# Save announcement destinations to MongoDB
+def save_announcement_destination(destination_id, destination_data):
+    """Save an announcement destination to MongoDB"""
+    try:
+        doc = {'_id': destination_id}
+        doc.update(destination_data)
+        destinations_collection.replace_one({'_id': destination_id}, doc, upsert=True)
+        logging.info(f"Saved announcement destination '{destination_id}' to MongoDB")
+        return True
+    except Exception as e:
+        logging.error(f"MongoDB save error for announcement destination: {e}")
+        return False
+
+# Delete announcement destination from MongoDB
+def delete_announcement_destination(destination_id):
+    """Delete an announcement destination from MongoDB"""
+    try:
+        result = destinations_collection.delete_one({'_id': destination_id})
+        if result.deleted_count > 0:
+            logging.info(f"Deleted announcement destination '{destination_id}' from MongoDB")
+            return True
+        else:
+            logging.warning(f"Announcement destination '{destination_id}' not found in MongoDB")
+            return False
+    except Exception as e:
+        logging.error(f"MongoDB delete error for announcement destination: {e}")
+        return False
+
+def load_discounts():
+    """Load discount information from database"""
+    try:
+        discounts = {}
+        
+        # Load regular discount
+        regular_discount = settings_collection.find_one({"_id": "regular_discount_settings"})
+        if regular_discount and regular_discount.get('active', False):
+            discounts['regular'] = regular_discount
+            logging.info("Loaded Regular membership discount from MongoDB")
+        else:
+            discounts['regular'] = None
+        
+        # Load supreme discount
+        supreme_discount = settings_collection.find_one({"_id": "supreme_discount_settings"})
+        if supreme_discount and supreme_discount.get('active', False):
+            discounts['supreme'] = supreme_discount
+            logging.info("Loaded Supreme membership discount from MongoDB")
+        else:
+            discounts['supreme'] = None
+            
+        return discounts
+    except Exception as e:
+        logging.error(f"Error loading discounts: {e}")
+        return {'regular': None, 'supreme': None}
+
+def save_discount(discount_data, membership_type):
+    """Save discount information to database"""
+    try:
+        doc_id = f"{membership_type.lower()}_discount_settings"
+        if discount_data:
+            settings_collection.replace_one(
+                {"_id": doc_id}, 
+                {**discount_data, "_id": doc_id}, 
+                upsert=True
+            )
+            logging.info(f"{membership_type.capitalize()} discount settings saved to MongoDB")
+        else:
+            settings_collection.delete_one({"_id": doc_id})
+            logging.info(f"{membership_type.capitalize()} discount settings removed from MongoDB")
+    except Exception as e:
+        logging.error(f"Error saving {membership_type} discount: {e}")
 
 def get_last_gif_message():
     """Get the ID of the last sent GIF message"""
@@ -220,28 +533,117 @@ def save_confirmed_old_members():
 
 # Similarly implement load_payment_data() and save_payment_data()
 def load_payment_data():
+    """Load payment data from MongoDB with enhanced error handling and logging"""
+    global payment_collection  # Add this line to access the global variable
+    
     try:
         payments = {}
+        start_time = time.time()
+        docs_count = 0
+        
         for doc in payment_collection.find():
             user_id = doc['_id']
             payments[user_id] = {k: v for k, v in doc.items() if k != '_id'}
+            docs_count += 1
+        
+        elapsed = time.time() - start_time
+        logging.info(f"Successfully loaded {docs_count} payment records from MongoDB in {elapsed:.2f}s")
+        
         return payments
+    except pymongo.errors.ConnectionFailure as e:
+        logging.error(f"MongoDB connection error loading payments: {e}")
+        # Try to reconnect and retry once
+        try:
+            logging.info("Attempting to reconnect to MongoDB...")
+            global client, db  # Also need these globals if we're redefining them
+            client = MongoClient(MONGO_URI)
+            db = client[DB_NAME]
+            payment_collection = db['payments']
+            
+            payments = {}
+            for doc in payment_collection.find():
+                user_id = doc['_id']
+                payments[user_id] = {k: v for k, v in doc.items() if k != '_id'}
+            
+            logging.info(f"Reconnected and loaded {len(payments)} payment records")
+            return payments
+        except Exception as retry_e:
+            logging.error(f"Failed to reconnect to MongoDB: {retry_e}")
+            return {}
     except Exception as e:
         logging.error(f"MongoDB error loading payments: {e}")
         return {}
 
 def save_payment_data():
+    """Save payment data to MongoDB with enhanced error handling and validation"""
     try:
+        start_time = time.time()
+        
+        # First validate the data to ensure it's in the correct format
+        validated_count = 0
+        invalid_records = []
+        
+        for user_id, data in PAYMENT_DATA.items():
+            # Basic validation
+            if not isinstance(data, dict):
+                invalid_records.append(user_id)
+                continue
+            
+            # Ensure required fields exist
+            required_fields = ['haspayed']  # Add other required fields as needed
+            if not all(field in data for field in required_fields):
+                invalid_records.append(user_id)
+                continue
+            
+            validated_count += 1
+        
+        if invalid_records:
+            logging.warning(f"Found {len(invalid_records)} invalid payment records: {invalid_records}")
+            
         # Use bulk operations for efficiency
         operations = []
         for user_id, data in PAYMENT_DATA.items():
+            # Skip invalid records
+            if user_id in invalid_records:
+                continue
+                
             doc = {'_id': user_id}
             doc.update(data)
+            # Add a "last_updated" timestamp for tracking
+            doc['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
             operations.append(
                 pymongo.ReplaceOne({'_id': user_id}, doc, upsert=True)
             )
+        
         if operations:
-            payment_collection.bulk_write(operations)
+            result = payment_collection.bulk_write(operations)
+            elapsed = time.time() - start_time
+            
+            logging.info(f"Successfully saved {len(operations)} payment records to MongoDB "
+                       f"({result.modified_count} modified, {result.upserted_count} inserted) "
+                       f"in {elapsed:.2f}s")
+        else:
+            logging.info("No valid payment records to save to MongoDB")
+            
+    except pymongo.errors.BulkWriteError as bwe:
+        logging.error(f"MongoDB bulk write error: {bwe.details}")
+        # Try to save records individually to identify problematic records
+        success_count = 0
+        for user_id, data in PAYMENT_DATA.items():
+            try:
+                if user_id in invalid_records:
+                    continue
+                    
+                doc = {'_id': user_id}
+                doc.update(data)
+                doc['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                payment_collection.replace_one({'_id': user_id}, doc, upsert=True)
+                success_count += 1
+            except Exception as e:
+                logging.error(f"Failed to save payment for user {user_id}: {e}")
+                
+        logging.info(f"Fallback save completed: saved {success_count} of {len(PAYMENT_DATA)} records")
     except Exception as e:
         logging.error(f"MongoDB save error: {e}")
 
@@ -316,11 +718,14 @@ def save_confession_counter(value):
         logging.error(f"Error saving confession counter: {e}")
 
 # Dictionaries to store user payment data
+UPDATE_SUBSCRIBERS = set()
+MENTORS = {}
+ADMIN_ANNOUNCING = {}
 USER_PAYMENT_DUE = {}
 CONFESSION_COUNTER = 0
 USERS_CONFESSING = {}
+PDF_MESSAGE_IDS = {}
 PAYMENT_DATA = load_payment_data()
-CONFIRMED_OLD_MEMBERS = load_confirmed_old_members()
 PENDING_USERS = load_pending_users() 
 CHANGELOGS = load_changelogs()
 BOT_SETTINGS = load_settings()
@@ -330,6 +735,14 @@ DAILY_CHALLENGE_TOPIC_ID = BOT_SETTINGS.get('daily_challenge_topic_id', None)
 ANNOUNCEMENT_TOPIC_ID = BOT_SETTINGS.get('announcement_topic_id', None)
 ACCOUNTABILITY_TOPIC_ID = BOT_SETTINGS.get('accountability_topic_id', None)
 LEADERBOARD_TOPIC_ID = BOT_SETTINGS.get('leaderboard_topic_id', None)
+DISCOUNTS = load_discounts()
+UPDATE_SUBSCRIBERS = load_update_subscribers()
+ANNOUNCEMENT_DESTINATIONS = load_announcement_destinations()
+# Define fee percentages for different payment methods
+PAYMENT_FEES = {
+    "💳 Paypal": 10.0,  # 10% fee
+}
+SERIAL_NUMBERS = load_serial_numbers()
 
 
 ### Different types of messages for the bot ###
@@ -478,7 +891,6 @@ def send_welcome(message):
             PENDING_USERS.pop(user_id, None)  # Remove from dictionary
             delete_pending_user(user_id)  # Remove from MongoDB
             logging.info(f"User {user_id} with rejected status has been removed from pending users")
-            # Continue to display welcome message
     
     # Handle pending requests first - don't show intro message again
     if pending_verification:
@@ -488,39 +900,169 @@ def send_welcome(message):
         bot.send_message(chat_id, random.choice(pending_payment_messages))
         return  # Exit the function here - don't show the intro message again
     
-    # Only show the intro message and options if there are no pending requests
-    bot.send_message(chat_id, f"""
-    🏫 Prodigy Trading Academy Enrollment ({BOT_VERSION})
+    # Check if user has already accepted the terms and privacy policy
+    has_accepted_terms = False
+    user_id_str = str(user_id)
+    
+    if user_id_str in PAYMENT_DATA:
+        has_accepted_terms = PAYMENT_DATA[user_id_str].get('terms_accepted', False) and PAYMENT_DATA[user_id_str].get('privacy_accepted', False)
+    
+    # If user has already accepted terms, show welcome message and main menu
+    if has_accepted_terms:
+        logging.info(f"User {user_id} has previously accepted terms - showing welcome message and main menu")
+        send_welcome_message(chat_id)
+        show_main_menu(chat_id, user_id)
+    else:
+        # If user hasn't accepted terms, show the legal notice first
+        send_simplified_legal_notice(chat_id, user_id)
 
-    Welcome to Prodigy Trading Academy! 🎉
+def send_welcome_message(chat_id):
+    """Send the welcome image and text to the user"""
+    # Send welcome image first
+    try:
+        with open('graphics/start.jpeg', 'rb') as welcome_img:
+            bot.send_photo(
+                chat_id, 
+                welcome_img,
+                caption=f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
+                "🎉 Welcome to Prodigy Trading Academy!\n\n"
+                "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀",
+                parse_mode="Markdown"
+            )
+    except FileNotFoundError:
+        # Fallback to text-only message if image not found
+        logging.error("Welcome image not found at graphics/start.jpeg")
+        bot.send_message(chat_id, 
+            f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
+            "🎉 Welcome to Prodigy Trading Academy!\n\n"
+            "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        # Log any other errors but still show welcome message
+        logging.error(f"Error sending welcome image: {e}")
+        bot.send_message(chat_id, 
+            f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
+            "🎉 Welcome to Prodigy Trading Academy!\n\n"
+            "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀",
+            parse_mode="Markdown"
+        )
 
-    We're pleased to assist you with joining our academy. This marks a significant step in enhancing your trading expertise.
+def send_simplified_legal_notice(chat_id, user_id):
+    """Send a simplified legal notice instead of the full documents"""
+    
+    legal_notice = (
+        "📜 *LEGAL NOTICE*\n\n"
+        "Before proceeding, please be aware that by using Prodigy Trading Academy's services:\n\n"
+        "• You agree to our *Terms & Conditions* which cover membership, content usage, and risks associated with trading\n\n"
+        "• You acknowledge our *Privacy Policy* regarding how we collect, store, and use your personal data\n\n"
+        "These legal documents are important and can be reviewed at any time via the FAQ section in the main menu (see: Terms & Conditions / Privacy Policy) or by contacting our support team.\n\n"
+        "By continuing, you confirm that you have read, understood, and agreed to these policies."
+    )
+    
+    # Create acceptance buttons
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("✅ I Agree to Terms & Privacy Policy", callback_data="accept_legal_notice"))
+    markup.add(InlineKeyboardButton("❌ I Decline", callback_data="decline_legal_notice"))
+    
+    # Send the notice
+    bot.send_message(
+        chat_id,
+        legal_notice,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Record user state
+    PENDING_USERS[user_id] = {'status': 'awaiting_legal_acceptance'}
+    save_pending_users()
 
-    📢 Note: This bot is currently in {BOT_VERSION}, so you may experience occasional updates or improvements.
+# Update the callback handler for the new legal notice acceptance
+@bot.callback_query_handler(func=lambda call: call.data in ["accept_legal_notice", "decline_legal_notice"])
+def handle_legal_notice_response(call):
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    
+    if call.data == "accept_legal_notice":
+        # User accepted both terms and privacy policy at once
+        if str(user_id) in PAYMENT_DATA:
+            PAYMENT_DATA[str(user_id)]["terms_accepted"] = True
+            PAYMENT_DATA[str(user_id)]["terms_accepted_date"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[str(user_id)]["privacy_accepted"] = True
+            PAYMENT_DATA[str(user_id)]["privacy_accepted_date"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            # Create a new record if user doesn't exist in PAYMENT_DATA
+            PAYMENT_DATA[str(user_id)] = {
+                "username": call.from_user.username or "No Username",
+                "terms_accepted": True,
+                "terms_accepted_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "privacy_accepted": True,
+                "privacy_accepted_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": False
+            }
+        
+        save_payment_data()
+        
+        bot.answer_callback_query(call.id, "Thank you! You've accepted our Terms & Privacy Policy.")
+        
+        # Delete the legal notice message
+        try:
+            bot.delete_message(chat_id, call.message.message_id)
+        except Exception as e:
+            logging.error(f"Error deleting legal notice message: {e}")
+        
+        # Send welcome message now that terms are accepted
+        send_welcome_message(chat_id)
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Show the main menu
+        show_main_menu(chat_id, user_id)
+        
+    else:  # User declined
+        bot.answer_callback_query(call.id, "You must accept our Terms & Privacy Policy to use this service.")
+        bot.send_message(chat_id, 
+            "❌ *Access Denied*\n\n"
+            "To use Prodigy Trading Academy services, you must accept our Terms & Conditions and Privacy Policy.\n\n"
+            "If you change your mind, please restart the bot with /start.",
+            parse_mode="Markdown"
+        )
+        
+        # Remove from pending users
+        if user_id in PENDING_USERS:
+            PENDING_USERS.pop(user_id, None)
+            delete_pending_user(user_id)
 
-    Please select an option below to proceed:
-    """)
+def show_main_menu(chat_id, user_id):
+    """Show the main menu with enrollment options"""
+    bot.send_message(chat_id, 
+        "Need help? We're here to guide you every step of the way. 💬\n\n"
+        "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.\n\n"
+        "Please select an option below to proceed:",
+        parse_mode="Markdown"
+    )
     
     # Ask for a payment plan
     markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add(KeyboardButton("📅 Purchase Membership"), KeyboardButton("🔍 Existing Member Verification"))
+    markup.add(KeyboardButton("📅 Purchase Membership"), KeyboardButton("❓ FAQ"))
     markup.add(KeyboardButton("🔄 Renew Membership"), KeyboardButton("❌ Cancel Membership"))
-    bot.send_message(chat_id, "Which service would you like to access??", reply_markup=markup)
+    bot.send_message(chat_id, "Which service would you like to access?", reply_markup=markup)
     
-    PENDING_USERS[chat_id] = {'status': 'choosing_option'}
+    PENDING_USERS[user_id] = {'status': 'choosing_option'}
     save_pending_users()
 
     # Check if the user has unseen changelogs - ONLY SHOW THE MOST RECENT ONE
-    if str(message.from_user.id) in PAYMENT_DATA and PAYMENT_DATA[str(message.from_user.id)]['haspayed']:
+    if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)]['haspayed']:
         # Initialize tracking variable
         update_shown = False
         
         # Look for the most recent changelog they haven't seen
         for i, changelog in enumerate(reversed(CHANGELOGS["user"])):
-            if not update_shown and str(message.from_user.id) not in changelog.get("seen_by", []):
+            if not update_shown and str(user_id) not in changelog.get("seen_by", []):
                 # Show the unseen changelog (only the most recent one)
                 bot.send_message(
-                    message.chat.id,
+                    chat_id,
                     f"📢 *UNREAD UPDATE*\n\n{changelog['content']}\n\n🕒 Posted: {changelog['timestamp']}",
                     parse_mode="Markdown"
                 )
@@ -528,45 +1070,54 @@ def send_welcome(message):
                 if "seen_by" not in changelog:
                     changelog["seen_by"] = []
                     
-                changelog["seen_by"].append(str(message.from_user.id))
+                changelog["seen_by"].append(str(user_id))
                 save_changelogs(CHANGELOGS)
                 
                 # Set flag to prevent showing more updates
                 update_shown = True
-                logging.info(f"Showed unread changelog to user {message.from_user.id}")
+                logging.info(f"Showed unread changelog to user {user_id}")
                 break
-
-
 
 def has_user_paid(user_id):
     return str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)]['haspayed']
 
 def can_renew_membership(user_id):
     """Check if user can renew their membership based on expiration date"""
-    if str(user_id) not in PAYMENT_DATA:
-        # Not a current member, so they can "renew" (actually purchase new)
+    user_id_str = str(user_id)
+    
+    # First check if user exists in PAYMENT_DATA
+    if user_id_str not in PAYMENT_DATA:
+        return False, "❌ You don't have an existing membership to renew. Please use 'Purchase Membership' option instead."
+    
+    data = PAYMENT_DATA[user_id_str]
+    
+    # Check for any evidence of a previous valid membership
+    has_ever_paid = data.get('haspayed') or data.get('ever_paid', False)
+    has_due_date = 'due_date' in data
+    
+    # If no evidence of ever having had a real membership, reject renewal
+    if not has_ever_paid and not has_due_date:
+        return False, "❌ You don't have a previous membership to renew. Please use 'Purchase Membership' option instead."
+    
+    # If not currently paid, they can renew (this is a genuine expired membership case)
+    if not data.get('haspayed', False):
         return True, None
-        
-    data = PAYMENT_DATA[str(user_id)]
-    if not data['haspayed']:
-        # Payment expired, they can renew
-        return True, None
-        
-    # Calculate days until expiration
+    
+    # If they're currently paid, check expiration date
     try:
         due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
         current_date = datetime.now()
         days_remaining = (due_date - current_date).days
         
-        # Allow renewal if within 7 days of expiration
+        # Allow renewal if within 3 days of expiration
         if days_remaining <= 3:
             return True, None
         else:
-            return False, f"You still have {days_remaining} days remaining on your current membership. Early renewal is only available within 3 days of expiration."
+            return False, f"⚠️ You still have {days_remaining} days remaining on your current membership. Early renewal is only available within 3 days of expiration."
     except Exception as e:
         logging.error(f"Error checking renewal eligibility: {e}")
-        # If there's an error, let them renew to be safe
-        return True, None
+        # If there's an error, default to no
+        return False, "❌ Error checking renewal eligibility. Please try again later or contact an admin."
 
 # Handle Option Selection
 @bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_option')
@@ -578,66 +1129,115 @@ def choose_option(message):
     option = message.text
 
     if option in ["📅 Purchase Membership", "🔄 Renew Membership"]:
-        if option == "📅 Purchase Membership" and has_user_paid(user_id):
-            bot.send_message(chat_id, "✅ You have already paid for your membership. No further action is required.")
-            return
+        # Check if this is a new purchase or a renewal
+        is_renewal = (option == "🔄 Renew Membership")
+        
+        # If it's a new purchase, check enrollment status
+        if option == "📅 Purchase Membership":
+            # Check if user already has paid membership first
+            if has_user_paid(user_id):
+                bot.send_message(chat_id, "✅ You have already paid for your membership. No further action is required.")
+                return
+                
+            # Check enrollment status for new purchases (not renewals)
+            enrollment_open = BOT_SETTINGS.get('enrollment_open', False)  # Default to open if not set
+                        
+            # Modified condition: Block ALL new purchases (not renewals) when enrollment is closed
+            if not enrollment_open and not is_renewal:
+                # Enrollment is closed - show message to ALL users trying to purchase (not renew)
+                
+                # Create inline keyboard with Update and FAQ buttons
+                markup = InlineKeyboardMarkup(row_width=2)
+                markup.add(
+                    InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+                    InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+                )
+                
+                bot.send_message(
+                    chat_id,
+                    "⚠️ *Enrollment is currently closed*\n\n"
+                    "New memberships are not available at this time. Please wait for the next "
+                    "announcement from the admins about when enrollment will open again.\n\n"
+                    "• Click *Get Notified* to receive updates when enrollment opens\n"
+                    "• Check our *FAQ* section for more information\n\n"
+                    "Thank you for your interest in Prodigy Trading Academy!",
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+                return
+        
+        # For renewals, check if they can renew
         elif option == "🔄 Renew Membership":
             can_renew, message_text = can_renew_membership(user_id)
             if not can_renew:
                 bot.send_message(chat_id, message_text)
                 return
-                
-        # Rest of the function remains the same
-        if option == "📅 Purchase Membership":
-            PENDING_USERS[chat_id]['status'] = 'buy_membership'
-            save_pending_users()
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton("Monthly - 499 PHP"), KeyboardButton("Yearly - 5,988 PHP"))
-            bot.send_message(chat_id, "Please select your preferred payment plan:\n\n💰 *Monthly* - 499 PHP\n💰 *Yearly* - 5,988 PHP", reply_markup=markup, parse_mode="Markdown")
-        elif option == "🔄 Renew Membership":
-            PENDING_USERS[chat_id]['status'] = 'renewal_membership_type'
-            save_pending_users()
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton("NEW MEMBER (Enrolled after November 2024)"), KeyboardButton("OG MEMBER (Enrolled before November 2024)"))
-            bot.send_message(chat_id, "Are you a new member or an old member?", reply_markup=markup)
-    elif option == "🔍 Existing Member Verification":
-        username = message.from_user.username
-        first_name = message.from_user.first_name or ""
-        last_name = message.from_user.last_name or ""
+
+        # If we get here, either enrollment is open or the user is renewing their membership
+        # Send enrollment benefits image first
+        try:
+            with open('graphics/benefits.jpeg', 'rb') as benefits_img:
+                bot.send_photo(
+                    chat_id,
+                    benefits_img,
+                    caption="Explore our membership benefits and choose the plan that's right for you!",
+                    parse_mode="Markdown"
+                )
+        except FileNotFoundError:
+            logging.error("Enrollment benefits image not found at graphics/enrollment_benefits.jpg")
+        except Exception as e:
+            logging.error(f"Error sending enrollment benefits image: {e}")
         
-        # Create display name using first name and last name when username is not available
-        if not username:
-            display_name = f"{first_name} {last_name}".strip() or "No Name"
-            user_display = f"{display_name} (No Username)"
-        else:
-            user_display = f"@{username}"
-
-        # Check if the user is already verified
-        if str(user_id) in CONFIRMED_OLD_MEMBERS:
-            bot.send_message(chat_id, "❗ You are already confirmed as an old member of PTA.")
-            return
-
-        PENDING_USERS[chat_id]['status'] = 'old_member_request'
-        PENDING_USERS[chat_id]['request_time'] = datetime.now()  # Add timestamp
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Continue with normal flow - update status and show mentorship options
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
+        PENDING_USERS[chat_id]['is_renewal'] = is_renewal  # Mark as renewal for later handling
         save_pending_users()
+        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
+        markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
+        bot.send_message(chat_id, "Please select your preferred mentorship level:", reply_markup=markup)
 
-        # Escape Markdown characters in user display text
-        user_display = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', user_display)
-
-        # Forward the request to admins with inline buttons
-        for admin in ADMIN_IDS:
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("Confirm", callback_data=f"confirm_old_{user_id}"))
-            markup.add(InlineKeyboardButton("Reject", callback_data=f"reject_old_{user_id}"))
-            bot.send_message(admin, 
-                f"🔔 *Existing Member Verification Request:*\n"
-                f"🆔 {user_display} (ID: `{user_id}`)\n\n"
-                "Please review and confirm this user's status.",
-                reply_markup=markup,
-                parse_mode="Markdown"
-            )
-
-        bot.send_message(chat_id, "Your request has been sent to the admins for verification. Please wait.")
+    elif option == "❓ FAQ":
+        # First send the FAQ image
+        try:
+            with open('graphics/faq_main.jpeg', 'rb') as faq_img:
+                bot.send_photo(
+                    chat_id,
+                    faq_img,
+                )
+        except FileNotFoundError:
+            logging.error("FAQ image not found at graphics/faq_main.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending FAQ image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1)
+        
+        # Then show the FAQ categories with inline buttons
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🎓 Join Academy", callback_data="faq_join_academy"),
+            InlineKeyboardButton("📅 Opening of Admissions", callback_data="faq_admissions"),
+            InlineKeyboardButton("💲 Mentorship Plans & Pricings", callback_data="faq_plans_pricing"),
+            InlineKeyboardButton("📦 Products & Services", callback_data="faq_products_services"),
+            InlineKeyboardButton("🌟 Benefits in Enrollment", callback_data="faq_enrollment_benefits"),
+            InlineKeyboardButton("📝 Terms & Conditions", callback_data="faq_terms"),
+            InlineKeyboardButton("🔒 Privacy Policy", callback_data="faq_privacy")
+        )
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.send_message(
+            chat_id,
+            "🔍 *Frequently Asked Questions*\n\n"
+            "Select a category to view related questions:",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+        # No need to change user status since they're just viewing FAQs
 
     elif option == "❌ Cancel Membership":
         # Check if user has an active membership
@@ -664,6 +1264,23 @@ def choose_option(message):
                 bot.send_message(chat_id, "ℹ️ Your membership is already cancelled. You will still have access until the next payment cycle.")
             return
 
+        # Send cancellation confirmation graphic first
+        try:
+            with open('graphics/cancel_membership.jpeg', 'rb') as cancel_img:
+                bot.send_photo(
+                    chat_id,
+                    cancel_img,
+                    caption="⚠️ Please confirm if you wish to cancel your membership"
+                )
+        except FileNotFoundError:
+            logging.error("Cancellation confirmation image not found at graphics/cancel_confirm.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending cancellation confirmation image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+
+        # Update user status and show confirmation buttons
         PENDING_USERS[chat_id]['status'] = 'cancel_membership'
         save_pending_users()
         markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
@@ -673,149 +1290,724 @@ def choose_option(message):
     else:
         bot.send_message(chat_id, "❌ Invalid option. Please select from the available options.")
 
-# Handle Renewal Membership Type Selection
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'renewal_membership_type')
-def choose_renewal_membership_type(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
-    chat_id = message.chat.id
-    membership_type = message.text
+# Add this function at an appropriate location in your code
 
-    if membership_type == "NEW MEMBER (Enrolled after November 2024)":
-        PENDING_USERS[chat_id]['status'] = 'renewal_membership_new'
-        save_pending_users()
-        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(KeyboardButton("Monthly - 499 PHP"), KeyboardButton("Yearly - 5,988 PHP"))
-        bot.send_message(chat_id, "Renewal options for new members:\n\n💰 *Monthly* - 499 PHP\n💰 *Yearly* - 5,988 PHP", reply_markup=markup, parse_mode="Markdown")
-
-    elif membership_type == "OG MEMBER (Enrolled before November 2024)":
-        user_id = message.from_user.id
-
-        # Check if the user is already verified
-        if str(user_id) in CONFIRMED_OLD_MEMBERS:
-            PENDING_USERS[chat_id]['status'] = 'renewal_membership_old'
-            save_pending_users()
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton("Monthly - 199 PHP"), KeyboardButton("Yearly - 2,388 PHP"))
-            bot.send_message(chat_id, "Renewal options for old members:\n\n💰 *Monthly* - 199 PHP\n💰 *Yearly* - 2,388 PHP", reply_markup=markup, parse_mode="Markdown")
-        else:
-            bot.send_message(chat_id, "❌ You are not an old PTA member.")
-            return
-
-    else:
-        bot.send_message(chat_id, "❌ Invalid option. Please select either 'New Member' or 'Old Member'.")
-
-# Admin Confirms Old Member
-@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_old_"))
-def callback_confirm_old_member(call):
-    user_id = int(call.data.split("_")[2])
-    if call.message.chat.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
-        return
-
-    try:
-
-        # Check if user is already confirmed as an old member
-        if user_id in CONFIRMED_OLD_MEMBERS:
-            bot.answer_callback_query(call.id, "⚠️ This user has already been confirmed as an old member.")
-            bot.send_message(user_id, random.choice(already_confirmed_messages))
-            return
-
-        # Modified check - accept if status is old_member_request OR if user has gone back to menu
-        if user_id not in PENDING_USERS or (
-            PENDING_USERS[user_id].get('status') != 'old_member_request' and 
-            not (PENDING_USERS[user_id].get('in_menu', False) and 
-                 PENDING_USERS[user_id].get('status') == 'old_member_request')
-        ):
-            bot.answer_callback_query(call.id, "❌ This user is not waiting for confirmation.")
-            return
-
-        # Confirm the user as an old member
-        PENDING_USERS[user_id]['status'] = 'old_member_confirmed'
-        user_info = bot.get_chat(user_id)
-        CONFIRMED_OLD_MEMBERS[str(user_id)] = {
-            "username": user_info.username or "No Username",
-            "confirmed": True
-        }
-        save_confirmed_old_members()  # Save to JSON file
-        save_pending_users()
-
-        bot.send_message(user_id, random.choice(confirmation_success_messages))
-        bot.answer_callback_query(call.id, random.choice(admin_confirm_messages))
-
-        # Log admin activity and notify all admins
-        admin_username = call.from_user.username or f"Admin ({call.message.chat.id})"
-        user_info = bot.get_chat(user_id)
-        username = user_info.username or f"ID: {user_id}"
-
-        # Escape Markdown characters in the usernames
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
-        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
-
-        for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has confirmed user from old PTA member @{username}.", parse_mode="Markdown")
-
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Unexpected error confirming old member: {e}")
-
-# Admin Rejects Old Member
-@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_old_"))
-def callback_reject_old_member(call):
-    user_id = int(call.data.split("_")[2])
-    if call.message.chat.id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
-        return
-
-    try:
-        if user_id not in PENDING_USERS or PENDING_USERS[user_id].get('status') != 'old_member_request':
-            bot.answer_callback_query(call.id, "❌ This user is not waiting for confirmation.")
-            return
-
-        # Completely remove the user from pending instead of just marking as rejected
-        PENDING_USERS.pop(user_id, None)  # Remove from dictionary
-        delete_pending_user(user_id)  # Remove from MongoDB
+@bot.callback_query_handler(func=lambda call: call.data.startswith("faq_"))
+def handle_faq_category(call):
+    """Handle FAQ category selection"""
+    category = call.data.split("_", 1)[1]  # Split at first underscore to get category
+    
+    if category == "join_academy":
+        # Send specific welcome message for Join Academy
+        welcome_message = (
+            "🎓 *Welcome to Prodigy Trading Academy!*\n\n"
+            "You're one step away from accessing our full mentorship and community resources on Telegram. "
+            "Here's how to join:\n\n"
+            "1️⃣ Purchase your chosen mentorship plan by accessing our official Telegram bot down below.\n\n"
+            "2️⃣ Follow the step-by-step instructions provided after payment.\n\n"
+            "3️⃣ You'll be added to the main channel and receive access to all relevant group chats.\n\n"
+            "If you need help choosing a plan or navigating the bot for joining, we're here to assist!"
+        )
         
-        bot.send_message(user_id, random.choice(rejection_messages))
-        bot.answer_callback_query(call.id, "❌ User rejected successfully.")
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.edit_message_text(
+            welcome_message,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+    
+    elif category == "admissions":
+        # Send information about admissions schedule
+        admissions_message = (
+            "📅 *Opening of Admissions*\n\n"
+            "Admissions are open every two weeks (bi-weekly), and each opening period lasts 1 full week only for enrollment.\n\n"
+            "Make sure to check our post updates regarding enrollment! If you see no posts related, we are likely to be closed.\n\n"
+            "Once admissions close, we do not accept late entries until the next opening — this is to keep things focused "
+            "and structured for our current students.\n\n"
+            "Stay tuned to our page for announcements on the next enrollment period, and don't miss your chance to join!"
+        )
+        
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.edit_message_text(
+            admissions_message,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+    
+    elif category == "plans_pricing":
+        # Send mentorship plans and pricing information
+        pricing_message = (
+            "💲 *Mentorship Plans & Pricing*\n\n"
+            "✨ *Supreme Mentorship:*\n"
+            "• Apprentice: $309.99 / 3 months\n"
+            "• Disciple: $524.99 / 6 months\n"
+            "• Master: $899.99 / lifetime\n\n"
+            "🔄 *Regular Mentorship:*\n"
+            "• Trial: $7.99 / month\n"
+            "• Momentum: $20.99 / 3 months - *save 11%*\n"
+            "• Legacy: $89.99 / year - *save 7%*\n\n"
+            "💳 *Payment Options*\n"
+            "GCash • PayPal • Bank Transfer\n"
+            "_(Stripe & Crypto coming soon)_\n\n"
+            "→ Click \"Join Academy\" in the menu for enrollment details!\n\n"
+            "Let us know if you need any help! We will be able to respond as soon as possible."
+        )
+        
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.edit_message_text(
+            pricing_message,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+    elif category == "products_services":
+        # Send products and services information with fixed formatting
+        products_message = (
+            "📚 *Products & Services*\n\n"
+            "📕 *Learning Materials:*\n"
+            "• Prodigy Path E-books - Exclusive to mentorship students\n"
+            "• Bundles 1-3 - Public access (Coming soon!)\n\n"
+            "🛠️ *Services:*\n"
+            "• Fund Management - We trade for you with our excellent strategies!\n"
+            "  Get to know about our expertise in fund management through\n"
+            "  Telegram and we will send you proofs of backtesting and journaling.\n\n"
+            "💬 *Contact Our Founders:*\n"
+            "• @rom\\_pta\n"
+            "• @fiftysevenrupees\n\n"
+            "🔮 *More tools and offers launching soon. Stay tuned!*"
+        )
+        
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.edit_message_text(
+            products_message,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+    elif category == "enrollment_benefits":
+        # Send benefits information with improved formatting
+        benefits_message = (
+            "🌟 *Mentorship Benefits*\n\n"
+            "✨ *SUPREME MENTORSHIP*\n"
+            "• 1-on-1 private coaching sessions\n"
+            "• Personalized teaching approach\n"
+            "• Deep learning sessions + priority support\n"
+            "• Includes everything in Regular membership\n\n"
+            "🔹 *REGULAR MENTORSHIP*\n"
+            "• Full access to core trading lessons\n"
+            "• Livestreams & educational discussions\n"
+            "• Access to community group chat\n\n"
+            "Need help choosing the best plan for your needs? Send us a message and we'll guide you through the options!"
+        )
+        
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.edit_message_text(
+            benefits_message,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+    elif category == "terms":
+        # First try sending the PDF if available
+        pdf_sent = False
+        try:
+            with open('pdf/terms_and_conditions.pdf', 'rb') as doc:
+                # Send as separate message and store the message ID
+                pdf_message = bot.send_document(
+                    call.message.chat.id, 
+                    doc, 
+                    caption="📝 Terms and Conditions"
+                )
+                # Store the PDF message ID for later deletion
+                user_id = call.from_user.id
+                PDF_MESSAGE_IDS[user_id] = {
+                    'message_id': pdf_message.message_id,
+                    'chat_id': call.message.chat.id
+                }
+                pdf_sent = True
+        except FileNotFoundError:
+            pass  # PDF not found, continue with text-only version
+        except Exception as e:
+            logging.error(f"Error sending T&C PDF in FAQ: {e}")
+            
+        # Now edit the original message with the text content
+        terms_text = (
+            "📝 *TERMS & CONDITIONS*\n\n"
+            "By using the Prodigy Trading Academy Bot and services, you agree to the following:\n\n"
+            "1. Membership fees are non-refundable once access is granted.\n"
+            "2. Trading involves risk; we do not guarantee financial returns.\n"
+            "3. Your membership is for personal use only and cannot be shared.\n"
+            "4. We may revoke access for policy violations without refund.\n"
+            "5. All educational content provided is property of Prodigy Trading Academy.\n"
+            "6. You must be at least 18 years old to use our services.\n"
+            "7. We reserve the right to modify these terms at any time."
+        )
+        
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        # Edit the original message instead of sending a new one
+        bot.edit_message_text(
+            terms_text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+        # Answer the callback to remove loading indicator
+        bot.answer_callback_query(call.id, "Viewing Terms & Conditions" + (" (PDF sent)" if pdf_sent else ""))
+    
+    elif category == "privacy":
+        # First try sending the PDF if available
+        pdf_sent = False
+        try:
+            with open('pdf/privacy_policy.pdf', 'rb') as doc:
+                # Send as separate message and store the message ID
+                pdf_message = bot.send_document(
+                    call.message.chat.id, 
+                    doc, 
+                    caption="🔒 Privacy Policy"
+                )
+                # Store the PDF message ID for later deletion
+                user_id = call.from_user.id
+                PDF_MESSAGE_IDS[user_id] = {
+                    'message_id': pdf_message.message_id,
+                    'chat_id': call.message.chat.id
+                }
+                pdf_sent = True
+        except FileNotFoundError:
+            pass  # PDF not found, continue with text-only version
+        except Exception as e:
+            logging.error(f"Error sending Privacy Policy PDF in FAQ: {e}")
+            
+        # Edit the original message with the text content
+        privacy_text = (
+            "🔒 *PRIVACY POLICY*\n\n"
+            "This policy explains how we handle your personal data:\n\n"
+            "1. We collect your Telegram ID, username, and payment information.\n"
+            "2. Your data is used to manage your membership and provide services.\n"
+            "3. We may send payment reminders and service updates.\n"
+            "4. Your information is not sold to third parties.\n"
+            "5. Your data is stored securely for the duration of your membership.\n"
+            "6. You may request access to or deletion of your data at any time.\n"
+            "7. We use encryption to protect your payment information."
+        )
+        
+        # Add back buttons with improved layout
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Categories", callback_data="faq_back"))
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        # Edit the original message instead of sending a new one
+        bot.edit_message_text(
+            privacy_text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+        # Answer the callback to remove loading indicator
+        bot.answer_callback_query(call.id, "Viewing Privacy Policy" + (" (PDF sent)" if pdf_sent else ""))
+    
+    elif category == "back":
+        # First try to delete any PDF file that was sent
+        user_id = call.from_user.id
+        if user_id in PDF_MESSAGE_IDS:
+            try:
+                bot.delete_message(
+                    PDF_MESSAGE_IDS[user_id]['chat_id'],
+                    PDF_MESSAGE_IDS[user_id]['message_id']
+                )
+                # Remove from tracking after successful deletion
+                PDF_MESSAGE_IDS.pop(user_id, None)
+                logging.info(f"Deleted PDF message for user {user_id} when returning to FAQ categories")
+            except Exception as e:
+                logging.error(f"Failed to delete PDF message when returning to FAQ: {e}")
+        
+        # Go back to main FAQ categories
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🎓 Join Academy", callback_data="faq_join_academy"),
+            InlineKeyboardButton("📅 Opening of Admissions", callback_data="faq_admissions"),
+            InlineKeyboardButton("💲 Mentorship Plans & Pricings", callback_data="faq_plans_pricing"),
+            InlineKeyboardButton("📦 Products & Services", callback_data="faq_products_services"),
+            InlineKeyboardButton("🌟 Benefits in Enrollment", callback_data="faq_enrollment_benefits"),
+            InlineKeyboardButton("📝 Terms & Conditions", callback_data="faq_terms"),
+            InlineKeyboardButton("🔒 Privacy Policy", callback_data="faq_privacy")
+        )
+        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
+        
+        bot.edit_message_text(
+            "🔍 *Frequently Asked Questions*\n\n"
+            "Select a category to view related questions:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "Back to FAQ categories")
+    
+    elif category == "main_menu":
+        # Also clean up any PDF messages when returning to main menu
+        user_id = call.from_user.id
+        if user_id in PDF_MESSAGE_IDS:
+            try:
+                bot.delete_message(
+                    PDF_MESSAGE_IDS[user_id]['chat_id'],
+                    PDF_MESSAGE_IDS[user_id]['message_id']
+                )
+                # Remove from tracking after successful deletion
+                PDF_MESSAGE_IDS.pop(user_id, None)
+                logging.info(f"Deleted PDF message for user {user_id} when returning to main menu")
+            except Exception as e:
+                logging.error(f"Failed to delete PDF message when returning to main menu: {e}")
+        
+        # Go back to the main menu
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            logging.info(f"Deleted original FAQ message when returning to main menu")
+        except Exception as e:
+            logging.error(f"Error deleting FAQ message: {e}")
+        
+        # Show the main menu
+        show_main_menu(call.message.chat.id, call.from_user.id)
+        
+        bot.answer_callback_query(call.id, "Returning to main menu")
 
-        # Log admin activity and notify all admins
-        admin_username = call.from_user.username or f"Admin ({call.message.chat.id})"
-        user_info = bot.get_chat(user_id)
-        username = user_info.username or f"ID: {user_id}"
-
-        # Escape Markdown characters in the usernames
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
-        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
-
-        for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has rejected user from old PTA member @{username}.", parse_mode="Markdown")
-
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"❌ Unexpected error rejecting old member: {e}")
-
-# Handle Payment Plan Selection
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') in ['buy_membership', 'old_member_confirmed', 'renewal_membership_new', 'renewal_membership_old'])
-def choose_payment_plan(message):
+# Handle mentorship type selection (Regular vs Supreme)
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_mentorship_type')
+def choose_mentorship_type(message):
     if message.chat.type != 'private':
         return  # Ignore if not in private chat
     chat_id = message.chat.id
-    plan_text = message.text.lower()
+    mentorship_type = message.text
+    is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
 
-    if "monthly" in plan_text:
-        plan = "Monthly"
-    elif "yearly" in plan_text:
-        plan = "Yearly"
+    # Store whether user is an OG member for pricing
+
+    # Check if user wants to go back
+    if mentorship_type == "⬅️ Go Back":
+        # Return to main menu
+        show_main_menu(chat_id, message.from_user.id)
+        return
+    
+    if mentorship_type == "Regular Mentorship":
+        # First send the Regular Mentorship pricing image
+        try:
+            with open('graphics/regular.jpeg', 'rb') as pricing_img:
+                bot.send_photo(
+                    chat_id,
+                    pricing_img,
+                    caption="Regular Mentorship Pricing Options"
+                )
+        except FileNotFoundError:
+            logging.error("Regular pricing image not found at graphics/regular.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending Regular pricing image: {e}")
+            
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Get regular discount specifically
+        applicable_discount = DISCOUNTS.get('regular')
+        discount_active = applicable_discount and applicable_discount.get('active', False)
+        
+        # Check if discount applies to this transaction type (new or renewal)
+        if discount_active:
+            transaction_type = "renewal" if is_renewal else "new"
+            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+            
+            # Determine if discount applies to this transaction type
+            applies_to_transaction = (
+                discount_transaction_type == 'both' or 
+                discount_transaction_type == transaction_type
+            )
+            
+            # Only consider discount active if it applies to this transaction type
+            if not applies_to_transaction:
+                discount_active = False
+                
+        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+        discount_name = applicable_discount.get('name', '') if discount_active else ''
+        
+        PENDING_USERS[chat_id]['mentorship_type'] = 'regular'
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
+        save_pending_users()
+        
+        # Original prices
+        trial_price = 7.99
+        momentum_price = 20.99
+        legacy_price = 89.99
+        
+        # Customize message based on whether this is a renewal
+        intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
+        
+        if discount_active:
+            # Calculate discounted prices
+            trial_discounted = round(trial_price * (1 - discount_percentage / 100), 2)
+            momentum_discounted = round(momentum_price * (1 - discount_percentage / 100), 2)
+            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+            
+            # Create keyboard with discounted prices
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton(f"Trial (${trial_discounted:.2f}) / Monthly"))
+            markup.add(KeyboardButton(f"Momentum (${momentum_discounted:.2f}) / 3 Months"))
+            markup.add(KeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Yearly"))
+            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
+            
+            # Use HTML formatting for both bold and strikethrough
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                          f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
+                          f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
+                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        else:
+            # No discount - show regular prices without strikethrough
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton(f"Trial (${trial_price:.2f}) / Monthly"))
+            markup.add(KeyboardButton(f"Momentum (${momentum_price:.2f}) / 3 Months"))
+            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly"))
+            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
+            
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
+                          f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
+                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        
+    elif mentorship_type == "Supreme Mentorship":
+        # First send the Supreme Mentorship pricing image
+        try:
+            with open('graphics/supreme.jpeg', 'rb') as pricing_img:
+                bot.send_photo(
+                    chat_id,
+                    pricing_img,
+                    caption="Supreme Mentorship Pricing Options"
+                )
+        except FileNotFoundError:
+            logging.error("Supreme pricing image not found at graphics/supreme.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending Supreme pricing image: {e}")
+            
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Get supreme discount specifically
+        applicable_discount = DISCOUNTS.get('supreme')
+        discount_active = applicable_discount and applicable_discount.get('active', False)
+        
+        # Check if discount applies to this transaction type (new or renewal)
+        if discount_active:
+            transaction_type = "renewal" if is_renewal else "new"
+            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+            
+            # Determine if discount applies to this transaction type
+            applies_to_transaction = (
+                discount_transaction_type == 'both' or 
+                discount_transaction_type == transaction_type
+            )
+            
+            # Only consider discount active if it applies to this transaction type
+            if not applies_to_transaction:
+                discount_active = False
+                
+        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+        discount_name = applicable_discount.get('name', '') if discount_active else ''
+        
+        PENDING_USERS[chat_id]['mentorship_type'] = 'supreme'
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
+        save_pending_users()
+        
+        # Original prices
+        apprentice_price = 309.99
+        disciple_price = 524.99
+        legacy_price = 899.99
+        
+        # Customize message based on whether this is a renewal
+        intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
+        
+        if discount_active:
+            # Calculate discounted prices
+            apprentice_discounted = round(apprentice_price * (1 - discount_percentage / 100), 2)
+            disciple_discounted = round(disciple_price * (1 - discount_percentage / 100), 2)
+            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+            
+            # Create keyboard with discounted prices
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton(f"Apprentice (${apprentice_discounted:.2f}) / 3 Months"))
+            markup.add(KeyboardButton(f"Disciple (${disciple_discounted:.2f}) / 6 Months"))
+            markup.add(KeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Lifetime"))
+            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
+            
+            # Use HTML formatting for both bold and strikethrough
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                          f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
+                          f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
+                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        else:
+            # No discount - show regular prices without strikethrough
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months"))
+            markup.add(KeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months"))
+            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime"))
+            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
+            
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
+                          f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
+                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
     else:
-        bot.send_message(chat_id, "❌ Please choose either 'Monthly' or 'Yearly'.")
+        # Add Back button to the error response too
+        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
+        markup.add(KeyboardButton("⬅️ Go Back"))
+        bot.send_message(chat_id, "❌ Please choose either 'Regular Mentorship' or 'Supreme Mentorship'.", reply_markup=markup)
+
+
+# Update the handler to process mentorship plans
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_mentorship_plan')
+def choose_mentorship_plan(message):
+    if message.chat.type != 'private':
+        return  # Ignore if not in private chat
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    plan_text = message.text
+    
+    # Check if user wants to go back
+    if plan_text == "⬅️ Go Back":
+        # Return to membership type selection
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
+        save_pending_users()
+        
+        # Show mentorship type options again
+        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
+        markup.add(KeyboardButton("⬅️ Go Back"))
+        bot.send_message(chat_id, "Please select your preferred mentorship level:", reply_markup=markup)
+        return
+    
+    # Extract plan data based on selection
+    if "Trial" in plan_text:
+        plan = "Trial"
+        price_usd = 7.99  # Store numeric USD price for currency conversion
+        duration = "Monthly"
+        mentorship_type = "regular"
+        plan_image = "graphics/trial.jpeg"
+    elif "Momentum" in plan_text:
+        plan = "Momentum"
+        price_usd = 20.99
+        duration = "3 Months"
+        mentorship_type = "regular"
+        plan_image = "graphics/momentum.jpeg"
+    elif "Apprentice" in plan_text:
+        plan = "Apprentice"
+        price_usd = 309.99
+        duration = "3 Months"
+        mentorship_type = "supreme"
+        plan_image = "graphics/apprentice.jpeg"
+    elif "Disciple" in plan_text:
+        plan = "Disciple"
+        price_usd = 524.99
+        duration = "6 Months" 
+        mentorship_type = "supreme"
+        plan_image = "graphics/disciple.jpeg"
+    elif "Legacy" in plan_text and "$89.99" in plan_text:
+        plan = "Legacy"
+        price_usd = 89.99
+        duration = "Yearly"
+        mentorship_type = "regular"
+        plan_image = "graphics/regular_legacy.jpeg"
+    elif "Master" in plan_text and "$899.99" in plan_text:
+        plan = "Master"
+        price_usd = 899.99
+        duration = "Lifetime"
+        mentorship_type = "supreme"
+        plan_image = "graphics/master.jpeg"
+    else:
+        bot.send_message(chat_id, "❌ Invalid plan selection. Please choose a valid plan.")
         return
 
+    # Send the plan-specific graphic
+    try:
+        with open(plan_image, 'rb') as img:
+            bot.send_photo(
+                chat_id,
+                img,
+            )
+    except FileNotFoundError:
+        logging.error(f"Plan image not found at {plan_image}")
+    except Exception as e:
+        logging.error(f"Error sending plan image: {e}")
+    
+    # Add a small delay for better UX
+    time.sleep(1.5)
+
+    # Store original price before any discounts
+    original_price_usd = price_usd
+    original_price = f"${original_price_usd:.2f}"
+    
+    # Apply appropriate discount based on mentorship type
+    discount_applied = False
+    applicable_discount = DISCOUNTS.get(mentorship_type)
+    
+    if applicable_discount and applicable_discount.get('active', False):
+        # Get transaction type - renewal or new purchase
+        is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
+        transaction_type = "renewal" if is_renewal else "new"
+        
+        # Debug log to identify the issue
+        logging.info(f"Discount check for {mentorship_type}: is_renewal={is_renewal}, user_transaction={transaction_type}, discount_type={applicable_discount.get('transaction_type', 'both')}")
+        
+        # Fix the transaction type check logic
+        applies_to_transaction = (
+            applicable_discount.get('transaction_type', 'both') == 'both' or 
+            applicable_discount.get('transaction_type', 'both') == transaction_type
+        )
+        
+        # Only apply if the discount is valid for this transaction type
+        if applies_to_transaction:
+            # Get discount percentage and user limit
+            discount_percentage = applicable_discount.get('percentage', 0)
+            user_limit = applicable_discount.get('user_limit')
+            users_used = applicable_discount.get('users_used', [])
+            discount_name = applicable_discount.get('name', f'Special {mentorship_type.capitalize()} Discount')
+            
+            # Check if user limit is reached and if this user already used the discount
+            if (user_limit is None or len(users_used) < user_limit) and str(user_id) not in users_used:
+                # Apply the discount
+                price_usd = original_price_usd * (1 - discount_percentage / 100)
+                
+                # Store discount info for later use
+                PENDING_USERS[chat_id]['discount_percentage'] = discount_percentage
+                PENDING_USERS[chat_id]['discount_name'] = discount_name
+                PENDING_USERS[chat_id]['original_price_usd'] = original_price_usd
+                
+                # Mark discount as applied
+                discount_applied = True
+                
+                # Add user to the list of users who used this discount
+                DISCOUNTS[mentorship_type]['users_used'].append(str(user_id))
+                save_discount(DISCOUNTS[mentorship_type], mentorship_type)
+                
+                # Log the discount application
+                logging.info(f"Applied {discount_percentage}% {mentorship_type} discount to user {user_id}, price reduced from ${original_price_usd} to ${price_usd}")
+            elif user_limit is not None and len(users_used) >= user_limit and str(user_id) not in users_used:
+                # User limit reached
+                bot.send_message(chat_id, f"❌ The {discount_name} discount has reached its user limit. Your purchase will continue at the regular price.")
+            elif str(user_id) in users_used:
+                # User already used the discount
+                bot.send_message(chat_id, f"ℹ️ You've already used the {discount_name} discount. This purchase will be at the regular price.")
+        else:
+            # Not applicable - inform user if this is a specific discount type
+            if applicable_discount.get('transaction_type') == "renewal" and not is_renewal:
+                bot.send_message(chat_id, f"ℹ️ The current {mentorship_type.capitalize()} discount is only available for renewals, not new purchases.")
+            elif applicable_discount.get('transaction_type') == "new" and is_renewal:
+                bot.send_message(chat_id, f"ℹ️ The current {mentorship_type.capitalize()} discount is only available for new purchases, not renewals.")
+    
+    # Format the price for display (always .99)
+    price = f"${price_usd:.2f}"
+
+    # Store the plan details including the numeric USD price
     PENDING_USERS[chat_id]['plan'] = plan
+    PENDING_USERS[chat_id]['price'] = price
+    PENDING_USERS[chat_id]['price_usd'] = price_usd  # Store numeric price for conversion
+    PENDING_USERS[chat_id]['mentorship_type'] = mentorship_type  # Store for later use
+    PENDING_USERS[chat_id]['duration'] = duration
     PENDING_USERS[chat_id]['status'] = 'choosing_payment_method'
     save_pending_users()
 
-    # Ask for a payment method
+    # Customize message based on discount
+    if discount_applied:
+        plan_message = (
+            f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
+            f"• Original price: {original_price}\n"
+            f"🔖 Discount: {PENDING_USERS[chat_id]['discount_percentage']}% OFF ({PENDING_USERS[chat_id]['discount_name']})\n\n"
+            f"• You pay: {price}\n"
+            f"• Duration: {duration}\n\n"
+            f"Please be prepared for the following steps:\n"
+            f"• Payment\n"
+            f"• Registration Forms\n\n"
+        )
+    else:
+        plan_message = (
+            f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
+            f"• Price: {price}\n"
+            f"• Duration: {duration}\n\n"
+            f"Please be prepared for the following steps:\n"
+            f"• Payment\n"
+            f"• Registration Forms\n\n"
+        )
+    
+    # Show plan confirmation message
+    bot.send_message(chat_id, plan_message)
+    
+    # Add a transition message with typing indicator
+    bot.send_chat_action(chat_id, 'typing')
+    transition_msg = bot.send_message(chat_id, "⏳ Moving on to payment options...")
+    
+    # Add a small delay for better UX
+    time.sleep(1.5)
+    
+    # Delete the transition message
+    try:
+        bot.delete_message(chat_id, transition_msg.message_id)
+    except Exception as e:
+        logging.error(f"Error deleting transition message: {e}")
+    
+    # Create payment method markup
     markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add(KeyboardButton("💳 Paypal"), KeyboardButton("📱 GCash"), KeyboardButton("💸 Exness Direct"), KeyboardButton("🏦 Bank Transfer"))
+    markup.add(KeyboardButton("💳 Paypal"), KeyboardButton("📱 GCash"))
+    markup.add(KeyboardButton("💸 Exness Direct"), KeyboardButton("🏦 Bank Transfer"))
+    markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
+        
+    # Ask for payment method after transition
     bot.send_message(chat_id, "Please select your payment method:", reply_markup=markup)
 
 # Handle Payment Method Selection
@@ -826,12 +2018,185 @@ def choose_payment_method(message):
     chat_id = message.chat.id
     method = message.text
 
+    # Check if user wants to go back
+    if method == "⬅️ Go Back":
+        # Return to plan selection
+        mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', 'regular')
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
+        save_pending_users()
+        
+        # Re-display appropriate plan options based on mentorship type
+        if mentorship_type == 'regular':
+            # Show regular plans
+            trial_price = 7.99
+            momentum_price = 20.99
+            legacy_price = 89.99
+            
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton(f"Trial (${trial_price:.2f}) / Monthly"))
+            markup.add(KeyboardButton(f"Momentum (${momentum_price:.2f}) / 3 Months"))
+            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly"))
+            markup.add(KeyboardButton("⬅️ Go Back"))
+            
+            bot.send_message(chat_id, "Please select your Regular Mentorship plan:", reply_markup=markup)
+        else:
+            # Show supreme plans
+            apprentice_price = 309.99
+            disciple_price = 524.99
+            legacy_price = 899.99
+            
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months"))
+            markup.add(KeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months"))
+            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime"))
+            markup.add(KeyboardButton("⬅️ Go Back"))
+            
+            bot.send_message(chat_id, "Please select your Supreme Mentorship plan:", reply_markup=markup)
+        return
+
     if method not in ["💳 Paypal", "🏦 Bank Transfer", "📱 GCash", "📱 PayMaya", "💸 Exness Direct"]:
         bot.send_message(chat_id, "❌ Invalid payment method. Please select a valid method.")
         return
 
+    # Store the user's payment method choice
     PENDING_USERS[chat_id]['method'] = method
     PENDING_USERS[chat_id]['status'] = 'awaiting_payment'
+    save_pending_users()
+    
+    # Determine which payment graphic to show based on the selected method
+    payment_image = None
+    if "Paypal" in method:
+        payment_image = "graphics/paypal.jpeg"
+    elif "Bank Transfer" in method:
+        payment_image = "graphics/bank.jpeg"
+    elif "GCash" in method:
+        payment_image = "graphics/gcash.jpeg"
+    elif "Exness Direct" in method:
+        payment_image = "graphics/exness.jpeg"
+    
+    # Send the payment method-specific graphic if available
+    if payment_image:
+        try:
+            with open(payment_image, 'rb') as img:
+                bot.send_photo(
+                    chat_id,
+                    img,
+                    caption=f"You've selected {method.strip('💳📱🏦🌐💸 ')} as your payment method"
+                )
+        except FileNotFoundError:
+            logging.error(f"Payment method image not found at {payment_image}")
+        except Exception as e:
+            logging.error(f"Error sending payment method image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+    
+    # Get plan details for the message
+    mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', '')
+    plan = PENDING_USERS[chat_id].get('plan', '')
+    price = PENDING_USERS[chat_id].get('price', '')
+    price_usd = PENDING_USERS[chat_id].get('price_usd', 0)  # Get numeric discounted price
+    original_price_usd = PENDING_USERS[chat_id].get('original_price_usd')  # Original price before discount
+    duration = PENDING_USERS[chat_id].get('duration', '')
+    
+    # Calculate payment method fee based on the ALREADY DISCOUNTED price
+    fee_percentage = PAYMENT_FEES.get(method, 0.0)
+    if fee_percentage > 0:
+        fee_adjusted_price = price_usd * (1 + fee_percentage/100)
+        fee_adjusted_price_str = f"${fee_adjusted_price:.2f}"
+    else:
+        fee_adjusted_price = price_usd  # No fee adjustment
+        fee_adjusted_price_str = price
+    
+    # Fetch real-time exchange rates - use fee_adjusted_price for conversions
+    exchange_rates = get_exchange_rates()
+    
+    # Prepare currency conversion information based on the FINAL price
+    currency_info = ""
+    if exchange_rates:
+        currency_info = "\n\n💱 *Equivalent Prices*:\n"
+        
+        # Define currency symbols for better display
+        currency_symbols = {
+            'USD': '$', 'GBP': '£', 'EUR': '€', 'IDR': 'Rp', 'PHP': '₱'
+        }
+        
+        for currency, rate in exchange_rates.items():
+            if currency == 'USD':
+                continue  # Skip USD as it's already shown
+            
+            # Use the final fee-adjusted price for all currency conversions
+            equivalent_price = fee_adjusted_price * rate
+            
+            symbol = currency_symbols.get(currency, '')
+            
+            # Format based on currency
+            if currency in ['IDR', 'PHP']:
+                formatted_price = f"{symbol}{equivalent_price:,.0f}"
+            else:
+                whole_price = int(equivalent_price)
+                formatted_price = f"{symbol}{whole_price:,}.99"
+            
+            currency_info += f"• *{currency}*: {formatted_price}\n"
+    
+    # Format plan details based on discount and payment fee combinations
+    discount_percentage = PENDING_USERS[chat_id].get('discount_percentage')
+    discount_name = PENDING_USERS[chat_id].get('discount_name')
+
+    # Create a comprehensive message showing all calculations clearly
+    if original_price_usd and discount_percentage:
+        # Case: Has discount
+        if fee_percentage > 0:
+            # Has both discount AND payment fee - show complete calculation
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- Original Price: ${original_price_usd:.2f} USD\n"
+                f"- *{discount_name}: {discount_percentage}% OFF* (-${(original_price_usd - price_usd):.2f})\n"
+                f"- Discounted Price: ${price_usd:.2f} USD\n"
+                f"- *{method.strip('💳📱🏦🌐💸 ')} Fee: {fee_percentage}%* (+${(fee_adjusted_price - price_usd):.2f})\n"
+                f"- **Final Price: {fee_adjusted_price_str} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+                f"*Note: A {fee_percentage}% fee applies to cover {method.strip('💳📱🏦🌐💸 ')} transaction costs.*\n\n"
+            )
+        else:
+            # Has discount but NO payment fee
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- Original Price: ${original_price_usd:.2f} USD\n"
+                f"- *{discount_name}: {discount_percentage}% OFF* (-${(original_price_usd - price_usd):.2f})\n"
+                f"- **Final Price: ${price_usd:.2f} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+            )
+    else:
+        # Case: No discount applied
+        if fee_percentage > 0:
+            # No discount, but has payment fee
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- Base Price: ${price_usd:.2f} USD\n"
+                f"- *{method.strip('💳📱🏦🌐💸 ')} Fee: {fee_percentage}%* (+${(fee_adjusted_price - price_usd):.2f})\n"
+                f"- **Final Price: {fee_adjusted_price_str} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+                f"*Note: A {fee_percentage}% fee applies to cover {method.strip('💳📱🏦🌐💸 ')} transaction costs.*\n\n"
+            )
+        else:
+            # No discount, no payment fee - simplest case
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- **Price: ${price_usd:.2f} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+            )
+
+    # Also update the payment information in PENDING_USERS to track the final price
+    PENDING_USERS[chat_id]['final_price_usd'] = fee_adjusted_price
     save_pending_users()
 
     # Send payment credentials based on the selected method
@@ -839,7 +2204,6 @@ def choose_payment_method(message):
         "💳 Paypal": "PayPal:\nOption 1: https://paypal.me/daintyrich\n\nOption 2: \nName: R Mina\nEmail: romeomina061109@gmail.com",
         "🏦 Bank Transfer": "🏦 **Bank Details:**\nBank: BDO\nDebit Number: 5210 6912 0103 9329\nAccount Name: Romeo B. Mina III",
         "📱 GCash": "📱 **GCash Number:** 09274478330 (R. U.)",
-        # "📱 PayMaya": "📱 **PayMaya Number:** 09998887777",
         "💸 Exness Direct": {
             "account_id_1": "108377569",
             "email_1": "diamondchay626@gmail.com",
@@ -848,10 +2212,11 @@ def choose_payment_method(message):
         }
     }
 
-    # Format the message properly
+    # Format the message properly with plan details
     if method == "💸 Exness Direct":
         message = (
             "💰 **Payment Instructions:**\n\n"
+            f"{plan_details}"
             "For Exness Direct:\n"
             f"📌 **Exness Account ID 1:** {payment_details['💸 Exness Direct']['account_id_1']}\n"
             f"📧 **Email 1:** {payment_details['💸 Exness Direct']['email_1']}\n\n"
@@ -863,6 +2228,7 @@ def choose_payment_method(message):
     else:
         message = (
             "💰 **Payment Instructions:**\n\n"
+            f"{plan_details}"
             f"{payment_details[method]}\n\n"
             "After completing your transaction, please use `/verify` to confirm your payment.\n\n"
             "Note: Your Telegram ID and name will be securely recorded."
@@ -892,30 +2258,89 @@ def request_payment_proof(message):
 def handle_payment_screenshot(message):
     if message.chat.type != 'private':
         return  # Ignore if not in private chat
+    
+    user_id = message.from_user.id
     chat_id = message.chat.id
+    
+    # First check if user is in confession mode - if so, skip this handler
+    if user_id in USERS_CONFESSING and USERS_CONFESSING[user_id]['status'] == 'awaiting_confession':
+        # Process as a confession photo - call the handler directly
+        handle_photo_confession(message)
+        return
+    
+        # Check if user is in announcement mode - if so, skip this handler
+    if user_id in ADMIN_ANNOUNCING and ADMIN_ANNOUNCING[user_id]['status'] == 'waiting_for_announcement':
+        # Process as an announcement photo
+        handle_announcement_message(message)
+        return
+    
+    # Otherwise, continue with payment verification logic
     if chat_id not in PENDING_USERS or PENDING_USERS[chat_id]['status'] != 'awaiting_proof':
         bot.send_message(chat_id, "❌ Please start verification with `/verify`.")
         return
 
     user_id = message.from_user.id
     username = message.from_user.username or "No Username"
-    plan = PENDING_USERS[chat_id]['plan']
-    method = PENDING_USERS[chat_id]['method']
-
+    
     # Escape Markdown characters in username
     if username != "No Username":
         username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
 
-    # Determine and send due date
+    # Get mentorship type and plan details from PENDING_USERS
     if user_id in PENDING_USERS:
-        plan = PENDING_USERS[user_id]['plan']
-        due_date = datetime.now() + timedelta(days=365) if plan == "Yearly" else datetime.now() + timedelta(days=30)
+        plan = PENDING_USERS[chat_id]['plan']
+        mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', 'Regular')
+        price_usd = PENDING_USERS[chat_id].get('price_usd', 0)  # Base discounted price
+        original_price_usd = PENDING_USERS[chat_id].get('original_price_usd', price_usd)  # Original price
+        price = PENDING_USERS[chat_id].get('price', '')
+        method = PENDING_USERS[chat_id]['method']
+        
+        # Get discount information for context
+        discount_percentage = PENDING_USERS[chat_id].get('discount_percentage', 0)
+        discount_applied = discount_percentage > 0
+        
+        # Calculate adjusted price if payment method has a fee
+        fee_percentage = PAYMENT_FEES.get(method, 0.0)
+        
+        if fee_percentage > 0:
+            # Apply fee to the already-discounted price
+            adjusted_price_usd = price_usd * (1 + fee_percentage/100)
+            adjusted_price = f"${adjusted_price_usd:.2f}"
+            
+            # Create complete price display showing both discount and fee if applicable
+            if discount_applied:
+                price_display = f"${original_price_usd:.2f} → ${price_usd:.2f} ({discount_percentage}% off) → {adjusted_price} (+{fee_percentage}% fee)"
+            else:
+                price_display = f"{price} → {adjusted_price} (+{fee_percentage}% fee)"
+        else:
+            # No fee, but might have discount
+            if discount_applied:
+                price_display = f"${original_price_usd:.2f} → {price} ({discount_percentage}% off)"
+            else:
+                price_display = price
+        
+        # Calculate due date based on the plan duration
+        if "Yearly" in plan or plan == "Regular Legacy":
+            due_date = datetime.now() + timedelta(days=365)
+        elif "3 Months" in plan or plan == "Momentum" or plan == "Apprentice":
+            due_date = datetime.now() + timedelta(days=90)  # 3 months
+        elif "6 Months" in plan or plan == "Disciple":
+            due_date = datetime.now() + timedelta(days=180)  # 6 months
+        elif "Lifetime" in plan or plan == "Supreme Legacy":
+            # For lifetime, set a very long expiration (10 years)
+            due_date = datetime.now() + timedelta(days=3650)  # ~10 years
+        else:
+            due_date = datetime.now() + timedelta(days=30)  # Default to monthly
     else:
+        plan = "Monthly"
+        mentorship_type = "Regular"
+        price_display = ""
+        method = "Unknown"
         due_date = datetime.now() + timedelta(days=30)  # Default to monthly if no plan is found
 
     USER_PAYMENT_DUE[user_id] = due_date
 
-    # Forward the screenshot to Admins WITH payment details and inline buttons
+    # Forward the screenshot to Admins WITH enhanced payment details and inline buttons
     for admin in ADMIN_IDS:
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("Approve", callback_data=f"approve_payment_{user_id}"))
@@ -924,9 +2349,11 @@ def handle_payment_screenshot(message):
         bot.forward_message(admin, chat_id, message.message_id)
         bot.send_message(admin,
             f"🔔 *Payment Request:*\n"
+            f"Someone is waiting for a payment approval. Here are the details:\n\n"
             f"🆔 @{username} (ID: `{user_id}`)\n"
             f"💳 Mode of Payment: {method}\n"
-            f"📅 Payment Plan: {plan}\n"
+            f"📅 Mentorship Type: {mentorship_type.capitalize()}\n"
+            f"📅 Plan: {plan} ({price_display})\n"  # Now shows adjusted price if needed
             f"📅 Due Date: {USER_PAYMENT_DUE[user_id].strftime('%Y-%m-%d %H:%M:%S')}",
             reply_markup=markup,
             parse_mode="Markdown"
@@ -962,12 +2389,27 @@ def callback_approve_payment(call):
         if user_id in PENDING_USERS:
             plan = PENDING_USERS[user_id].get('plan', 'Monthly')  # Default to 'Monthly' if not found
             payment_mode = PENDING_USERS[user_id].get('method', 'Unknown')  # Default to 'Unknown' if not found
-            due_date = datetime.now() + timedelta(days=365) if plan == "Yearly" else datetime.now() + timedelta(days=30)
+            mentorship_type = PENDING_USERS[user_id].get('mentorship_type', 'Regular')  # Get mentorship type with fallback
+            
+            # Calculate due date based on the plan duration
+            if "Yearly" in plan or plan == "Regular Legacy":
+                due_date = datetime.now() + timedelta(days=365)
+            elif "3 Months" in plan or plan == "Momentum" or plan == "Apprentice":
+                due_date = datetime.now() + timedelta(days=90)  # 3 months
+            elif "6 Months" in plan or plan == "Disciple":
+                due_date = datetime.now() + timedelta(days=180)  # 6 months
+            elif "Lifetime" in plan or plan == "Supreme Legacy":
+                # For lifetime, set a very long expiration (10 years)
+                due_date = datetime.now() + timedelta(days=3650)  # ~10 years
+            else:
+                due_date = datetime.now() + timedelta(days=30)  # Default to monthly
+
             PENDING_USERS.pop(user_id, None)  # Remove from pending list
             delete_pending_user(user_id)
         else:
             plan = 'Monthly'
             payment_mode = 'Unknown'
+            mentorship_type = 'Regular'  # Default to Regular if not in PENDING_USERS
             due_date = datetime.now() + timedelta(days=30)  # Default to monthly if no plan is found
 
         save_pending_users()
@@ -979,18 +2421,39 @@ def callback_approve_payment(call):
         except Exception:
             username = "No Username"  # Fallback if can't get username
 
-        # Save payment data with USER'S username (not admin's)
-        PAYMENT_DATA[str(user_id)] = {
-            "username": username,  # Use the user's username instead of admin's
-            "payment_plan": plan,
-            "payment_mode": payment_mode,
-            "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
-            "haspayed": True
-        }
+        # FIX: Preserve existing data when saving payment approval
+        if str(user_id) in PAYMENT_DATA:
+            # Get existing data first to preserve terms/privacy acceptance
+            existing_data = PAYMENT_DATA[str(user_id)]
+            
+            # Update only the payment-related fields
+            existing_data.update({
+                "username": username,  # Use the user's username instead of admin's
+                "payment_plan": plan,
+                "payment_mode": payment_mode,
+                "mentorship_type": mentorship_type,
+                "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True
+            })
+            
+            # The existing terms_accepted and privacy_accepted will be preserved
+        else:
+            # No existing data - create new entry
+            PAYMENT_DATA[str(user_id)] = {
+                "username": username,
+                "payment_plan": plan,
+                "payment_mode": payment_mode,
+                "mentorship_type": mentorship_type,
+                "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "terms_accepted": False,  # Default values
+                "privacy_accepted": False  # Default values
+            }
+        
         logging.info(f"Saving payment data for user {user_id}: {PAYMENT_DATA[str(user_id)]}")
         save_payment_data()  # Ensure this function is called to save the data
 
-        # ✅ Check if the bot can message the user
+                # ✅ Check if the bot can message the user
         try:
             bot.send_chat_action(user_id, 'typing')  # Check if the user exists
         except ApiException:
@@ -1009,52 +2472,105 @@ def callback_approve_payment(call):
         for admin_id in ADMIN_IDS:
             bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} has approved payment from PTA member @{username}.", parse_mode="Markdown")
 
-        # ✅ Step 1: Verification successful
-        bot.send_message(user_id, random.choice(payment_approval_messages), parse_mode="Markdown")
-        bot.answer_callback_query(call.id, "✅ Payment approved successfully.")
-
-        # 📅 Step 2: Determine and send due date
-        USER_PAYMENT_DUE[user_id] = due_date
-        bot.send_message(user_id, f"📅 **Your next payment is due on:** {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
-
-        # 🔍 Step 3: Check if the user is already in the group
+        # After successful payment approval:
         try:
-            member = bot.get_chat_member(PAID_GROUP_ID, user_id)
-            if member.status in ["member", "administrator", "creator"]:
-                bot.send_message(user_id, "✅ You already have access to the group.")
-                return  # Stop here, no invite needed
-        except Exception:
-            pass  # User not found in the group
+            # First send the payment approved graphic
+            try:
+                with open('graphics/payment_approved.jpeg', 'rb') as approval_img:
+                    bot.send_photo(
+                        user_id,
+                        approval_img,
+                        caption="Your payment has been approved!"
+                    )
+            except FileNotFoundError:
+                logging.error("Payment approval image not found at graphics/payment_approved.jpeg")
+            except Exception as e:
+                logging.error(f"Error sending payment approval image: {e}")
+                
+            # Add a small delay for better UX
+            time.sleep(1.5)
+            
+            # ✅ Step 1: Verification successful (keep the text confirmation too)
+            bot.send_message(user_id, random.choice(payment_approval_messages), parse_mode="Markdown")
+            bot.answer_callback_query(call.id, "✅ Payment approved successfully.")
 
-        # 🚀 Step 4: User is not in the group → Create a one-time use invite link
-        try:
-            invite_link: ChatInviteLink = bot.create_chat_invite_link(
-                PAID_GROUP_ID,
-                member_limit=1,  # One-time use only
-                creates_join_request=False
-            )
-            bot.send_message(user_id, f"🔗 Group Access: Please join our members' community here: {invite_link.invite_link}")
+                        # 📅 Step 2: Determine and send due date
+            USER_PAYMENT_DUE[user_id] = due_date
+            bot.send_message(user_id, f"📅 **Your next payment is due on:** {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
 
-            # ⏳ Step 5: Delay revocation and notify admins
-            def revoke_link_later(chat_id, invite_link, admin_ids):
-                time.sleep(15)  # Wait 15 seconds before revoking
+            # Send registration form graphic first
+            try:
+                with open('graphics/registration_form.jpeg', 'rb') as form_img:
+                    bot.send_photo(
+                        user_id,
+                        form_img,
+                        caption="Please complete the registration form to continue"
+                    )
+            except FileNotFoundError:
+                logging.error("Registration form image not found at graphics/registration_form.jpeg")
+            except Exception as e:
+                logging.error(f"Error sending registration form image: {e}")
+                
+            # Add a small delay for better UX
+            time.sleep(1.5)
+
+            # Add transition message before moving to onboarding
+            bot.send_chat_action(user_id, 'typing')
+            transition_msg = bot.send_message(user_id, "⏳ Loading Registration Forms...")
+            
+            # Add a slight delay for better UX
+            time.sleep(1)
+            
+            try:
+                # Delete the transition message after delay
+                bot.delete_message(user_id, transition_msg.message_id)
+            except Exception as e:
+                logging.error(f"Error deleting transition message: {e}")
+            
+            # 📝 Step 3: Send onboarding form
+            target_group_id = SUPREME_GROUP_ID if mentorship_type.lower() == 'supreme' else PAID_GROUP_ID
+            PENDING_USERS[user_id] = {
+                'form_answers': {},  # Initialize empty dict to store responses
+                'invite_link': None,  # Will store the invite link to use after form completion
+                'target_group_id': target_group_id  # Store which group to invite to
+            }
+            save_pending_users()
+
+            # Then call send_onboarding_form which will set the proper status
+            send_onboarding_form(user_id)
+            
+            # The rest of the function (social links, group invite) will be sent after form completion
+            # We'll save the invite link for later use
+            try:
+                # Check if the user is already in the group they should be invited to
+                target_group_id = PENDING_USERS[user_id]['target_group_id']
                 try:
-                    bot.revoke_chat_invite_link(chat_id, invite_link)
-                    for admin_id in admin_ids:
-                        bot.send_message(admin_id, f"🔒 One-time invite link revoked: {invite_link}")
-                except ApiException as e:
-                    print(f"⚠️ Failed to revoke invite link: {e}")
-
-            threading.Thread(target=revoke_link_later, args=(PAID_GROUP_ID, invite_link.invite_link, ADMIN_IDS)).start()
-
-        except ApiException as e:
-            bot.send_message(call.message.chat.id, f"❌ Link generation failed: {e.result_json['description']}")
-            return
-        
-        # Send thank you message instead of requesting feedback
-        bot.send_message(user_id, "Thank you for joining Prodigy Trading Academy! If you have any questions, feel free to ask our admins.")
-        # Don't add them to PENDING_USERS for feedback - removed this line:
-        # PENDING_USERS[user_id] = {'status': 'awaiting_feedback'}
+                    member = bot.get_chat_member(target_group_id, user_id)
+                    if member.status in ["member", "administrator", "creator"]:
+                        PENDING_USERS[user_id]['already_in_group'] = True
+                        save_pending_users()
+                        return  # No invite needed
+                except Exception:
+                    pass  # User not found in the group
+                
+                # User is not in the group → Create a one-time use invite link but don't send it yet
+                invite_link: ChatInviteLink = bot.create_chat_invite_link(
+                    target_group_id,
+                    member_limit=1,  # One-time use only
+                    creates_join_request=False
+                )
+                
+                # Save the invite link for later
+                PENDING_USERS[user_id]['invite_link'] = invite_link.invite_link
+                save_pending_users()
+                
+            except ApiException as e:
+                bot.send_message(call.message.chat.id, f"❌ Link generation failed: {e.result_json['description']}")
+                return
+            
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ Error sending onboarding form: {e}")
+            logging.error(f"Error in onboarding form: {e}")
 
         # 🔒 Step 6: Ensure bot is an admin before adding restrictions
         try:
@@ -1064,6 +2580,1056 @@ def callback_approve_payment(call):
 
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Unexpected error approving payment: {e}")
+
+def send_onboarding_form(user_id):
+    """Send the first question of the onboarding form to the user"""
+    # Check if the user has already completed the form previously
+    user_id_str = str(user_id)
+    
+    # Look for existing form_answers in PAYMENT_DATA
+    if user_id_str in PAYMENT_DATA and PAYMENT_DATA[user_id_str].get('form_answers'):
+        logging.info(f"User {user_id} has already completed forms - skipping to final steps")
+        
+        # Get existing data for passing to complete_onboarding
+        membership_type = PAYMENT_DATA[user_id_str].get('mentorship_type', 'regular').lower()
+        
+        # Get is_renewal flag from existing PENDING_USERS data or default to True
+        # This ensures admin notifications are skipped for users with existing forms
+        is_renewal = PENDING_USERS.get(user_id, {}).get('is_renewal', True)
+        
+        # Prepare minimal PENDING_USERS data - just enough for the complete_onboarding function
+        PENDING_USERS[user_id] = {
+            'status': 'completed_onboarding',
+            'form_answers': PAYMENT_DATA[user_id_str]['form_answers'],
+            'membership_type': membership_type,
+            'invite_link': PENDING_USERS.get(user_id, {}).get('invite_link') if user_id in PENDING_USERS else None,
+            'target_group_id': SUPREME_GROUP_ID if membership_type.lower() == 'supreme' else PAID_GROUP_ID,
+            'is_renewal': is_renewal  # Always set is_renewal when reusing forms
+        }
+        save_pending_users()
+        
+        # Send a message that we're using existing form data
+        bot.send_message(
+            user_id,
+            "✅ *Welcome back!*\n\nWe noticed you've already filled out our onboarding form. We'll use your previous responses.",
+            parse_mode="Markdown"
+        )
+        
+        # Skip directly to the final step of onboarding
+        complete_onboarding(user_id)
+        return
+    
+    # Original function continues here for new users
+    # Show typing indicator for better UX
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1)
+    
+    # Determine which form to send based on membership type
+    membership_type = "regular"  # Default to regular
+    if user_id_str in PAYMENT_DATA:
+        membership_type = PAYMENT_DATA[user_id_str].get('mentorship_type', 'regular').lower()
+    
+    # Initialize form data structure - Store with BOTH user_id (int) and the string version
+    # This ensures we have consistent keys no matter how they're accessed
+    PENDING_USERS[user_id] = {
+        'status': 'onboarding_form_regular_step1' if membership_type == 'regular' else 'onboarding_form_supreme_step1',
+        'form_answers': {},
+        'membership_type': membership_type,
+        'invite_link': PENDING_USERS.get(user_id, {}).get('invite_link') if user_id in PENDING_USERS else None,
+        'target_group_id': PENDING_USERS.get(user_id, {}).get('target_group_id', PAID_GROUP_ID) if user_id in PENDING_USERS else PAID_GROUP_ID,
+        'user_id_str': user_id_str  # Add this for clarity
+    }
+    save_pending_users()
+    
+    # Log user state to help debug
+    logging.info(f"Initialized onboarding form for user {user_id} with status: {PENDING_USERS[user_id]['status']}")
+    
+    # Send welcome message with form explanation
+    welcome_msg = "🎉 *Welcome to Prodigy Trading Academy!*\n\n"
+    
+    if membership_type == 'supreme':
+        welcome_msg += "As a *Supreme Mentorship* member, we'd like to learn more about you to personalize your experience. Please take a few moments to complete this 10-question onboarding survey:"
+        
+        # Send the first question for supreme membership with example
+        bot.send_message(
+            user_id,
+            welcome_msg + "\n\n📝 *Question 1:* Full Name (ex. Juan Dela Cruz)",
+            parse_mode="Markdown"
+        )
+    else:
+        welcome_msg += "Before we add you to our community group, we'd like to learn a bit about you. Please take a moment to answer these 5 quick questions:"
+        
+        # Send the first question for regular membership (Full Name) with example
+        bot.send_message(
+            user_id,
+            welcome_msg + "\n\n📝 *Question 1:* Full Name (ex. Juan Dela Cruz)",
+            parse_mode="Markdown"
+        )
+
+
+# REGULAR MEMBERSHIP FORM HANDLERS
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step1')
+def handle_regular_form_step1(message):
+    user_id = message.from_user.id
+    
+    # Store the answer - this is the full name question
+    PENDING_USERS[user_id]['form_answers']['full_name'] = message.text
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step2'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send second question for Birthday (changed from Age/Birth Year)
+    bot.send_message(
+        user_id,
+        "📝 *Question 2:* Birthday (DD/MM/YYYY format, e.g., 15/06/1990)",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step2')
+def handle_regular_form_step2(message):
+    user_id = message.from_user.id
+    birthday_input = message.text
+    
+    # Validate birthday format (DD/MM/YYYY)
+    try:
+        # Check if input matches DD/MM/YYYY pattern
+        if not re.match(r"^\d{2}/\d{2}/\d{4}$", birthday_input):
+            bot.send_message(
+                user_id,
+                "❌ Invalid birthday format. Please use DD/MM/YYYY format (e.g., 15/06/1990)."
+            )
+            return
+            
+        # Try to parse the date to ensure it's valid
+        day, month, year = map(int, birthday_input.split('/'))
+        birthday_date = datetime(year, month, day)
+        
+        # Check if birthday is in the past
+        if birthday_date > datetime.now():
+            bot.send_message(
+                user_id,
+                "❌ Birthday cannot be in the future. Please enter a valid date."
+            )
+            return
+            
+        # Store the answer - now as proper birthday
+        PENDING_USERS[user_id]['form_answers']['birthday'] = birthday_input
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step3'
+        save_pending_users()
+        
+        # Show typing indicator
+        bot.send_chat_action(user_id, 'typing')
+        time.sleep(1.5)
+        
+        # Send third question with multiple choice options for experience level
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.row("a. Completely new")
+        markup.row("b. Beginner")
+        markup.row("c. Intermediate")
+        markup.row("d. Expert")
+        markup.row("e. Master")
+        
+        bot.send_message(
+            user_id,
+            "📝 *Question 3:* Are you completely new to trading or do you have some experience?",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    except ValueError:
+        bot.send_message(
+            user_id,
+            "❌ Invalid date. Please enter a valid birthday in DD/MM/YYYY format (e.g., 15/06/1990)."
+        )
+
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step3')
+def handle_regular_form_step3(message):
+    user_id = message.from_user.id
+    
+    # Store the answer - this is the experience level
+    PENDING_USERS[user_id]['form_answers']['experience_level'] = message.text
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step4'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send fourth question about learning goals
+    bot.send_message(
+        user_id,
+        "📝 *Question 4:* What do you hope to learn inside the academy?",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. Technical and Fundamental Analysis")
+    markup.row("b. Trading Psychology")
+    markup.row("c. Risk Management")
+    markup.row("d. Full Path to Financial Freedom")
+    markup.row("e. All of the above")
+    
+    bot.send_message(
+        user_id,
+        "Please select what you hope to learn:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step4')
+def handle_regular_form_step4(message):
+    user_id = message.from_user.id
+    
+    # Store the answer - this is what they hope to learn
+    PENDING_USERS[user_id]['form_answers']['learning_goals'] = message.text
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step5'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send fifth question about how they found PTA
+    bot.send_message(
+        user_id,
+        "📝 *Question 5:* How did you find out about Prodigy Trading Academy?",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. Socials (Telegram, Facebook, Instagram)")
+    markup.row("b. Referred to by a friend, family or expert")
+    markup.row("c. Invited by executives or founders themselves")
+    markup.row("d. Other")
+    
+    bot.send_message(
+        user_id,
+        "Please select how you found us:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step5')
+def handle_regular_form_step5(message):
+    user_id = message.from_user.id
+    
+    # Store the answer - this is how they found PTA
+    PENDING_USERS[user_id]['form_answers']['source'] = message.text
+    
+    # Remove custom keyboard
+    markup = ReplyKeyboardRemove()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send registration complete graphic with the completion message as caption
+    try:
+        with open('graphics/registration_done.jpeg', 'rb') as complete_img:
+            bot.send_photo(
+                user_id,
+                complete_img,
+                caption="✅ *Form Complete!*\n\n"
+                "Thank you for sharing this information with us. This helps us "
+                "better understand your needs and tailor our community support.\n\n"
+                "Now, let's get you connected with the Prodigy Trading Academy community!",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+    except FileNotFoundError:
+        logging.error("Registration complete image not found at graphics/registration_done.jpeg")
+        # Fallback to text-only message
+        bot.send_message(
+            user_id,
+            "✅ *Form Complete!*\n\n"
+            "Thank you for sharing this information with us. This helps us "
+            "better understand your needs and tailor our community support.\n\n"
+            "Now, let's get you connected with the Prodigy Trading Academy community!",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    except Exception as e:
+        logging.error(f"Error sending registration complete image: {e}")
+        # Fallback to text-only message
+        bot.send_message(
+            user_id,
+            "✅ *Form Complete!*\n\n"
+            "Thank you for sharing this information with us. This helps us "
+            "better understand your needs and tailor our community support.\n\n"
+            "Now, let's get you connected with the Prodigy Trading Academy community!",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    
+    # Now proceed with the welcome package and group invite
+    complete_onboarding(user_id)
+
+# SUPREME MEMBERSHIP FORM HANDLERS
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step1')
+def handle_supreme_form_step1(message):
+    user_id = message.from_user.id
+    
+    # Store the answer - this is the full name question
+    PENDING_USERS[user_id]['form_answers']['full_name'] = message.text
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step2'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send second question for Birthday
+    bot.send_message(
+        user_id,
+        "📝 *Question 2:* Birthday (DD/MM/YYYY)",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step2')
+def handle_supreme_form_step2(message):
+    user_id = message.from_user.id
+    birthday_input = message.text
+    
+    # Validate birthday format (DD/MM/YYYY)
+    try:
+        # Check if input matches DD/MM/YYYY pattern
+        if not re.match(r"^\d{2}/\d{2}/\d{4}$", birthday_input):
+            bot.send_message(
+                user_id,
+                "❌ Invalid birthday format. Please use DD/MM/YYYY format (e.g., 15/06/1990)."
+            )
+            return
+            
+        # Try to parse the date to ensure it's valid
+        day, month, year = map(int, birthday_input.split('/'))
+        birthday_date = datetime(year, month, day)
+        
+        # Check if birthday is in the past
+        if birthday_date > datetime.now():
+            bot.send_message(
+                user_id,
+                "❌ Birthday cannot be in the future. Please enter a valid date."
+            )
+            return
+            
+        # Store the answer - this is the birthday
+        PENDING_USERS[user_id]['form_answers']['birthday'] = birthday_input
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step3'
+        save_pending_users()
+        
+        # Show typing indicator
+        bot.send_chat_action(user_id, 'typing')
+        time.sleep(1.5)
+        
+        # Send third question for Phone Number with country code instructions
+        bot.send_message(
+            user_id,
+            "📝 *Question 3:* Phone Number (include country code, ex. +63 917 123 4567 for Philippines or +1 555 123 4567 for US)",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        bot.send_message(
+            user_id,
+            "❌ Invalid date. Please enter a valid birthday in DD/MM/YYYY format (e.g., 15/06/1990)."
+        )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step3')
+def handle_supreme_form_step3(message):
+    user_id = message.from_user.id
+    phone = message.text
+    
+    # Store the answer - this is the phone number
+    PENDING_USERS[user_id]['form_answers']['phone_number'] = phone
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step4'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send fourth question for Time Zone with preset options
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("PHT (Philippines)", "SGT (Singapore)")
+    markup.row("PST (Pacific)", "EST (Eastern)")
+    markup.row("Other (please specify)")
+    
+    bot.send_message(
+        user_id,
+        "📝 *Question 4:* Current Time Zone",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step4')
+def handle_supreme_form_step4(message):
+    user_id = message.from_user.id
+    timezone = message.text
+    
+    # Check if the user selected "Other (please specify)"
+    if timezone == "Other (please specify)":
+        # Set a different status for custom timezone entry
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step4_custom'
+        save_pending_users()
+        
+        # Show typing indicator
+        bot.send_chat_action(user_id, 'typing')
+        time.sleep(1.5)
+        
+        # Ask for the specific time zone
+        bot.send_message(
+            user_id,
+            "📝 Please enter your specific time zone:",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Regular flow for predefined options
+    # Store the answer - this is the time zone
+    PENDING_USERS[user_id]['form_answers']['time_zone'] = timezone
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step5'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send fifth question for Trading Expertise Level
+    bot.send_message(
+        user_id,
+        "📝 *Question 5:* Trading Expertise Level",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. Completely New")
+    markup.row("b. Beginner")
+    markup.row("c. Intermediate")
+    markup.row("d. Expert")
+    markup.row("e. Master")
+    
+    bot.send_message(
+        user_id,
+        "Please select your expertise level:",
+        reply_markup=markup
+    )
+
+# Add a new handler for custom timezone entry
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step4_custom')
+def handle_supreme_form_step4_custom(message):
+    user_id = message.from_user.id
+    custom_timezone = message.text
+    
+    # Store the answer - this is the custom time zone
+    PENDING_USERS[user_id]['form_answers']['time_zone'] = f"Custom: {custom_timezone}"
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step5'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send fifth question for Trading Expertise Level
+    bot.send_message(
+        user_id,
+        "📝 *Question 5:* Trading Expertise Level",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. Completely New")
+    markup.row("b. Beginner")
+    markup.row("c. Intermediate")
+    markup.row("d. Expert")
+    markup.row("e. Master")
+    
+    bot.send_message(
+        user_id,
+        "Please select your expertise level:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step5')
+def handle_supreme_form_step5(message):
+    user_id = message.from_user.id
+    expertise = message.text
+    
+    # Store the answer - this is the trading expertise level
+    PENDING_USERS[user_id]['form_answers']['expertise_level'] = expertise
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step6'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send sixth question for Part-time vs. Full-time
+    bot.send_message(
+        user_id,
+        "📝 *Question 6:* Will you be a part-time or full-time trader? Why?",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. Part-time, I'm currently employed and trading on the side.")
+    markup.row("b. Part-time, I have other responsibilities but want to gradually build my trading career.")
+    markup.row("c. Full-time, I'm fully committed and have the time and resources to focus on trading.")
+    markup.row("d. Full-time, I'm a student and want to dedicate my free time to becoming a funded trader.")
+    
+    bot.send_message(
+        user_id,
+        "Please select the option that best describes you:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step6')
+def handle_supreme_form_step6(message):
+    user_id = message.from_user.id
+    trading_time = message.text
+    
+    # Store the answer - this is the part-time vs. full-time answer
+    PENDING_USERS[user_id]['form_answers']['trading_time_commitment'] = trading_time
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step7'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send seventh question - Interest in Supreme mentorship
+    bot.send_message(
+        user_id,
+        "📝 *Question 7:* What drew your interest to join the Supreme mentorship specifically?",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. The premium content and structured education.")
+    markup.row("b. The fun and engaging way you teach and discuss.")
+    markup.row("c. It's affordable and still high quality.")
+    markup.row("d. The uniqueness and overall vibe of the group.")
+    markup.row("e. All of the above.")
+    
+    bot.send_message(
+        user_id,
+        "Please select your reason:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step7')
+def handle_supreme_form_step7(message):
+    user_id = message.from_user.id
+    interest_reason = message.text
+    
+    # Store the answer - interest in supreme mentorship
+    PENDING_USERS[user_id]['form_answers']['interest_reason'] = interest_reason
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step8'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send eighth question - Personal expectations/goals
+    bot.send_message(
+        user_id,
+        "📝 *Question 8:* What are your personal expectations or goals inside the Supreme group?",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step8')
+def handle_supreme_form_step8(message):
+    user_id = message.from_user.id
+    goals = message.text
+    
+    # Store the answer - personal goals
+    PENDING_USERS[user_id]['form_answers']['personal_goals'] = goals
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step9'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send ninth question - Comfort with 1:1 calls
+    bot.send_message(
+        user_id,
+        "📝 *Question 9:* Are you comfortable with regular 1:1 private calls or mentorship check-ins?",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. No, please do not schedule 1:1 mentoring sessions for me.")
+    markup.row("b. Yes, but please only a few times or scheduled times in a week as I have a hectic schedule.")
+    markup.row("c. Yes, I am willing and comfortable to do so anytime.")
+    
+    bot.send_message(
+        user_id,
+        "Please select your preference:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step9')
+def handle_supreme_form_step9(message):
+    user_id = message.from_user.id
+    call_preference = message.text
+    
+    # Store the answer - 1:1 call preference
+    PENDING_USERS[user_id]['form_answers']['call_preference'] = call_preference
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step10'
+    save_pending_users()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send tenth question - Trading challenges
+    bot.send_message(
+        user_id,
+        "📝 *Question 10:* Are there any trading topics or challenges you've struggled with that you'd like us to focus on during mentorship?",
+        parse_mode="Markdown"
+    )
+    
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("a. Trading Psychology")
+    markup.row("b. Risk Management")
+    markup.row("c. Strategy and Technical Analysis")
+    markup.row("d. Fundamental Analysis")
+    markup.row("e. I am at ease with all of the choices above, please think of what is best to focus for me.")
+    markup.row("f. I lack ability in all of the choices above as I am a beginner.")
+    
+    bot.send_message(
+        user_id,
+        "Please select your answer:",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step10')
+def handle_supreme_form_step10(message):
+    user_id = message.from_user.id
+    challenges = message.text
+    
+    # Store the answer
+    PENDING_USERS[user_id]['form_answers']['challenges'] = challenges
+    
+    # Remove custom keyboard
+    markup = ReplyKeyboardRemove()
+    
+    # Show typing indicator
+    bot.send_chat_action(user_id, 'typing')
+    time.sleep(1.5)
+    
+    # Send registration complete graphic with completion message as caption
+    try:
+        with open('graphics/registration_done.jpeg', 'rb') as complete_img:
+            bot.send_photo(
+                user_id,
+                complete_img,
+                caption="✅ *Supreme Mentorship Form Complete!*\n\n"
+                "Thank you for taking the time to share this detailed information with us. "
+                "As a Supreme member, this will help us tailor your 1-on-1 coaching sessions "
+                "and personalized support to your specific trading goals and needs.\n\n"
+                "Now, let's get you connected with the Prodigy Trading Academy Supreme community!",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+    except FileNotFoundError:
+        logging.error("Registration complete image not found at graphics/registration_done.jpeg")
+        # Fallback to text-only message
+        bot.send_message(
+            user_id,
+            "✅ *Supreme Mentorship Form Complete!*\n\n"
+            "Thank you for taking the time to share this detailed information with us. "
+            "As a Supreme member, this will help us tailor your 1-on-1 coaching sessions "
+            "and personalized support to your specific trading goals and needs.\n\n"
+            "Now, let's get you connected with the Prodigy Trading Academy Supreme community!",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    except Exception as e:
+        logging.error(f"Error sending registration complete image: {e}")
+        # Fallback to text-only message
+        bot.send_message(
+            user_id,
+            "✅ *Supreme Mentorship Form Complete!*\n\n"
+            "Thank you for taking the time to share this detailed information with us. "
+            "As a Supreme member, this will help us tailor your 1-on-1 coaching sessions "
+            "and personalized support to your specific trading goals and needs.\n\n"
+            "Now, let's get you connected with the Prodigy Trading Academy Supreme community!",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    
+    # Now proceed with the welcome package and group invite
+    complete_onboarding(user_id)
+
+def complete_onboarding(user_id):
+    """Complete the onboarding process by sending welcome package and group invite"""
+    try:
+        # Add a transition message before sending welcome package
+        bot.send_chat_action(user_id, 'typing')
+        transition_msg = bot.send_message(user_id, "✨ Finalizing your enrollment...")
+        
+        # Add a short delay for better UX
+        time.sleep(1)
+        
+        try:
+            # Delete the transition message
+            bot.delete_message(user_id, transition_msg.message_id)
+        except Exception as e:
+            logging.error(f"Error deleting transition message: {e}")
+
+        # IMPORTANT: Generate and send certificate BEFORE the welcome package
+        send_completion_certificate(user_id)
+
+        time.sleep(2)
+            
+        # Send the Welcome to Academy graphic
+        try:
+            with open('graphics/welcomePTA.jpeg', 'rb') as welcome_img:
+                bot.send_photo(
+                    user_id,
+                    welcome_img,
+                    caption="🎉 Welcome to Prodigy Trading Academy!"
+                )
+        except FileNotFoundError:
+            logging.error("Welcome academy image not found at graphics/welcome_academy.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending welcome academy image: {e}")
+
+        # Add another small delay for better UX
+        time.sleep(1.5)
+        
+        # 1. Send social media connections
+        send_welcome_package(user_id)
+        
+        # 2. Send group invite if we have one saved
+        invite_link = PENDING_USERS[user_id].get('invite_link')
+        already_in_group = PENDING_USERS[user_id].get('already_in_group', False)
+        target_group_id = PENDING_USERS[user_id].get('target_group_id', PAID_GROUP_ID)
+        
+        # Get group name based on target group ID
+        group_name = "Supreme Mentorship" if target_group_id == SUPREME_GROUP_ID else "Prodigy Trading Academy"
+        
+        if not already_in_group and invite_link:
+            # ADDED: Send an important disclaimer about trading before group invite
+            disclaimer_message = (
+                "⚠️ *IMPORTANT TRADING DISCLAIMER*\n\n"
+                "Before you join our trading community, please understand:\n\n"
+                "• Trading is NOT a 'get rich quick' scheme\n"
+                "• Trading does NOT guarantee easy money\n"
+                "• Our content is purely EDUCATIONAL in nature\n"
+                "• We are NOT financial advisors and do not provide personalized financial advice\n"
+                "• Any decisions you make are your own responsibility\n\n"
+                "Success in trading requires dedication, discipline, and continuous learning. "
+                "Our academy provides education and community support, but trading always involves risk."
+            )
+            
+            # Send disclaimer first
+            bot.send_message(
+                user_id,
+                disclaimer_message,
+                parse_mode="Markdown"
+            )
+            
+            # Wait 2 seconds for user to read disclaimer before sending invite
+            time.sleep(2)
+            
+            # Add another transition message before sending group invite
+            group_transition_msg = bot.send_message(user_id, "🔗 Generating your exclusive group invite link...")
+            time.sleep(1.5)
+            try:
+                bot.delete_message(user_id, group_transition_msg.message_id)
+            except Exception as e:
+                logging.error(f"Error deleting group transition message: {e}")
+            
+            # Then send group invite
+            bot.send_message(
+                user_id,
+                f"🎉 *Welcome to {group_name}!*\n\nPlease join our community here: {invite_link}",
+                parse_mode="Markdown"
+            )
+            
+            # Set up delayed link revocation with longer timeout (15 seconds)
+            def revoke_link_later(chat_id, invite_link, admin_ids):
+                time.sleep(10)  # Wait 10 seconds before revoking (increased from 10)
+                try:
+                    bot.revoke_chat_invite_link(chat_id, invite_link)
+                    for admin_id in admin_ids:
+                        bot.send_message(admin_id, f"🔒 One-time invite link revoked: {invite_link}")
+                except Exception as e:
+                    logging.error(f"⚠️ Failed to revoke invite link: {e}")
+
+            threading.Thread(target=revoke_link_later, args=(target_group_id, invite_link, ADMIN_IDS)).start()
+        
+        # 3. Record user form responses for admin reference
+        try:
+            form_answers = PENDING_USERS[user_id]['form_answers']
+            membership_type = PENDING_USERS[user_id].get('membership_type', 'regular')
+            
+            # Check if this is a renewal - if so, skip admin notifications
+            is_renewal = PENDING_USERS[user_id].get('is_renewal', False)
+            
+            # NEW: Save form responses to PAYMENT_DATA for persistence
+            user_id_str = str(user_id)
+            if user_id_str in PAYMENT_DATA:
+                # Add form answers to payment data
+                PAYMENT_DATA[user_id_str]['form_answers'] = form_answers
+                PAYMENT_DATA[user_id_str]['form_completion_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                save_payment_data()  # Save to database
+                logging.info(f"Form responses saved to PAYMENT_DATA for user {user_id}")
+            
+            # Only send admin notifications if this is NOT a renewal
+            if not is_renewal:
+                # Get username with proper escaping
+                username = safe_markdown_escape(PAYMENT_DATA[str(user_id)].get('username', f'ID: {user_id}'))
+                
+                # Create different notification formats based on membership type
+                if membership_type == 'supreme':
+                    # Notify admins about the Supreme form responses (more detailed)
+                    for admin_id in ADMIN_IDS:
+                        bot.send_message(
+                            admin_id,
+                            f"📋 *New SUPREME Member Form Responses*\n\n"
+                            f"User: {username}\n"
+                            f"Full Name: {safe_markdown_escape(form_answers.get('full_name', 'Not provided'))}\n"
+                            f"Birthday: {safe_markdown_escape(form_answers.get('birthday', 'Not provided'))}\n"
+                            f"Phone Number: {(form_answers.get('phone_number', 'Not provided'))}\n"
+                            f"Time Zone: {(form_answers.get('time_zone', 'Not provided'))}\n"
+                            f"Expertise Level: {(form_answers.get('expertise_level', 'Not provided'))}\n"
+                            f"Trading Time: {(form_answers.get('trading_time_commitment', 'Not provided'))}\n"
+                            f"Interest Reason: {(form_answers.get('interest_reason', 'Not provided'))}\n"
+                            f"Personal Goals: {(form_answers.get('personal_goals', 'Not provided'))}\n"
+                            f"Call Preference: {(form_answers.get('call_preference', 'Not provided'))}\n"
+                            f"Trading Challenges: {(form_answers.get('challenges', 'Not provided'))}",
+                            parse_mode="Markdown"
+                        )
+                else:
+                    # Notify admins about the Regular form responses with new fields
+                    for admin_id in ADMIN_IDS:
+                        bot.send_message(
+                            admin_id,
+                            f"📋 *New Regular Member Form Responses*\n\n"
+                            f"User: {username}\n"
+                            f"Full Name: {safe_markdown_escape(form_answers.get('full_name', 'Not provided'))}\n"
+                            f"Age/Birth Year: {safe_markdown_escape(form_answers.get('birthday', 'Not provided'))}\n"
+                            f"Experience Level: {(form_answers.get('experience_level', 'Not provided'))}\n"
+                            f"Learning Goals: {(form_answers.get('learning_goals', 'Not provided'))}\n"
+                            f"Found us via: {(form_answers.get('source', 'Not provided'))}",
+                            parse_mode="Markdown"
+                        )
+            else:
+                # Log that we're skipping admin notification for renewal
+                logging.info(f"Skipping form notification for renewal user {user_id}")
+        except Exception as e:
+            logging.error(f"Error sending form responses to admins: {e}")
+        
+        # NEW: Prompt user to subscribe to updates
+        time.sleep(1)  # Add a small delay for better UX
+        
+        # Create inline keyboard with Yes/No options
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Yes, Keep Me Updated", callback_data="update_yes"),
+            InlineKeyboardButton("❌ No Thanks", callback_data="update_no")
+        )
+        
+        bot.send_message(
+            user_id,
+            "🔔 *Stay Updated!*\n\n"
+            "Would you like to receive notifications about:\n\n"
+            "• 🔓 When enrollment opens or closes\n"
+            "• 💰 Special discount promotions & offers\n"
+            "• 🎁 Other academy opportunities\n\n"
+            "You can change this setting anytime with /update command.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        # 4. Clean up pending user data - THIS IS THE IMPORTANT CHANGE
+        # Instead of deleting the user, set a completed status
+        PENDING_USERS[user_id]['status'] = 'completed_onboarding'
+        save_pending_users()
+        
+        # If this is a supreme member, suggest the supreme dashboard command
+        # if PENDING_USERS[user_id].get('mentorship_type', '').lower() == 'supreme':
+        #     time.sleep(2)  # Add another small delay
+        #     bot.send_message(
+        #         user_id,
+        #         "✨ *Supreme Member Exclusive*\n\n"
+        #         "Access your personalized Supreme dashboard with:\n"
+        #         "`/supreme_dashboard`\n\n"
+        #         "This will give you access to your mentor line, trading journey, and more!",
+        #         parse_mode="Markdown"
+        #     )
+        
+    except Exception as e:
+        logging.error(f"Error in complete_onboarding for user {user_id}: {e}")
+
+def send_completion_certificate(user_id):
+    """Generate and send personalized certificates to the user"""
+    try:
+        # Get user's form answers and membership type
+        form_answers = PENDING_USERS[user_id].get('form_answers', {})
+        membership_type = PENDING_USERS[user_id].get('membership_type', 'regular').lower()
+        
+        # Get user's full name from form answers
+        full_name = form_answers.get('full_name', 'Member')
+        
+        # Format current date
+        current_date = datetime.now().strftime('%B %d, %Y')
+        
+        # Send Certificate of Completion first (no customization needed)
+        cert1_path = 'cert/cert1.jpeg'
+        if os.path.exists(cert1_path):
+            with open(cert1_path, 'rb') as cert:
+                bot.send_photo(
+                    user_id,
+                    cert,
+                    caption=f"🎓 *CERTIFICATE OF COMPLETION*\n\n"
+                           f"Congratulations on completing your onboarding for the "
+                           f"{'Supreme' if membership_type == 'supreme' else 'Regular'} "
+                           f"Membership of Prodigy Trading Academy!",
+                    parse_mode="Markdown"
+                )
+            
+            # Add a small delay between certificates for better UX
+            time.sleep(1.5)
+        
+        # Now send Certificate of Enrollment (needs customization)
+        cert2_path = 'cert/cert2.jpeg'
+        if os.path.exists(cert2_path):
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                
+                # Open the certificate template
+                img = Image.open(cert2_path)
+                draw = ImageDraw.Draw(img)
+
+                # Load fonts (make sure these font files exist)
+                try:
+                    # Start with preferred font size
+                    name_font_size = 40
+                    name_font = ImageFont.truetype('fonts/Garet-Book.ttf', name_font_size)
+                    date_font = ImageFont.truetype('fonts/Garet-Book.ttf', 18)
+                    
+                    # Get certificate width
+                    img_width = img.width
+                    
+                    # Calculate name width with initial font size
+                    name_width = draw.textlength(full_name, font=name_font)
+                    
+                    # Auto-adjust font size if name is too long (reduce until it fits)
+                    while name_width > (img_width * 0.8) and name_font_size > 20:  # Allow name to use up to 80% of width
+                        name_font_size -= 2
+                        name_font = ImageFont.truetype('fonts/Garet-Book.ttf', name_font_size)
+                        name_width = draw.textlength(full_name, font=name_font)
+                    
+                    # Calculate center position for the name (this will auto-center regardless of name length)
+                    name_x = (img_width - name_width) / 2
+                    name_position = (name_x, 320)  # Keep Y position at 320
+                    
+                except OSError:
+                    # Fallback to default font
+                    name_font = ImageFont.load_default()
+                    date_font = ImageFont.load_default()
+                    
+                    # Even with default font, still center the name
+                    name_width = draw.textlength(full_name, font=name_font)
+                    name_x = (img_width - name_width) / 2
+                    name_position = (name_x, 320)
+
+                # Set exact position for date (unchanged)
+                date_position = (650, 490)  # Exact X and Y coordinates for date
+
+                # Draw text on image
+                draw.text(name_position, full_name, fill=(0, 0, 0), font=name_font)  # Black text
+                draw.text(date_position, current_date, fill=(0, 0, 0), font=date_font)
+                
+                # Save the customized certificate
+                temp_certificate = f'cert/temp_{user_id}.jpg'
+                img.save(temp_certificate)
+                
+                # Send the certificate with a nice message
+                with open(temp_certificate, 'rb') as cert:
+                    bot.send_photo(
+                        user_id,
+                        cert,
+                        caption=f"📜 *CERTIFICATE OF ENROLLMENT*\n\n"
+                               f"This certifies that {full_name} is officially enrolled in the "
+                               f"{'Supreme' if membership_type == 'supreme' else 'Regular'} "
+                               f"Membership of Prodigy Trading Academy as of {current_date}.",
+                        parse_mode="Markdown"
+                    )
+                
+                # Clean up temporary file
+                try:
+                    os.remove(temp_certificate)
+                except:
+                    pass
+                    
+            except ImportError:
+                # If PIL is not available, send the static certificate with explanation message
+                with open(cert2_path, 'rb') as cert:
+                    bot.send_photo(
+                        user_id,
+                        cert,
+                        caption=f"📜 *CERTIFICATE OF ENROLLMENT*\n\n"
+                               f"This certifies that {full_name} is officially enrolled in the "
+                               f"{'Supreme' if membership_type == 'supreme' else 'Regular'} "
+                               f"Membership of Prodigy Trading Academy as of {current_date}.\n\n"
+                               f"(Note: This is a generic certificate - your personalized one will be available soon)",
+                        parse_mode="Markdown"
+                    )
+                    
+        logging.info(f"Sent certificates to user {user_id}")
+        
+    except Exception as e:
+        logging.error(f"Error sending certificates: {e}")
+        # Fallback message if certificate generation fails
+        bot.send_message(
+            user_id,
+            f"🎓 *MEMBERSHIP CONFIRMED*\n\n"
+            f"Congratulations on completing your enrollment in Prodigy Trading Academy!",
+            parse_mode="Markdown"
+        )
+
+def send_welcome_package(user_id):
+    """Send social media links and welcome info after form completion"""
+    try:
+        # Show typing indicator for better UX
+        bot.send_chat_action(user_id, 'typing')
+        time.sleep(1)
+        
+        # Send social media connections message with clickable buttons
+        social_text = (
+            "🌐 *CONNECT WITH OUR COMMUNITY*\n\n"
+            "To get the most from your membership, follow us on our social platforms:\n\n"
+            "• *Instagram:* Daily tips and market insights\n"
+            "• *Facebook Page:* Connect with fellow traders\n"
+            "We share exclusive content and community highlights you won't want to miss!"
+        )
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📱 Instagram", url="https://instagram.com/prodigytradingacademy"),
+            InlineKeyboardButton("👥 Facebook", url="https://www.facebook.com/prodigytradingacademy"),
+        )
+        
+        bot.send_message(
+            user_id,
+            social_text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+            disable_web_page_preview=True
+        )
+        
+        logging.info(f"Sent welcome package with social links to user {user_id}")
+        
+    except Exception as e:
+        logging.error(f"Failed to send welcome package to user {user_id}: {e}")
 
 # Admin Rejects Payment
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reject_payment_"))
@@ -1086,6 +3652,7 @@ def callback_reject_payment(call):
 
         bot.send_message(user_id, random.choice(payment_rejection_messages), parse_mode="Markdown")
         PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)  # Remove from MongoDB
         save_pending_users()
         bot.answer_callback_query(call.id, "❌ Payment rejected successfully.")
 
@@ -1108,8 +3675,13 @@ def callback_reject_payment(call):
 def welcome_new_members(message):
     """Welcome new members when they join the group"""
     try:
-        # Only activate in the paid group
-        if message.chat.id != PAID_GROUP_ID:
+        # Check which group the message is coming from
+        if message.chat.id == PAID_GROUP_ID:
+            group_type = "regular"
+        elif message.chat.id == SUPREME_GROUP_ID:
+            group_type = "supreme"
+        else:
+            # Not a monitored group
             return
             
         # Process all new members (in case multiple users join at once)
@@ -1123,17 +3695,32 @@ def welcome_new_members(message):
             # Escape any special Markdown characters
             user_name = safe_markdown_escape(user_name)
             
-            # Send welcome message
-            welcome_message = (
-                f"🎉 *Welcome to Prodigy Trading Academy, {user_name}!* 🎉\n\n"
-                f"We're excited to have you join our trading community. "
-                f"Here you'll find valuable insights, daily challenges, and a supportive network of fellow traders.\n\n"
-                f"📊 *Daily challenges* are posted at 8:00 AM PH time\n"
-                f"💡 *Expert guidance* from our community\n"
-                f"📚 *Learning resources* to improve your skills\n\n"
-                f"If you have any questions, our mentors are here to help!\n"
-                f"Happy Trading! 📈"
-            )
+            # Different welcome messages based on group type
+            if group_type == "supreme":
+                welcome_message = (
+                    f"🌟 *Welcome to the SUPREME Mentorship Group, {user_name}!* 🌟\n\n"
+                    f"You've joined our exclusive premium community of dedicated traders. "
+                    f"With your Supreme membership, you'll have access to:\n\n"
+                    f"🔹 *Advanced trading strategies* and premium analysis\n"
+                    f"🔹 *Priority support* from our expert mentors\n"
+                    f"🔹 *Exclusive learning resources* not available elsewhere\n" 
+                    f"🔹 *Daily challenges* and premium accountability features\n\n"
+                    f"Your investment in yourself shows your commitment to excellence. "
+                    f"We're here to help you maximize your trading potential!\n\n"
+                    f"If you have any questions, our mentors are ready to assist you.\n"
+                    f"Happy Trading! 📈"
+                )
+            else:  # Regular group
+                welcome_message = (
+                    f"🎉 *Welcome to Prodigy Trading Academy, {user_name}!* 🎉\n\n"
+                    f"We're excited to have you join our trading community. "
+                    f"Here you'll find valuable insights, daily challenges, and a supportive network of fellow traders.\n\n"
+                    f"📊 *Daily challenges* are posted at 8:00 AM PH time\n"
+                    f"💡 *Expert guidance* from our community\n"
+                    f"📚 *Learning resources* to improve your skills\n\n"
+                    f"If you have any questions, our mentors are here to help!\n"
+                    f"Happy Trading! 📈"
+                )
             
             # Send the welcome message directly to the group
             try:
@@ -1143,7 +3730,7 @@ def welcome_new_members(message):
                     parse_mode="Markdown"
                 )
                     
-                logging.info(f"Sent welcome message for new member {new_member.id} ({user_name})")
+                logging.info(f"Sent {group_type} welcome message for new member {new_member.id} ({user_name})")
             except ApiException as e:
                 # If Markdown fails, try without formatting
                 logging.error(f"Failed to send welcome with Markdown: {e}")
@@ -1211,6 +3798,21 @@ def handle_cancel_confirmation(message):
             username = safe_markdown_escape(username)
         except Exception as e:
             username = f"User {user_id}"  # Fallback if we can't get username
+            
+        # Send cancellation graphic first
+        try:
+            with open('graphics/confirm_cancel.jpeg', 'rb') as cancellation_img:
+                bot.send_photo(
+                    chat_id,
+                    cancellation_img,
+                )
+        except FileNotFoundError:
+            logging.error("Cancellation image not found at graphics/confirm_cancel.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending cancellation image: {e}")
+            
+        # Add a small delay for better UX
+        time.sleep(1)
 
         # Forward the cancellation request to admins with additional context
         for admin in ADMIN_IDS:
@@ -1618,6 +4220,22 @@ def send_payment_reminder():
             logging.error(f"Error in payment reminder main loop: {e}")
             time.sleep(60)  # Wait a minute on error before trying again
 
+def safe_markdown_escape_v2(text):
+    """Comprehensive and reliable function to escape text for Telegram Markdown V2"""
+    if text is None:
+        return "None"
+        
+    # First replace literal backslashes
+    text = text.replace('\\', '\\\\')
+    
+    # Then escape all special characters
+    special_chars = '_*[]()~`>#+-=|{}.!'
+    for char in special_chars:
+        text = text.replace(char, f"\\{char}")
+    
+    return text
+
+
 # Handle admin clicking "Give Grace Period" button
 @bot.callback_query_handler(func=lambda call: call.data.startswith("grace_"))
 def handle_grace_period(call):
@@ -1644,54 +4262,34 @@ def handle_grace_period(call):
             except:
                 username = None
                 
-        user_display = f"@{username}" if username else f"User {user_id}"
+        # Safely escape the username for Markdown
+        if username:
+            user_display = f"@{safe_markdown_escape_v2(username)}"
+        else:
+            user_display = f"User {user_id}"
         
-        # Calculate grace period end date (2 days from now)
-        now = datetime.now(pytz.timezone('Asia/Manila'))
-        grace_end_date = now + timedelta(days=2)
-        
-        # Update payment data to add grace period
-        if user_id_str in PAYMENT_DATA:
-            PAYMENT_DATA[user_id_str]['grace_period'] = True
-            PAYMENT_DATA[user_id_str]['grace_end_date'] = grace_end_date.strftime('%Y-%m-%d %H:%M:%S')
-            PAYMENT_DATA[user_id_str]['haspayed'] = True  # Temporarily mark as paid during grace period
-            PAYMENT_DATA[user_id_str]['admin_action_pending'] = False  # Clear the pending flag
-            save_payment_data()
-        
-        # Notify the user about the grace period
-        try:
-            bot.send_message(
-                user_id,
-                "⏳ *Grace Period Granted*\n\n"
-                "You have been given a 2-day grace period to renew your membership. "
-                f"Please renew before {grace_end_date.strftime('%Y-%m-%d %I:%M:%S %p')} to avoid being removed from the group.",
-                parse_mode="Markdown"
-            )
-            user_notified = True
-        except:
-            user_notified = False
-        
-        # Update the button to show action was taken
-        bot.edit_message_text(
-            f"✅ *ACTION TAKEN: GRACE PERIOD*\n\n"
-            f"{user_display} has been given a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.\n"
-            f"User notification {'sent' if user_notified else 'FAILED'}.",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown"
+        # Create confirmation markup
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Yes, give grace", callback_data=f"confirm_grace_{user_id}"),
+            InlineKeyboardButton("❌ No, cancel", callback_data=f"cancel_action_{call.message.message_id}")
         )
         
-        # Notify ALL admins about this action using direct regex escaping
-        admin_username = call.from_user.username or f"Admin {admin_id}"
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
-
-        for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} gave {user_display} a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.", parse_mode="Markdown")
+        # Send confirmation message
+        bot.edit_message_text(
+            f"⚠️ *CONFIRMATION REQUIRED*\n\n"
+            f"Are you sure you want to give {user_display} a 2-day grace period?\n\n"
+            f"This will temporarily mark them as paid and prevent them from being kicked.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
         
-        bot.answer_callback_query(call.id, f"Grace period granted to {user_display} until {grace_end_date.strftime('%Y-%m-%d')}")
+        bot.answer_callback_query(call.id)
         
     except Exception as e:
-        logging.error(f"Error in handle_grace_period: {e}")
+        logging.error(f"Error in handle_grace_period confirmation: {e}")
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
 
 # Handle admin clicking "Kick Member" button
@@ -1720,7 +4318,229 @@ def handle_kick_member(call):
             except:
                 username = None
                 
-        user_display = f"@{username}" if username else f"User {user_id}"
+        # Safely escape the username for Markdown
+        if username:
+            user_display = f"@{safe_markdown_escape_v2(username)}"
+        else:
+            user_display = f"User {user_id}"
+        
+        # Create confirmation markup
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Yes, kick member", callback_data=f"confirm_kick_{user_id}"),
+            InlineKeyboardButton("❌ No, cancel", callback_data=f"cancel_action_{call.message.message_id}")
+        )
+        
+        # Send confirmation message
+        bot.edit_message_text(
+            f"⚠️ *CONFIRMATION REQUIRED*\n\n"
+            f"Are you sure you want to kick {user_display} from the group?\n\n"
+            f"They will be notified and removed from the group immediately.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        bot.answer_callback_query(call.id)
+        
+    except Exception as e:
+        logging.error(f"Error in handle_kick_member confirmation: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+# Handle admin decision to keep member after grace period expires
+@bot.callback_query_handler(func=lambda call: call.data.startswith("keep_"))
+def handle_keep_member(call):
+    """Handle admin clicking 'Keep Member' after grace period expiry"""
+    admin_id = call.from_user.id
+    
+    # Verify the user is an admin
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[1])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', None)
+        else:
+            try:
+                user_info = bot.get_chat(user_id)
+                username = user_info.username
+            except:
+                username = None
+                
+        # Safely escape the username for Markdown
+        if username:
+            user_display = f"@{safe_markdown_escape_v2(username)}"
+        else:
+            user_display = f"User {user_id}"
+        
+        # Create confirmation markup
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Yes, keep member", callback_data=f"confirm_keep_{user_id}"),
+            InlineKeyboardButton("❌ No, cancel", callback_data=f"cancel_action_{call.message.message_id}")
+        )
+        
+        # Send confirmation message
+        bot.edit_message_text(
+            f"⚠️ *CONFIRMATION REQUIRED*\n\n"
+            f"Are you sure you want to keep {user_display} in the group despite expired membership?\n\n"
+            f"Their account will remain marked as unpaid in the system.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        bot.answer_callback_query(call.id)
+        
+    except Exception as e:
+        logging.error(f"Error in handle_keep_member confirmation: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+# Now add handlers for the confirmation actions
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_grace_"))
+def confirm_grace_period(call):
+    """Handle admin confirming to give grace period"""
+    # Copy the existing grace period handler code here, but with user_id from call.data.split("_")[2]
+    admin_id = call.from_user.id
+    
+    # Verify the user is an admin
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Rest of the original grace period handler code
+        # Get username for display - WITH PROPER ESCAPING
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', None)
+        else:
+            try:
+                user_info = bot.get_chat(user_id)
+                username = user_info.username
+            except:
+                username = None
+                
+        # Safely escape the username for Markdown
+        if username:
+            user_display = f"@{safe_markdown_escape_v2(username)}"
+        else:
+            user_display = f"User {user_id}"
+        
+        # Calculate grace period end date (2 days from now)
+        now = datetime.now(pytz.timezone('Asia/Manila'))
+        grace_end_date = now + timedelta(days=2)
+        
+        # Update payment data to add grace period
+        if user_id_str in PAYMENT_DATA:
+            PAYMENT_DATA[user_id_str]['grace_period'] = True
+            PAYMENT_DATA[user_id_str]['grace_end_date'] = grace_end_date.strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[user_id_str]['haspayed'] = True  # Temporarily mark as paid during grace period
+            PAYMENT_DATA[user_id_str]['admin_action_pending'] = False  # Clear the pending flag
+            save_payment_data()
+        
+        # Notify the user about the grace period
+        try:
+            bot.send_message(
+                user_id,
+                "⏳ *Grace Period Granted*\n\n"
+                "You have been given a 2-day grace period to renew your membership. "
+                f"Please renew before {grace_end_date.strftime('%Y-%m-%d %I:%M:%S %p')} to avoid being removed from the group.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except:
+            user_notified = False
+            
+        # Get safely escaped admin username
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = safe_markdown_escape_v2(admin_username)
+        
+        # Update the button for the admin who took action (USING SAFE ESCAPING)
+        bot.edit_message_text(
+            f"✅ *ACTION TAKEN: GRACE PERIOD*\n\n"
+            f"{user_display} has been given a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.\n"
+            f"Action taken by @{admin_username}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Update messages for ALL other admins too (USING SAFE ESCAPING)
+        if user_id in reminder_messages and 'admin_msg_ids' in reminder_messages[user_id]:
+            other_admin_messages = reminder_messages[user_id]['admin_msg_ids']
+            
+            for other_admin_id, msg_id in other_admin_messages.items():
+                if int(other_admin_id) == admin_id:
+                    continue
+                    
+                try:
+                    bot.edit_message_text(
+                        f"✅ *ACTION ALREADY TAKEN: GRACE PERIOD*\n\n"
+                        f"{user_display} has been given a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.\n"
+                        f"Action was taken by @{admin_username}.",
+                        other_admin_id,
+                        msg_id,
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to update message for admin {other_admin_id}: {e}")
+        
+        # Notify ALL admins (WITH SAFE ESCAPING)
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, 
+                f"📝 *Activity Log*\n\n@{admin_username} gave {user_display} a 2-day grace period until {grace_end_date.strftime('%Y-%m-%d')}.", 
+                parse_mode="Markdown"
+            )
+        
+        bot.answer_callback_query(call.id, f"Grace period granted to {username or user_id} until {grace_end_date.strftime('%Y-%m-%d')}")
+        
+    except Exception as e:
+        logging.error(f"Error in confirm_grace_period: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_kick_"))
+def confirm_kick_member(call):
+    """Handle admin confirming to kick member"""
+    admin_id = call.from_user.id
+    
+    # Verify the user is an admin
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract user ID to kick
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display - WITH PROPER ESCAPING
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', None)
+        else:
+            try:
+                user_info = bot.get_chat(user_id)
+                username = user_info.username
+            except:
+                username = None
+                
+        # Safely escape the username for Markdown
+        if username:
+            user_display = f"@{safe_markdown_escape_v2(username)}"
+        else:
+            user_display = f"User {user_id}"
         
         # First notify the user that they're being removed
         try:
@@ -1748,37 +4568,64 @@ def handle_kick_member(call):
         bot.edit_message_text(
             f"{'✅' if kick_successful else '❌'} *ACTION TAKEN: KICK MEMBER*\n\n"
             f"{user_display} has {'been removed from' if kick_successful else 'FAILED to be removed from'} the group.\n"
-            f"User notification {'sent' if user_notified else 'FAILED'}.",
+            f"User notification {'sent' if user_notified else 'FAILED'}.\n"
+            f"Action taken by admin @{safe_markdown_escape_v2(call.from_user.username or f'ID:{admin_id}')}",
             call.message.chat.id,
             call.message.message_id,
             parse_mode="Markdown"
         )
 
-        # In handle_kick_member function - after successful kick:
+        # Update messages for ALL other admins too
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = safe_markdown_escape_v2(admin_username)
+        
+        # Find all admin messages for this user from reminder_messages
+        if user_id in reminder_messages and 'admin_msg_ids' in reminder_messages[user_id]:
+            other_admin_messages = reminder_messages[user_id]['admin_msg_ids']
+            
+            # Update each admin's message except the one who took action
+            for other_admin_id, msg_id in other_admin_messages.items():
+                # Skip the admin who took the action (their message was already updated)
+                if int(other_admin_id) == admin_id:
+                    continue
+                    
+                try:
+                    bot.edit_message_text(
+                        f"{'✅' if kick_successful else '❌'} *ACTION ALREADY TAKEN: KICK MEMBER*\n\n"
+                        f"{user_display} has {'been removed from' if kick_successful else 'FAILED to be removed from'} the group.\n"
+                        f"Action was taken by @{admin_username}.",
+                        other_admin_id,
+                        msg_id,
+                        parse_mode="Markdown"
+                    )
+                    logging.info(f"Updated message for admin {other_admin_id} about kick action taken by {admin_id}")
+                except Exception as e:
+                    logging.error(f"Failed to update message for admin {other_admin_id}: {e}")
+
+        # Mark user as no longer pending admin action if kick was successful
         if kick_successful:
             PAYMENT_DATA[user_id_str]['admin_action_pending'] = False
             save_payment_data()
         
-        # Notify ALL admins about this action using direct regex escaping
-        admin_username = call.from_user.username or f"Admin {admin_id}"
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
-
+        # Notify ALL admins about this action
         for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} kicked {user_display} from the group.", parse_mode="Markdown")
+            bot.send_message(admin_id, 
+                f"📝 *Activity Log*\n\n@{admin_username} kicked {user_display} from the group.", 
+                parse_mode="Markdown"
+            )
         
         bot.answer_callback_query(
             call.id, 
-            f"User {user_display} has {'been kicked' if kick_successful else 'FAILED to be kicked'} from the group."
+            f"User {username or user_id} has {'been kicked' if kick_successful else 'FAILED to be kicked'} from the group."
         )
         
     except Exception as e:
-        logging.error(f"Error in handle_kick_member: {e}")
+        logging.error(f"Error in confirm_kick_member: {e}")
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
 
-# Handle admin decision to keep member after grace period expires
-@bot.callback_query_handler(func=lambda call: call.data.startswith("keep_"))
-def handle_keep_member(call):
-    """Handle admin clicking 'Keep Member' after grace period expiry"""
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_keep_"))
+def confirm_keep_member(call):
+    """Handle admin confirming to keep member"""
     admin_id = call.from_user.id
     
     # Verify the user is an admin
@@ -1787,14 +4634,11 @@ def handle_keep_member(call):
         return
     
     # Extract user ID
-    user_id = int(call.data.split("_")[1])
+    user_id = int(call.data.split("_")[2])
     user_id_str = str(user_id)
-
-    PAYMENT_DATA[user_id_str]['admin_action_pending'] = False
-    save_payment_data()
     
     try:
-        # Get username for display
+        # Get username for display - WITH PROPER ESCAPING
         if user_id_str in PAYMENT_DATA:
             username = PAYMENT_DATA[user_id_str].get('username', None)
         else:
@@ -1804,30 +4648,157 @@ def handle_keep_member(call):
             except:
                 username = None
                 
-        user_display = f"@{username}" if username else f"User {user_id}"
+        # Safely escape the username for Markdown
+        if username:
+            user_display = f"@{safe_markdown_escape_v2(username)}"
+        else:
+            user_display = f"User {user_id}"
+        
+        # Mark user as no longer pending admin action, but still unpaid
+        PAYMENT_DATA[user_id_str]['admin_action_pending'] = False
+        save_payment_data()
+        
+        # Get safely escaped admin username
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = safe_markdown_escape_v2(admin_username)
         
         # Update the button to show action was taken
         bot.edit_message_text(
             f"✅ *ACTION TAKEN: KEPT MEMBER*\n\n"
             f"{user_display} has been allowed to remain in the group despite expired membership.\n"
-            f"Their account is still marked as unpaid in the system.",
+            f"Their account is still marked as unpaid in the system.\n"
+            f"Action taken by @{admin_username}",
             call.message.chat.id,
             call.message.message_id,
             parse_mode="Markdown"
         )
         
-        # Notify ALL admins about this action using direct regex escaping
-        admin_username = call.from_user.username or f"Admin {admin_id}"
-        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
-
-        for admin_id in ADMIN_IDS:
-            bot.send_message(admin_id, f"📝 *Activity Log*\n\n{admin_username} allowed {user_display} to remain in the group despite expired membership.", parse_mode="Markdown")
+        # Update messages for ALL other admins too
+        if user_id in reminder_messages and 'admin_msg_ids' in reminder_messages[user_id]:
+            other_admin_messages = reminder_messages[user_id]['admin_msg_ids']
+            
+            # Update each admin's message except the one who took action
+            for other_admin_id, msg_id in other_admin_messages.items():
+                # Skip the admin who took the action (their message was already updated)
+                if int(other_admin_id) == admin_id:
+                    continue
+                    
+                try:
+                    bot.edit_message_text(
+                        f"✅ *ACTION ALREADY TAKEN: KEPT MEMBER*\n\n"
+                        f"{user_display} has been allowed to remain in the group despite expired membership.\n"
+                        f"Action was taken by @{admin_username}.",
+                        other_admin_id,
+                        msg_id,
+                        parse_mode="Markdown"
+                    )
+                    logging.info(f"Updated message for admin {other_admin_id} about keep action taken by {admin_id}")
+                except Exception as e:
+                    logging.error(f"Failed to update message for admin {other_admin_id}: {e}")
         
-        bot.answer_callback_query(call.id, f"Decision recorded: {user_display} will remain in the group")
+        # Notify ALL admins about this action
+        for admin_id in ADMIN_IDS:
+            bot.send_message(admin_id, 
+                f"📝 *Activity Log*\n\n@{admin_username} allowed {user_display} to remain in the group despite expired membership.", 
+                parse_mode="Markdown"
+            )
+        
+        bot.answer_callback_query(call.id, f"Decision recorded: {username or user_id} will remain in the group")
         
     except Exception as e:
-        logging.error(f"Error in handle_keep_member: {e}")
+        logging.error(f"Error in confirm_keep_member: {e}")
         bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_action_"))
+def handle_action_cancellation(call):
+    """Handle admin cancelling a confirmation"""
+    try:
+        # Parse the data to get message ID and user ID
+        parts = call.data.split("_")
+        message_id = parts[2]
+        
+        # Get the original message content to determine which action was being taken
+        message_text = call.message.text.lower()
+        
+        # Determine which action was being cancelled and extract user ID from the message text
+        # The user ID is mentioned in the text like "...give {user_display} a 2-day grace period..."
+        # or "...kick {user_display} from the group..."
+        
+        # Find user ID in the message text - it's between 'user' and next space or line break
+        user_id_match = re.search(r'user\s+(\d+)', message_text)
+        if user_id_match:
+            user_id = int(user_id_match.group(1))
+        else:
+            # Get username from the text if possible and try to find them
+            username_match = re.search(r'@([a-zA-Z0-9_]+)', message_text)
+            if username_match:
+                username = username_match.group(1)
+                try:
+                    # Try to get user from username (won't work for display names)
+                    chat = bot.get_chat(f"@{username}")
+                    user_id = chat.id
+                except:
+                    # If we can't get the user, we'll show a generic message
+                    user_id = None
+            else:
+                user_id = None
+        
+        # If we have the user ID, restore the original action buttons
+        if user_id:
+            # Check user membership status to determine appropriate actions
+            is_expired = False
+            days_expired = 0
+            
+            if str(user_id) in PAYMENT_DATA:
+                due_date = datetime.strptime(PAYMENT_DATA[str(user_id)]['due_date'], '%Y-%m-%d %H:%M:%S')
+                now = datetime.now()
+                if due_date < now:
+                    is_expired = True
+                    days_expired = (now - due_date).days
+            
+            # Create appropriate markup based on expiration status
+            markup = InlineKeyboardMarkup()
+            
+            if is_expired and days_expired > 3:
+                # Long expired - show kick or keep only
+                markup.add(
+                    InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}"),
+                    InlineKeyboardButton("✓ Keep Member", callback_data=f"keep_{user_id}")
+                )
+                bot.edit_message_text(
+                    f"⚠️ *MEMBERSHIP EXPIRED*\n\nThis member's membership has expired for {days_expired} days.\n\nWhat would you like to do?",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+            else:
+                # Recently expired or upcoming expiry - show grace period option
+                markup.add(
+                    InlineKeyboardButton("⏳ Give 2 Days Grace", callback_data=f"grace_{user_id}"),
+                    InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}")
+                )
+                bot.edit_message_text(
+                    f"⚠️ *MEMBERSHIP EXPIRED*\n\nThis member's membership has expired or will expire soon.\n\nWhat would you like to do?",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+        else:
+            # If we couldn't determine the user ID, show generic cancellation message
+            bot.edit_message_text(
+                "🚫 *Action cancelled*\n\n"
+                "The admin action was cancelled. Please use the original notification to try again.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+        
+        bot.answer_callback_query(call.id, "✅ Action cancelled")
+    except Exception as e:
+        logging.error(f"Error handling action cancellation: {e}")
+        bot.answer_callback_query(call.id, "❌ Error cancelling action", show_alert=True)
 
 
 def delete_all_reminders():
@@ -2084,43 +5055,126 @@ def show_user_dashboard(message):
                 status_icon = "❌"
                 status_text = "Expired"
                 
-            # Check if they're an OG member
-            is_og = "Yes ⭐" if str(user_id) in CONFIRMED_OLD_MEMBERS else "No"
+            # Get mentorship type - added in this update
+            mentorship_type = data.get('mentorship_type', 'Regular')
             
-            # Create and send the dashboard message
+            # Get challenge points if available
+            user_points = 0
+            user_rank = "N/A"
+            
+            # Check for points in the current month
+            current_month = datetime.now().strftime('%Y-%m')
+            try:
+                monthly_scores = get_monthly_leaderboard(current_month)
+                for i, entry in enumerate(monthly_scores):
+                    if entry.get('user_id') == int(user_id):
+                        user_points = entry.get('total_points', 0)
+                        user_rank = i + 1
+                        break
+            except Exception as e:
+                logging.error(f"Error getting user points for dashboard: {e}")
+            
+            # Create progress bar for time remaining
+            if days_remaining > 0:
+                # Create progress bar based on plan duration
+                plan = data.get('payment_plan', '')
+                
+                if "Yearly" in plan or "Legacy" in plan:
+                    total_days = 365
+                elif "3 Months" in plan or "Momentum" in plan or "Apprentice" in plan:
+                    total_days = 90
+                elif "6 Months" in plan or "Disciple" in plan:
+                    total_days = 180
+                elif "Lifetime" in plan:
+                    total_days = 3650  # ~10 years
+                else:
+                    total_days = 30  # Default to monthly
+                    
+                # Calculate days elapsed 
+                elapsed = total_days - days_remaining
+                if elapsed < 0:  # Handle edge cases
+                    elapsed = 0
+                    
+                # Cap elapsed at total days
+                if elapsed > total_days:
+                    elapsed = total_days
+                    
+                # Create visual progress bar (15 segments) 
+                filled = int((elapsed / total_days) * 15)
+                progress_bar = "█" * filled + "▒" * (15 - filled)
+                percentage = round((elapsed / total_days) * 100)
+                
+                time_progress = f"{progress_bar} {percentage}% used"
+            elif data.get('cancelled', False):
+                time_progress = "🚫 Membership cancelled"
+            else:
+                time_progress = "❌ Membership expired"
+            
+            # Create and send the dashboard message with improved formatting
             dashboard_message = (
-                f"📊 *MEMBER DASHBOARD*\n\n"
-                f"👤 *Username:* @{username}\n"
-                f"🆔 *Member ID:* `{user_id}`\n"
-                f"📅 *Plan:* {data['payment_plan']}\n"
-                f"💳 *Payment Method:* {data['payment_mode']}\n"
-                f"🏆 *OG Member:* {is_og}\n\n"
-                f"📊 *Status:* {status_icon} {status_text}\n"
-                f"⏰ *Expiration Date:* {due_date.strftime('%Y-%m-%d')}\n"
-                f"⏳ *Time Remaining:* {days_remaining} days, {hours_remaining} hours\n\n"
+                f"📊 *MEMBERSHIP DASHBOARD*\n\n"
+                f"┌─────── 👤 *MEMBER INFO* ────────┐\n"
+                f"│ *Username:* @{username}\n"
+                f"│ *Member ID:* `{user_id}`\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── 💳 *SUBSCRIPTION* ────────┐\n"
+                f"│ *Plan:* {data.get('payment_plan', 'Unknown')}\n"
+                f"│ *Type:* {mentorship_type} Mentorship\n"
+                f"│ *Payment Method:* {data.get('payment_mode', 'Unknown')}\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── ⏱️ *STATUS* ────────┐\n"
+                f"│ *Status:* {status_icon} {status_text}\n"
+                f"│ *Expiration:* {due_date.strftime('%Y-%m-%d')}\n"
+                f"│ *Time Left:* {days_remaining} days, {hours_remaining} hours\n"
+                f"│ {time_progress}\n"
+                f"└────────────────────────────────┘\n"
             )
+            
+            # Add challenge stats if user has participated
+            if user_points > 0:
+                dashboard_message += (
+                    f"\n┌─────── 🏆 *CHALLENGES* ────────┐\n"
+                    f"│ *Monthly Points:* {user_points} points\n"
+                    f"│ *Current Rank:* #{user_rank}\n"
+                    f"└────────────────────────────────┘\n"
+                )
             
             # Add renewal instructions if expiring soon (and not cancelled)
             if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
                 dashboard_message += (
-                    "⚠️ *Your membership expires soon!*\n"
-                    "Use /start and select 'Renew Membership' to continue access.\n\n"
+                    f"\n⚠️ *Your membership expires soon!*\n"
+                    f"Use /start and select 'Renew Membership' to continue access.\n"
                 )
             # Add special message for cancelled memberships
             elif data.get('cancelled', False):
                 dashboard_message += (
-                    "🚫 *Your membership has been cancelled*\n"
+                    f"\n🚫 *Your membership has been cancelled*\n"
                     f"You will still have access until {due_date.strftime('%Y-%m-%d')}.\n"
-                    "To reactivate before expiration, use /start and select 'Renew Membership'.\n\n"
+                    f"To reactivate before expiration, use /start and select 'Renew Membership'.\n"
                 )
                 
-            # Add help information
+            # Add help information with some quick commands
             dashboard_message += (
-                "📋 *Need Help?*\n"
-                "Use /start for all available options."
+                f"\n📋 *QUICK COMMANDS*\n"
+                f"• /start - Main menu\n"
+                f"• /confess - Submit anonymous confession\n"
+                f"• /commands - View all available commands"
             )
             
-            bot.send_message(chat_id, dashboard_message, parse_mode="Markdown")
+            # Create helpful inline buttons
+            markup = InlineKeyboardMarkup(row_width=2)
+            
+            if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
+                # Show renewal button for expiring memberships
+                markup.add(InlineKeyboardButton("🔄 Renew Membership", callback_data="start_renewal"))
+            
+            # Add general buttons
+            markup.add(InlineKeyboardButton("❓ FAQ", callback_data="faq_back"))
+            markup.add(InlineKeyboardButton("📊 Leaderboard", callback_data="view_leaderboard"))
+            
+            bot.send_message(chat_id, dashboard_message, parse_mode="Markdown", reply_markup=markup)
             
         except Exception as e:
             bot.send_message(chat_id, f"❌ Error retrieving dashboard: {str(e)}")
@@ -2129,9 +5183,1522 @@ def show_user_dashboard(message):
         # User doesn't have membership data
         bot.send_message(
             chat_id, 
-            "❌ *No active membership found*\n\nYou don't appear to have an active membership. Use /start to enroll in Prodigy Trading Academy.",
+            "❌ *No active membership found*\n\n"
+            "You don't appear to have an active membership. Use /start to enroll in Prodigy Trading Academy.",
             parse_mode="Markdown"
         )
+
+@bot.message_handler(commands=['supreme_dashboard'])
+def show_supreme_dashboard(message, edit_message=False, call_obj=None):
+    """Display the Supreme Membership dashboard with detailed student information and task overview"""
+    if edit_message and call_obj:
+        # We're editing an existing message (returning from a sub-menu)
+        chat_id = call_obj.message.chat.id
+        message_id = call_obj.message.message_id
+        user_id = call_obj.from_user.id
+    else:
+        # Normal command invocation
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+    
+    user_id_str = str(user_id)
+    
+    # Only allow in private chats for privacy (only check for normal command invocation)
+    if not edit_message and message.chat.type != 'private':
+        bot.send_message(chat_id, "🔒 Please use this command in a private message with the bot.")
+        return
+    
+    # Check if the user has Supreme membership
+    if user_id_str in PAYMENT_DATA and PAYMENT_DATA[user_id_str].get('mentorship_type', '').lower() == 'supreme':
+        try:
+            data = PAYMENT_DATA[user_id_str]
+            
+            if edit_message:
+                username = call_obj.from_user.username or "No Username"
+            else:
+                username = message.from_user.username or "No Username"
+                
+            full_name = data.get('form_answers', {}).get('full_name', username)
+            
+            # Get membership details
+            plan = data.get('payment_plan', 'Unknown')
+            
+            # Determine the mentor (you can customize this logic)
+            mentors = {'Apprentice': 'Rom', 'Disciple': 'Konfu', 'Legacy': 'Nath'}
+            mentor = mentors.get(plan, '???')
+            
+            # Calculate enrollment date and expiry date
+            enrollment_date = datetime.strptime(data.get('enrollment_date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')), '%Y-%m-%d %H:%M:%S')
+            due_date = datetime.strptime(data.get('due_date', '2099-12-31 23:59:59'), '%Y-%m-%d %H:%M:%S')
+            
+            # Calculate days remaining until expiration
+            current_date = datetime.now()
+            days_remaining = (due_date - current_date).days
+            hours_remaining = int((due_date - current_date).seconds / 3600)
+            
+            # Get mentorship type
+            mentorship_type = data.get('mentorship_type', 'Supreme')
+            
+            # Check if membership is cancelled
+            if data.get('cancelled', False):
+                status_icon = "🚫"
+                status_text = "Cancelled"
+            # If not cancelled, format status based on days remaining
+            elif days_remaining > 7:
+                status_icon = "✅"
+                status_text = "Active"
+            elif days_remaining > 0:
+                status_icon = "⚠️"
+                status_text = "Expiring Soon"
+            else:
+                status_icon = "❌"
+                status_text = "Expired"
+            
+            # Determine user ranking based on custom logic (placeholder)
+            rank_points = data.get('rank_points', 0)
+            
+            ranking_tiers = {
+                (0, 100): "Rookie I",
+                (101, 200): "Rookie II",
+                (201, 300): "Rookie III",
+                (301, 500): "Elite I",
+                (501, 700): "Elite II",
+                (701, 900): "Elite III",
+                (901, 1200): "Master I",
+                (1201, 1500): "Master II",
+                (1501, 1800): "Master III",
+                (1801, 2200): "Legend I",
+                (2201, 2600): "Legend II",
+                (2601, 3000): "Legend III",
+                (3001, float('inf')): "Sovereign"
+            }
+            
+            ranking = "Rookie I"  # Default
+            for (min_points, max_points), rank in ranking_tiers.items():
+                if min_points <= rank_points <= max_points:
+                    ranking = rank
+                    break
+            
+            # Get user expertise level from form answers
+            expertise_level = "Beginner"
+            
+            if 'form_answers' in data and 'expertise_level' in data['form_answers']:
+                expertise = data['form_answers']['expertise_level'].lower()
+                
+                if 'beginner' in expertise or 'a.' in expertise:
+                    expertise_level = "Beginner"
+                elif 'intermediate' in expertise or 'c.' in expertise:
+                    expertise_level = "Intermediate"  
+                elif 'expert' in expertise or 'd.' in expertise:
+                    expertise_level = "Expert"
+                elif 'master' in expertise or 'e.' in expertise:
+                    expertise_level = "Master"
+            
+            # Create nice formatting for the dashboard with box-style formatting
+            dashboard_message = (
+                f"✨ *SUPREME DASHBOARD*\n\n"
+                
+                f"┌─────── 👤 *STUDENT INFO* ────────┐\n"
+                f" *Name:* {full_name}\n"
+                f" *Member ID:* `{user_id_str}`\n"
+                f" *Ranking:* {ranking}\n"
+                f" *Expertise Level:* {expertise_level}\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── 💳 *SUBSCRIPTION* ────────┐\n"
+                f" *Plan:* {plan}\n"
+                f" *Type:* {mentorship_type} Mentorship\n"
+                f" *Mentor:* {mentor}\n"
+                f" *Enrollment:* {enrollment_date.strftime('%B %d, %Y')}\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── ⏱️ *STATUS* ────────┐\n"
+                f" *Status:* {status_icon} {status_text}\n"
+                f" *Expiration:* {due_date.strftime('%Y-%m-%d')}\n"
+                f" *Time Left:* {days_remaining} days, {hours_remaining} hours\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── 📝 *LEARNING TASKS* ────────┐\n"
+                f" • Complete Market Structure Lesson\n"
+                f"   *Due: Friday*\n"
+                f" • Submit Weekly Chart Analysis\n"
+                f"   *Due: Sunday*\n"
+                f" • Schedule Next 1:1 Session\n"
+                f"   *Due: Tomorrow*\n"
+                f"└────────────────────────────────┘\n"
+            )
+            
+            # Add renewal instructions if expiring soon (and not cancelled)
+            if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
+                dashboard_message += (
+                    f"\n⚠️ *Your membership expires soon!*\n"
+                    f"Use /start and select 'Renew Membership' to continue access.\n"
+                )
+            # Add special message for cancelled memberships
+            elif data.get('cancelled', False):
+                dashboard_message += (
+                    f"\n🚫 *Your membership has been cancelled*\n"
+                    f"You will still have access until {due_date.strftime('%Y-%m-%d')}.\n"
+                    f"To reactivate before expiration, use /start and select 'Renew Membership'.\n"
+                )
+            
+            # Create navigation buttons for the Supreme dashboard - UPDATED PER REQUIREMENTS
+            markup = InlineKeyboardMarkup(row_width=2)
+            
+            # First row
+            markup.add(
+                InlineKeyboardButton("💎 Supreme Vault", callback_data="supreme_vault"),
+                InlineKeyboardButton("👨‍🏫 Mentor Line", callback_data="mentor_line")
+            )
+            
+            # Second row
+            markup.add(
+                InlineKeyboardButton("🛣️ Trading Journey", callback_data="trading_journey"),
+                InlineKeyboardButton("📔 Trading Journal", callback_data="trading_journal")
+            )
+            
+            # Third row
+            markup.add(
+                InlineKeyboardButton("🏆 Leaderboard", callback_data="supreme_leaderboard"),
+                InlineKeyboardButton("👥 Supreme Network", callback_data="supreme_network")
+            )
+            
+            # Add renewal button if needed
+            if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
+                markup.add(InlineKeyboardButton("🔄 Renew Membership", callback_data="start_renewal"))
+            
+            # Send or edit the dashboard message with buttons
+            if edit_message:
+                bot.edit_message_text(
+                    dashboard_message, 
+                    chat_id,
+                    message_id,
+                    parse_mode="Markdown", 
+                    reply_markup=markup
+                )
+            else:
+                bot.send_message(chat_id, dashboard_message, parse_mode="Markdown", reply_markup=markup)
+            
+        except Exception as e:
+            error_msg = f"❌ Error retrieving Supreme dashboard: {str(e)}"
+            if edit_message and call_obj:
+                bot.edit_message_text(error_msg, chat_id, message_id)
+            else:
+                bot.send_message(chat_id, error_msg)
+            logging.error(f"Supreme dashboard error for user {user_id}: {str(e)}")
+    else:
+        # User is not a Supreme member
+        error_msg = (
+            "⭐ *Supreme Dashboard Access Restricted*\n\n"
+            "This feature is exclusively for Supreme membership holders. "
+            "To upgrade your membership, use /start and select 'Purchase Membership'."
+        )
+        
+        if edit_message and call_obj:
+            bot.edit_message_text(error_msg, chat_id, message_id, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, error_msg, parse_mode="Markdown")
+
+# Add a callback handler for Supreme dashboard buttons
+@bot.callback_query_handler(func=lambda call: call.data.startswith("supreme_") or call.data in ["mentor_line", "trading_journey", "trading_journal", "supreme_vault", "supreme_leaderboard"])
+def handle_supreme_dashboard_buttons(call):
+    """Handle navigation buttons on the Supreme dashboard"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    # Handle different button actions based on callback data
+    if call.data == "supreme_vault":
+        # Show Supreme Vault options
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📚 E-books", callback_data="vault_ebooks"),
+            InlineKeyboardButton("📔 Trading Journal", callback_data="vault_journal")
+        )
+        markup.add(
+            InlineKeyboardButton("🎬 Video Lessons", callback_data="vault_videos"),
+            InlineKeyboardButton("📖 Prodigy Codex", callback_data="vault_codex")
+        )
+        markup.add(
+            InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+        )
+        
+        bot.edit_message_text(
+            "💎 *SUPREME VAULT*\n\n"
+            "Access exclusive premium resources curated for Supreme members. "
+            "Select a category to explore:",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    elif call.data == "mentor_line":
+        # Check if user has a mentor
+        user_id = call.from_user.id
+        user_id_str = str(user_id)
+        has_mentor = False
+        
+        try:
+            if user_id_str in PAYMENT_DATA:
+                mentor = PAYMENT_DATA[user_id_str].get('assigned_mentor')
+                if mentor:
+                    has_mentor = True
+                    
+                    # Show mentor details - ENHANCED WITH AVAILABILITY AND STATUS
+                    markup = InlineKeyboardMarkup(row_width=2)
+                    
+                    # Main mentor interaction buttons - now in 2x2 grid
+                    markup.add(
+                        InlineKeyboardButton("💬 Message", callback_data=f"message_mentor_{mentor}"),
+                        InlineKeyboardButton("📅 Schedule", callback_data=f"schedule_mentor_{mentor}")
+                    )
+                    markup.add(
+                        InlineKeyboardButton("📚 Resources", callback_data=f"mentor_resources_{mentor}"),
+                        InlineKeyboardButton("❓ Support", callback_data=f"mentor_support_{mentor}")
+                    )
+                    
+                    # History and back buttons
+                    markup.add(
+                        InlineKeyboardButton("📋 Session History", callback_data=f"mentor_history_{mentor}")
+                    )
+                    markup.add(
+                        InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+                    )
+                    
+                    # Check if MENTORS is initialized and contains this mentor
+                    if 'MENTORS' in globals() and MENTORS and mentor in MENTORS:
+                        mentor_info = MENTORS.get(mentor, {})
+                    else:
+                        # Fallback mentor details if database isn't loaded
+                        mentor_info = {
+                            "name": mentor,
+                            "expertise": "Trading",
+                            "description": "Your dedicated Supreme mentor.",
+                            "availability": "Contact for availability",
+                            "current_status": "Available",
+                            "success_rate": "90%"
+                        }
+                        logging.warning(f"Using fallback mentor info for {mentor} - MENTORS may not be properly initialized")
+                    
+                    # Create a status emoji based on current status
+                    status_emoji = "🟢" if mentor_info.get('current_status') == "Available" else "🔴" if mentor_info.get('current_status') == "In Session" else "🟡"
+                    
+                    # Next scheduled session (placeholder - would be from actual data)
+                    next_session = "Tomorrow at 3:00 PM PHT" 
+                    
+                    bot.edit_message_text(
+                        f"👨‍🏫 *YOUR MENTOR*\n\n"
+                        f"*Name:* {mentor_info.get('name', mentor)}\n"
+                        f"*Status:* {status_emoji} {mentor_info.get('current_status', 'Unknown')}\n"
+                        f"*Expertise:* {mentor_info.get('expertise', 'Trading')}\n"
+                        f"*Success Rate:* {mentor_info.get('success_rate', 'N/A')}\n\n"
+                        f"*About:* {mentor_info.get('description', 'Your dedicated Supreme mentor.')}\n\n"
+                        f"*Availability:* {mentor_info.get('availability', 'Contact for availability')}\n"
+                        f"*Next Session:* {next_session}\n\n"
+                        f"What would you like to do?",
+                        chat_id,
+                        message_id,
+                        parse_mode="Markdown",
+                        reply_markup=markup
+                    )
+                else:
+                    # No mentor assigned yet, show enhanced find mentor options
+                    markup = InlineKeyboardMarkup(row_width=1)
+                    markup.add(
+                        InlineKeyboardButton("🔍 Browse Available Mentors", callback_data="view_mentors"),
+                        InlineKeyboardButton("❓ How Mentorship Works", callback_data="mentor_info"),
+                        InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+                    )
+                    
+                    bot.edit_message_text(
+                        "👨‍🏫 *SUPREME MENTOR LINE*\n\n"
+                        "Finding the right mentor can transform your trading journey. Our expert mentors are "
+                        "here to provide personalized guidance tailored to your style and goals.\n\n"
+                        "✅ *Benefits of having a mentor:*\n"
+                        "• Personalized trading strategies\n"
+                        "• Faster improvement curve\n"
+                        "• Accountability partner for consistent growth\n"
+                        "• Direct feedback on your trades\n\n"
+                        "What would you like to do?",
+                        chat_id,
+                        message_id,
+                        parse_mode="Markdown",
+                        reply_markup=markup
+                    )
+            else:
+                # User doesn't have payment data, show "no mentor" options
+                markup = InlineKeyboardMarkup(row_width=1)
+                markup.add(
+                    InlineKeyboardButton("🔍 Browse Available Mentors", callback_data="view_mentors"),
+                    InlineKeyboardButton("🧪 1-Week Mentor Trial", callback_data="mentor_trial"),
+                    InlineKeyboardButton("❓ How Mentorship Works", callback_data="mentor_info"),
+                    InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+                )
+                
+                bot.edit_message_text(
+                    "👨‍🏫 *SUPREME MENTOR LINE*\n\n"
+                    "Finding the right mentor can transform your trading journey. Our expert mentors are "
+                    "here to provide personalized guidance tailored to your style and goals.\n\n"
+                    "✅ *Benefits of having a mentor:*\n"
+                    "• Personalized trading strategies\n"
+                    "• Faster improvement curve\n"
+                    "• Accountability partner for consistent growth\n"
+                    "• Direct feedback on your trades\n\n"
+                    "What would you like to do?",
+                    chat_id,
+                    message_id,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+        except Exception as e:
+            logging.error(f"Error in mentor_line handler: {e}")
+            # Provide a fallback UI in case of errors
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard"))
+            
+            bot.edit_message_text(
+                "⚠️ *Something went wrong*\n\n"
+                "We encountered a problem displaying your mentor information. Please try again later or contact support.",
+                chat_id,
+                message_id,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+                
+    elif call.data == "trading_journey":
+        # Show Trading Journey options
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("📊 Market Structure Path", callback_data="journey_market_structure"),
+            InlineKeyboardButton("💰 Smart Money Path", callback_data="journey_smart_money"),
+            InlineKeyboardButton("⚙️ Automated Trading Path", callback_data="journey_automated"),
+            InlineKeyboardButton("🧠 Trading Psychology Path", callback_data="journey_psychology"),
+            InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+        )
+        
+        bot.edit_message_text(
+            "🛣️ *TRADING JOURNEY*\n\n"
+            "Track your progress and access personalized learning paths "
+            "based on your trading interests and mentor's expertise.\n\n"
+            "Select a journey to explore:",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    elif call.data == "trading_journal":
+        # Show Trading Journal features
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📝 New Entry", callback_data="journal_new_entry"),
+            InlineKeyboardButton("📈 Performance", callback_data="journal_performance")
+        )
+        markup.add(
+            InlineKeyboardButton("📊 Statistics", callback_data="journal_stats"),
+            InlineKeyboardButton("🔍 Analysis", callback_data="journal_analysis")
+        )
+        markup.add(
+            InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+        )
+        
+        bot.edit_message_text(
+            "📔 *TRADING JOURNAL*\n\n"
+            "Track your trades, analyze patterns, and improve your performance "
+            "with our comprehensive trading journal.\n\n"
+            "What would you like to do?",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    elif call.data == "supreme_leaderboard":
+        # Show Supreme Leaderboard
+        # Get current month leaderboard data (placeholder logic)
+        now = datetime.now(pytz.timezone('Asia/Manila'))
+        month_year = now.strftime('%Y-%m')
+        leaderboard_data = get_monthly_leaderboard(month_year)
+        
+        # Format leaderboard text
+        leaderboard_text = f"🏆 *SUPREME LEADERBOARD: {now.strftime('%B %Y')}*\n\n"
+        
+        if not leaderboard_data:
+            leaderboard_text += "No entries yet for this month!"
+        else:
+            # Keep track of the current rank and last score for tie detection
+            current_rank = 1
+            last_score = None
+            
+            for i, entry in enumerate(leaderboard_data[:10]):  # Show top 10
+                total_points = entry.get('total_points', 0)
+                username = entry.get('username', 'No_Username')
+                
+                # If this score is different from the previous one, update the rank
+                if last_score is not None and total_points != last_score:
+                    current_rank = i + 1
+                    
+                last_score = total_points
+                
+                # Create emoji for ranks
+                if current_rank == 1:
+                    rank_emoji = "🥇"
+                elif current_rank == 2:
+                    rank_emoji = "🥈"
+                elif current_rank == 3:
+                    rank_emoji = "🥉"
+                else:
+                    rank_emoji = f"{current_rank}."
+                
+                leaderboard_text += f"{rank_emoji} @{username}: *{total_points} points*\n"
+        
+        # Create back button
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard"))
+        
+        bot.edit_message_text(
+            leaderboard_text,
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    elif call.data == "supreme_network":
+        # Show Supreme Network options
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("💬 Supreme Group Chat", url="https://t.me/+abc123"),  # Replace with actual group link
+            InlineKeyboardButton("👥 Members Directory", callback_data="network_directory"),
+            InlineKeyboardButton("📄 Group Guidelines", callback_data="network_guidelines"),
+            InlineKeyboardButton("« Back to Dashboard", callback_data="back_to_supreme_dashboard")
+        )
+        
+        bot.edit_message_text(
+            "👥 *SUPREME NETWORK*\n\n"
+            "Connect with fellow Supreme members for collaboration, growth, and "
+            "exclusive networking opportunities.\n\n"
+            "Select an option to begin:",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    
+    elif call.data == "back_to_supreme_dashboard":
+        # Return to main supreme dashboard (re-display it)
+        show_supreme_dashboard(call.message, edit_message=True, call_obj=call)
+    
+    # Answer the callback to remove the loading indicator
+    bot.answer_callback_query(call.id)
+
+# Add this after your existing callback handlers
+@bot.callback_query_handler(func=lambda call: call.data == "view_mentors")
+def view_available_mentors(call):
+    """Show the list of available mentors to choose from"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    # Create a formatted list of mentors from database
+    mentors_message = "🔍 *AVAILABLE MENTORS*\n\n"
+    
+    # Convert database dictionary to list for easier iteration
+    mentor_list = []
+    for mentor_id, mentor_data in MENTORS.items():
+        mentor_data['id'] = mentor_id  # Add ID to the data
+        mentor_list.append(mentor_data)
+    
+    # If no mentors found in database, show empty message
+    if not mentor_list:
+        mentors_message += "No mentors currently available. Please try again later."
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("« Back to Mentor Line", callback_data="mentor_line"))
+        
+        bot.edit_message_text(
+            mentors_message,
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id)
+        return
+    
+    # Format each mentor entry
+    for i, mentor in enumerate(mentor_list, 1):
+        # Create availability indicators based on level in database
+        avail_level = mentor.get("availability_level", "Unknown")
+        if avail_level == "High":
+            avail_indicator = "🟢 High"
+        elif avail_level == "Medium":
+            avail_indicator = "🟡 Medium"
+        else:
+            avail_indicator = "🟠 Limited"
+            
+        mentors_message += (
+            f"*{i}. {mentor['name']}*\n"
+            f"• Expertise: {mentor.get('expertise', 'Trading')}\n"
+            f"• Experience: {mentor.get('experience', 'N/A')}\n"
+            f"• Style: {mentor.get('style', 'N/A')}\n"
+            f"• Availability: {avail_indicator}\n\n"
+        )
+    
+    mentors_message += "Select a mentor to view their profile and request mentorship:"
+    
+    # Create buttons for each mentor
+    markup = InlineKeyboardMarkup(row_width=2)
+    
+    # Add buttons in pairs for better layout
+    buttons = []
+    for mentor in mentor_list:
+        buttons.append(InlineKeyboardButton(
+            mentor["name"], 
+            callback_data=f"mentor_profile_{mentor['id']}"
+        ))
+    
+    # Add buttons in pairs
+    for i in range(0, len(buttons), 2):
+        if i + 1 < len(buttons):
+            markup.add(buttons[i], buttons[i+1])
+        else:
+            markup.add(buttons[i])
+    
+    # Add back button
+    markup.add(InlineKeyboardButton("« Back to Mentor Line", callback_data="mentor_line"))
+    
+    bot.edit_message_text(
+        mentors_message,
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Answer the callback to remove loading state
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mentor_profile_"))
+def view_mentor_profile(call):
+    """Show detailed profile for a specific mentor"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    # Extract mentor ID from callback data
+    mentor_id = call.data.split("_")[2]
+    
+    # Get mentor data from the database
+    mentor = MENTORS.get(mentor_id)
+    
+    # Check if mentor exists in our database
+    if not mentor:
+        bot.answer_callback_query(call.id, "Mentor profile not found!")
+        return
+    
+    # Create strengths bullet points
+    strengths_text = ""
+    for strength in mentor.get("strengths", ["No strengths listed"]):
+        strengths_text += f"• {strength}\n"
+    
+    # Create the profile message
+    profile_message = (
+        f"🧠 *{mentor['name'].upper()} - MENTOR PROFILE*\n\n"
+        f"*{mentor.get('full_name', mentor['name'])}*\n"
+        f"_{mentor.get('title', 'Trading Mentor')}_\n\n"
+        f"*Expertise:* {mentor.get('expertise', 'Trading')}\n"
+        f"*Experience:* {mentor.get('experience', 'N/A')}\n"
+        f"*Trading Style:* {mentor.get('style', 'N/A')}\n"
+        f"*Success Rate:* {mentor.get('success_rate', 'N/A')}\n\n"
+        f"*About:*\n{mentor.get('description', 'No description available.')}\n\n"
+        f"*Key Strengths:*\n{strengths_text}\n"
+        f"*Teaching Style:*\n{mentor.get('teaching_style', 'No teaching style specified.')}\n\n"
+        f"*Availability:*\n{mentor.get('availability', 'Contact for availability.')}\n\n"
+        f"*Student Testimonial:*\n_{mentor.get('student_testimonial', 'No testimonials yet.')}_\n"
+    )
+    
+    # Create buttons for profile actions
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📆 Request Mentorship", callback_data=f"request_mentor_{mentor_id}"),
+        InlineKeyboardButton("« Back to Mentor List", callback_data="view_mentors"),
+        InlineKeyboardButton("« Back to Mentor Line", callback_data="mentor_line")
+    )
+    
+    bot.edit_message_text(
+        profile_message,
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Answer the callback to remove loading state
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("request_mentor_"))
+def handle_mentor_request(call):
+    """Handle a user requesting mentorship with a specific mentor"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Extract mentor ID from callback data
+    mentor_id = call.data.split("_")[2]
+    
+    # Get user information
+    username = call.from_user.username or f"User {user_id}"
+    first_name = call.from_user.first_name or username
+    
+    # Get mentor data
+    mentor = MENTORS.get(mentor_id)
+    if not mentor:
+        bot.answer_callback_query(call.id, "❌ Mentor not found in database", show_alert=True)
+        return
+    
+    mentor_name = mentor.get('name', mentor_id)
+    
+    try:
+        # Find the mentor's user ID from PAYMENT_DATA
+        mentor_user_id = None
+        for user_id_str, data in PAYMENT_DATA.items():
+            if data.get('is_mentor') and data.get('mentor_id') == mentor_id:
+                mentor_user_id = int(user_id_str)
+                break
+        
+        if not mentor_user_id:
+            # Fallback for demo/development - use creator ID
+            mentor_user_id = CREATOR_ID
+            logging.warning(f"No mentor user ID found for {mentor_id}, using creator ID")
+        
+        # Send confirmation to user
+        bot.edit_message_text(
+            f"✅ *Mentorship Request Sent*\n\n"
+            f"Your request to have {mentor_name} as your mentor has been sent!\n\n"
+            f"You will be notified once the mentor responds to your request.",
+            chat_id,
+            message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Create acceptance/rejection buttons for mentor
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Accept", callback_data=f"accept_mentee_{user_id}_{mentor_id}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"decline_mentee_{user_id}_{mentor_id}")
+        )
+        
+        # Send request notification to mentor
+        bot.send_message(
+            mentor_user_id,
+            f"🔔 *New Mentorship Request*\n\n"
+            f"@{username} ({first_name}) would like to have you as their mentor.\n\n"
+            f"Would you like to accept this mentorship request?",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        bot.answer_callback_query(call.id, "Request sent successfully!")
+        
+    except Exception as e:
+        logging.error(f"Error handling mentor request: {e}")
+        bot.answer_callback_query(call.id, "❌ Error processing request", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("accept_mentee_"))
+def handle_accept_mentee(call):
+    """Handle mentor accepting a mentee"""
+    parts = call.data.split("_")
+    mentee_id = int(parts[2])
+    mentor_id = parts[3]
+    
+    # Get mentor data for display
+    mentor = MENTORS.get(mentor_id)
+    mentor_name = mentor.get('name', mentor_id)
+    
+    # Generate random session date (between 3-7 days from now)
+    days_ahead = random.randint(3, 7)
+    session_date = datetime.now() + timedelta(days=days_ahead)
+    
+    # Random time between 9 AM and 5 PM
+    hour = random.randint(9, 17)
+    minute = random.choice([0, 15, 30, 45])
+    
+    session_time = session_date.replace(hour=hour, minute=minute)
+    formatted_date = session_time.strftime("%A, %B %d, %Y")
+    formatted_time = session_time.strftime("%I:%M %p")
+    
+    # Update mentee's data to assign mentor
+    user_id_str = str(mentee_id)
+    if user_id_str in PAYMENT_DATA:
+        PAYMENT_DATA[user_id_str]['assigned_mentor'] = mentor_id
+        PAYMENT_DATA[user_id_str]['mentor_session_date'] = session_time.strftime('%Y-%m-%d %H:%M:%S')
+        save_payment_data()
+    
+    try:
+        # Notify mentee of acceptance
+        bot.send_message(
+            mentee_id,
+            f"🎉 *Mentorship Request Accepted!*\n\n"
+            f"Great news! {mentor_name} has accepted your mentorship request.\n\n"
+            f"Your first 1:1 session is scheduled for:\n"
+            f"📆 *Date:* {formatted_date}\n"
+            f"⏰ *Time:* {formatted_time} PHT\n\n"
+            f"Please be prepared for your session. Your mentor will contact you directly.",
+            parse_mode="Markdown"
+        )
+        
+        # Update the mentor's message
+        bot.edit_message_text(
+            f"✅ *Mentorship Request Accepted*\n\n"
+            f"You have accepted @{call.message.text.split('@')[1].split(' ')[0]} as your mentee.\n\n"
+            f"📆 First session scheduled for:\n"
+            f"*{formatted_date} at {formatted_time} PHT*\n\n"
+            f"Please contact your mentee directly before the session.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "✅ Mentee accepted successfully!")
+        
+    except Exception as e:
+        logging.error(f"Error handling mentee acceptance: {e}")
+        bot.answer_callback_query(call.id, "❌ Error processing acceptance", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("decline_mentee_"))
+def handle_decline_mentee(call):
+    """Handle mentor declining a mentee"""
+    parts = call.data.split("_")
+    mentee_id = int(parts[2])
+    mentor_id = parts[3]
+    
+    # Get mentor data for display
+    mentor = MENTORS.get(mentor_id)
+    mentor_name = mentor.get('name', mentor_id)
+    
+    try:
+        # Notify mentee of declination
+        bot.send_message(
+            mentee_id,
+            f"ℹ️ *Mentorship Request Update*\n\n"
+            f"Unfortunately, {mentor_name} is unable to accept your mentorship request at this time.\n\n"
+            f"This could be due to their current workload or availability constraints. "
+            f"Please try requesting another mentor or try again at a later time.",
+            parse_mode="Markdown"
+        )
+        
+        # Update the mentor's message
+        bot.edit_message_text(
+            f"❌ *Mentorship Request Declined*\n\n"
+            f"You have declined the mentorship request from @{call.message.text.split('@')[1].split(' ')[0]}.\n\n"
+            f"The user has been notified of your decision.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "Mentorship request declined")
+        
+    except Exception as e:
+        logging.error(f"Error handling mentee declination: {e}")
+        bot.answer_callback_query(call.id, "❌ Error processing declination", show_alert=True)
+
+@bot.message_handler(commands=['mentorstatus'])
+def update_mentor_status(message):
+    """Admin command to update a mentor's status"""
+    user_id = message.from_user.id
+    
+    # Check if user is admin
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "❌ Usage: `/mentorstatus [mentor_id] [status]`\n\nStatus can be: available, in_session, away", parse_mode="Markdown")
+        return
+    
+    mentor_id = args[1]
+    status = args[2].lower()
+    
+    # Check if mentor exists
+    if mentor_id not in MENTORS:
+        bot.reply_to(message, f"❌ Mentor '{mentor_id}' not found in database.")
+        return
+    
+    # Map status code to readable status
+    status_map = {
+        "available": "Available",
+        "in_session": "In Session", 
+        "away": "Away",
+        "a": "Available",
+        "i": "In Session",
+        "s": "In Session"
+    }
+    
+    if status not in status_map:
+        bot.reply_to(message, "❌ Invalid status. Use: available, in_session, or away")
+        return
+    
+    # Update mentor status
+    MENTORS[mentor_id]['current_status'] = status_map[status]
+    save_mentor(mentor_id, MENTORS[mentor_id])
+    
+    bot.reply_to(message, f"✅ Updated {mentor_id}'s status to: {status_map[status]}")
+
+@bot.message_handler(commands=['mentors'])
+def list_all_mentors(message):
+    """List all mentors and their current status"""
+    user_id = message.from_user.id
+    
+    # Check if user is admin or mentor
+    is_admin = user_id in ADMIN_IDS or user_id == CREATOR_ID
+    
+    # Only admins can see full details
+    if not is_admin:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Generate mentor list
+    mentor_text = "👨‍🏫 *MENTOR STATUS LIST*\n\n"
+    
+    if not MENTORS:
+        mentor_text += "No mentors found in database."
+    else:
+        for mentor_id, mentor in MENTORS.items():
+            # Get status emoji
+            status = mentor.get('current_status', 'Unknown')
+            if status == "Available":
+                status_emoji = "🟢"
+            elif status == "In Session":
+                status_emoji = "🔴"
+            else:
+                status_emoji = "🟡"
+                
+            mentor_text += f"{status_emoji} *{mentor['name']}*: {status}\n"
+    
+    bot.reply_to(message, mentor_text, parse_mode="Markdown")
+
+# Update the show_supreme_dashboard function to support editing messages
+
+@bot.message_handler(commands=['addmentor'])
+def start_add_mentor(message):
+    """Start the process of adding a new mentor to the database"""
+    user_id = message.from_user.id
+    
+    # Check if user is admin or creator
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Start the mentor creation process
+    PENDING_USERS[user_id] = {
+        'status': 'adding_mentor_id',
+        'mentor_data': {}
+    }
+    save_pending_users()
+    
+    bot.send_message(user_id, 
+        "🧠 *Add New Mentor*\n\n"
+        "Let's add a new mentor to the system. Please provide the following information:\n\n"
+        "First, enter the unique ID for this mentor (e.g., Rom, Konfu). "
+        "This will be used as the internal identifier:",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_id')
+def process_mentor_id(message):
+    user_id = message.from_user.id
+    mentor_id = message.text.strip()
+    
+    # Basic validation
+    if not mentor_id or len(mentor_id) < 2:
+        bot.send_message(user_id, "❌ Mentor ID must be at least 2 characters. Please try again.")
+        return
+        
+    # Check if mentor ID already exists
+    if mentor_id in MENTORS:
+        bot.send_message(user_id, 
+            f"⚠️ A mentor with ID '{mentor_id}' already exists.\n"
+            f"Please use a different ID or use the `/updatementor {mentor_id}` command to update the existing mentor."
+        )
+        return
+    
+    # Store the mentor ID and move to next step
+    PENDING_USERS[user_id]['mentor_data']['id'] = mentor_id
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_name'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's display name:")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_name')
+def process_mentor_name(message):
+    user_id = message.from_user.id
+    name = message.text.strip()
+    
+    if not name:
+        bot.send_message(user_id, "❌ Name cannot be empty. Please try again.")
+        return
+    
+    # Store the name and move to next step
+    PENDING_USERS[user_id]['mentor_data']['name'] = name
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_full_name'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's full name:")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_full_name')
+def process_mentor_full_name(message):
+    user_id = message.from_user.id
+    full_name = message.text.strip()
+    
+    if not full_name:
+        bot.send_message(user_id, "❌ Full name cannot be empty. Please try again.")
+        return
+    
+    # Store the full name and move to next step
+    PENDING_USERS[user_id]['mentor_data']['full_name'] = full_name
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_title'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's title (e.g., 'Senior Trading Strategist'):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_title')
+def process_mentor_title(message):
+    user_id = message.from_user.id
+    title = message.text.strip()
+    
+    if not title:
+        bot.send_message(user_id, "❌ Title cannot be empty. Please try again.")
+        return
+    
+    # Store the title and move to next step
+    PENDING_USERS[user_id]['mentor_data']['title'] = title
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_photo_url'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's photo URL (or type 'skip' to leave blank):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_photo_url')
+def process_mentor_photo_url(message):
+    user_id = message.from_user.id
+    photo_url = message.text.strip()
+    
+    # Allow skipping this field
+    if photo_url.lower() == 'skip':
+        photo_url = ""
+    
+    # Store the photo URL and move to next step
+    PENDING_USERS[user_id]['mentor_data']['photo_url'] = photo_url
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_expertise'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's expertise (e.g., 'Price Action & Market Structure'):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_expertise')
+def process_mentor_expertise(message):
+    user_id = message.from_user.id
+    expertise = message.text.strip()
+    
+    if not expertise:
+        bot.send_message(user_id, "❌ Expertise cannot be empty. Please try again.")
+        return
+    
+    # Store the expertise and move to next step
+    PENDING_USERS[user_id]['mentor_data']['expertise'] = expertise
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_experience'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's experience (e.g., '7+ years'):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_experience')
+def process_mentor_experience(message):
+    user_id = message.from_user.id
+    experience = message.text.strip()
+    
+    if not experience:
+        bot.send_message(user_id, "❌ Experience cannot be empty. Please try again.")
+        return
+    
+    # Store the experience and move to next step
+    PENDING_USERS[user_id]['mentor_data']['experience'] = experience
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_style'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's trading style (e.g., 'Technical Analysis'):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_style')
+def process_mentor_style(message):
+    user_id = message.from_user.id
+    style = message.text.strip()
+    
+    if not style:
+        bot.send_message(user_id, "❌ Trading style cannot be empty. Please try again.")
+        return
+    
+    # Store the trading style and move to next step
+    PENDING_USERS[user_id]['mentor_data']['style'] = style
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_description'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter a detailed description of the mentor:")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_description')
+def process_mentor_description(message):
+    user_id = message.from_user.id
+    description = message.text.strip()
+    
+    if not description:
+        bot.send_message(user_id, "❌ Description cannot be empty. Please try again.")
+        return
+    
+    # Store the description and move to next step
+    PENDING_USERS[user_id]['mentor_data']['description'] = description
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_strengths'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's strengths, separated by commas (e.g., 'Clean chart analysis, Entry/exit precision, Risk management'):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_strengths')
+def process_mentor_strengths(message):
+    user_id = message.from_user.id
+    strengths_text = message.text.strip()
+    
+    if not strengths_text:
+        bot.send_message(user_id, "❌ Strengths cannot be empty. Please try again.")
+        return
+    
+    # Split by commas and strip whitespace
+    strengths = [s.strip() for s in strengths_text.split(',')]
+    
+    # Store the strengths and move to next step
+    PENDING_USERS[user_id]['mentor_data']['strengths'] = strengths
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_teaching_style'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's teaching style:")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_teaching_style')
+def process_mentor_teaching_style(message):
+    user_id = message.from_user.id
+    teaching_style = message.text.strip()
+    
+    if not teaching_style:
+        bot.send_message(user_id, "❌ Teaching style cannot be empty. Please try again.")
+        return
+    
+    # Store the teaching style and move to next step
+    PENDING_USERS[user_id]['mentor_data']['teaching_style'] = teaching_style
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_availability'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's availability schedule (e.g., 'Weekdays 9AM-5PM PHT'):")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_availability')
+def process_mentor_availability(message):
+    user_id = message.from_user.id
+    availability = message.text.strip()
+    
+    if not availability:
+        bot.send_message(user_id, "❌ Availability cannot be empty. Please try again.")
+        return
+    
+    # Store the availability and move to next step
+    PENDING_USERS[user_id]['mentor_data']['availability'] = availability
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_availability_level'
+    save_pending_users()
+    
+    # Create a keyboard for availability level
+    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add(KeyboardButton("High"), KeyboardButton("Medium"), KeyboardButton("Limited"))
+    
+    bot.send_message(user_id, "Select the mentor's availability level:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_availability_level')
+def process_mentor_availability_level(message):
+    user_id = message.from_user.id
+    availability_level = message.text.strip()
+    
+    # Validate availability level
+    valid_levels = ["High", "Medium", "Limited"]
+    if availability_level not in valid_levels:
+        bot.send_message(user_id, "❌ Please select a valid availability level: High, Medium, or Limited.")
+        return
+    
+    # Store the availability level and move to next step
+    PENDING_USERS[user_id]['mentor_data']['availability_level'] = availability_level
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_current_status'
+    save_pending_users()
+    
+    # Create a keyboard for current status
+    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add(KeyboardButton("Available"), KeyboardButton("In Session"), KeyboardButton("Away"))
+    
+    bot.send_message(user_id, "Select the mentor's current status:", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_current_status')
+def process_mentor_current_status(message):
+    user_id = message.from_user.id
+    current_status = message.text.strip()
+    
+    # Validate current status
+    valid_statuses = ["Available", "In Session", "Away"]
+    if current_status not in valid_statuses:
+        bot.send_message(user_id, "❌ Please select a valid status: Available, In Session, or Away.")
+        return
+    
+    # Store the current status and move to next step
+    PENDING_USERS[user_id]['mentor_data']['current_status'] = current_status
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_testimonial'
+    save_pending_users()
+    
+    # Remove the keyboard
+    markup = ReplyKeyboardRemove()
+    bot.send_message(user_id, "Enter a student testimonial (or type 'skip' to leave blank):", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_testimonial')
+def process_mentor_testimonial(message):
+    user_id = message.from_user.id
+    testimonial = message.text.strip()
+    
+    # Allow skipping this field
+    if testimonial.lower() == 'skip':
+        testimonial = "No testimonials yet."
+    
+    # Store the testimonial and move to next step
+    PENDING_USERS[user_id]['mentor_data']['student_testimonial'] = testimonial
+    PENDING_USERS[user_id]['status'] = 'adding_mentor_success_rate'
+    save_pending_users()
+    
+    bot.send_message(user_id, "Enter the mentor's success rate (e.g., '92%'):")
+
+# Final handler to save the mentor to database
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'adding_mentor_success_rate')
+def process_mentor_success_rate(message):
+    user_id = message.from_user.id
+    success_rate = message.text.strip()
+    
+    # Store the success rate
+    PENDING_USERS[user_id]['mentor_data']['success_rate'] = success_rate
+    
+    # Get all the collected mentor data
+    mentor_data = PENDING_USERS[user_id]['mentor_data']
+    mentor_id = mentor_data.pop('id')  # Remove ID from the data dict
+    
+    # Save the mentor to database
+    save_mentor(mentor_id, mentor_data)
+    
+    # Update the MENTORS global variable
+    MENTORS[mentor_id] = mentor_data
+    
+    # Clear the pending state
+    PENDING_USERS.pop(user_id, None)
+    delete_pending_user(user_id)
+    
+    # Send confirmation
+    bot.send_message(
+        user_id, 
+        f"✅ Mentor '{mentor_id}' has been successfully added to the database!",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['deletementor'])
+def delete_mentor(message):
+    """Delete a mentor from the database"""
+    user_id = message.from_user.id
+    
+    # Check if user is admin or creator
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Get mentor ID from command
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Usage: `/deletementor [mentor_id]`", parse_mode="Markdown")
+        return
+        
+    mentor_id = args[1]
+    
+    # Check if mentor exists
+    if mentor_id not in MENTORS:
+        bot.reply_to(message, f"❌ Mentor '{mentor_id}' not found.")
+        return
+    
+    # Confirm deletion
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirm_delete_mentor_{mentor_id}"),
+        InlineKeyboardButton("❌ No, cancel", callback_data="cancel_delete_mentor")
+    )
+    
+    bot.reply_to(
+        message,
+        f"⚠️ Are you sure you want to delete mentor '{mentor_id}'? This action cannot be undone.",
+        reply_markup=markup
+    )
+
+def show_supreme_dashboard(message, edit_message=False, call_obj=None):
+    """Display the Supreme Membership dashboard with detailed student information and task overview"""
+    if edit_message and call_obj:
+        # We're editing an existing message (returning from a sub-menu)
+        chat_id = call_obj.message.chat.id
+        message_id = call_obj.message.message_id
+        user_id = call_obj.from_user.id
+    else:
+        # Normal command invocation
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+    
+    user_id_str = str(user_id)
+    
+    # Only allow in private chats for privacy (only check for normal command invocation)
+    if not edit_message and message.chat.type != 'private':
+        bot.send_message(chat_id, "🔒 Please use this command in a private message with the bot.")
+        return
+    
+    # Check if the user has Supreme membership
+    if user_id_str in PAYMENT_DATA and PAYMENT_DATA[user_id_str].get('mentorship_type', '').lower() == 'supreme':
+        try:
+            data = PAYMENT_DATA[user_id_str]
+            
+            if edit_message:
+                username = call_obj.from_user.username or "No Username"
+            else:
+                username = message.from_user.username or "No Username"
+                
+            full_name = data.get('form_answers', {}).get('full_name', username)
+            
+            # Get membership details
+            plan = data.get('payment_plan', 'Unknown')
+            
+            # Determine the mentor (you can customize this logic)
+            mentors = {'Apprentice': 'Rom', 'Disciple': 'Konfu', 'Legacy': 'Nath'}
+            mentor = mentors.get(plan, '???')
+            
+            # Calculate enrollment date and expiry date
+            enrollment_date = datetime.strptime(data.get('enrollment_date', datetime.now().strftime('%Y-%m-%d %H:%M:%S')), '%Y-%m-%d %H:%M:%S')
+            due_date = datetime.strptime(data.get('due_date', '2099-12-31 23:59:59'), '%Y-%m-%d %H:%M:%S')
+            
+            # Calculate days remaining until expiration
+            current_date = datetime.now()
+            days_remaining = (due_date - current_date).days
+            hours_remaining = int((due_date - current_date).seconds / 3600)
+            
+            # Get mentorship type
+            mentorship_type = data.get('mentorship_type', 'Supreme')
+            
+            # Check if membership is cancelled
+            if data.get('cancelled', False):
+                status_icon = "🚫"
+                status_text = "Cancelled"
+            # If not cancelled, format status based on days remaining
+            elif days_remaining > 7:
+                status_icon = "✅"
+                status_text = "Active"
+            elif days_remaining > 0:
+                status_icon = "⚠️"
+                status_text = "Expiring Soon"
+            else:
+                status_icon = "❌"
+                status_text = "Expired"
+            
+            # Determine user ranking based on custom logic (placeholder)
+            rank_points = data.get('rank_points', 0)
+            
+            ranking_tiers = {
+                (0, 100): "Rookie I",
+                (101, 200): "Rookie II",
+                (201, 300): "Rookie III",
+                (301, 500): "Elite I",
+                (501, 700): "Elite II",
+                (701, 900): "Elite III",
+                (901, 1200): "Master I",
+                (1201, 1500): "Master II",
+                (1501, 1800): "Master III",
+                (1801, 2200): "Legend I",
+                (2201, 2600): "Legend II",
+                (2601, 3000): "Legend III",
+                (3001, float('inf')): "Sovereign"
+            }
+            
+            ranking = "Rookie I"  # Default
+            for (min_points, max_points), rank in ranking_tiers.items():
+                if min_points <= rank_points <= max_points:
+                    ranking = rank
+                    break
+            
+            # Get user expertise level from form answers
+            expertise_level = "Beginner"
+            
+            if 'form_answers' in data and 'expertise_level' in data['form_answers']:
+                expertise = data['form_answers']['expertise_level'].lower()
+                
+                if 'beginner' in expertise or 'a.' in expertise:
+                    expertise_level = "Beginner"
+                elif 'intermediate' in expertise or 'c.' in expertise:
+                    expertise_level = "Intermediate"  
+                elif 'expert' in expertise or 'd.' in expertise:
+                    expertise_level = "Expert"
+                elif 'master' in expertise or 'e.' in expertise:
+                    expertise_level = "Master"
+            
+            # Create nice formatting for the dashboard with box-style formatting
+            dashboard_message = (
+                f"✨ *SUPREME DASHBOARD*\n\n"
+                
+                f"┌─────── 👤 *STUDENT INFO* ────────┐\n"
+                f"│ *Name:* {full_name}\n"
+                f"│ *Member ID:* `{user_id_str}`\n"
+                f"│ *Ranking:* {ranking}\n"
+                f"│ *Expertise Level:* {expertise_level}\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── 💳 *SUBSCRIPTION* ────────┐\n"
+                f"│ *Plan:* {plan}\n"
+                f"│ *Type:* {mentorship_type} Mentorship\n"
+                f"│ *Mentor:* {mentor}\n"
+                f"│ *Enrollment:* {enrollment_date.strftime('%B %d, %Y')}\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── ⏱️ *STATUS* ────────┐\n"
+                f"│ *Status:* {status_icon} {status_text}\n"
+                f"│ *Expiration:* {due_date.strftime('%Y-%m-%d')}\n"
+                f"│ *Time Left:* {days_remaining} days, {hours_remaining} hours\n"
+                f"└────────────────────────────────┘\n\n"
+                
+                f"┌─────── 📝 *LEARNING TASKS* ────────┐\n"
+                f"│ • Complete Market Structure Lesson\n"
+                f"│   *Due: Friday*\n"
+                f"│ • Submit Weekly Chart Analysis\n"
+                f"│   *Due: Sunday*\n"
+                f"│ • Schedule Next 1:1 Session\n"
+                f"│   *Due: Tomorrow*\n"
+                f"└────────────────────────────────┘\n"
+            )
+            
+            # Add renewal instructions if expiring soon (and not cancelled)
+            if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
+                dashboard_message += (
+                    f"\n⚠️ *Your membership expires soon!*\n"
+                    f"Use /start and select 'Renew Membership' to continue access.\n"
+                )
+            # Add special message for cancelled memberships
+            elif data.get('cancelled', False):
+                dashboard_message += (
+                    f"\n🚫 *Your membership has been cancelled*\n"
+                    f"You will still have access until {due_date.strftime('%Y-%m-%d')}.\n"
+                    f"To reactivate before expiration, use /start and select 'Renew Membership'.\n"
+                )
+            
+            # Create navigation buttons for the Supreme dashboard - UPDATED PER REQUIREMENTS
+            markup = InlineKeyboardMarkup(row_width=2)
+            
+            # First row
+            markup.add(
+                InlineKeyboardButton("💎 Supreme Vault", callback_data="supreme_vault"),
+                InlineKeyboardButton("👨‍🏫 Mentor Line", callback_data="mentor_line")
+            )
+            
+            # Second row
+            markup.add(
+                InlineKeyboardButton("🛣️ Trading Journey", callback_data="trading_journey"),
+                InlineKeyboardButton("📔 Trading Journal", callback_data="trading_journal")
+            )
+            
+            # Third row
+            markup.add(
+                InlineKeyboardButton("🏆 Leaderboard", callback_data="supreme_leaderboard"),
+                InlineKeyboardButton("👥 Supreme Network", callback_data="supreme_network")
+            )
+            
+            # Add renewal button if needed
+            if days_remaining < 7 and days_remaining >= 0 and not data.get('cancelled', False):
+                markup.add(InlineKeyboardButton("🔄 Renew Membership", callback_data="start_renewal"))
+            
+            # Send or edit the dashboard message with buttons
+            if edit_message:
+                bot.edit_message_text(
+                    dashboard_message, 
+                    chat_id,
+                    message_id,
+                    parse_mode="Markdown", 
+                    reply_markup=markup
+                )
+            else:
+                bot.send_message(chat_id, dashboard_message, parse_mode="Markdown", reply_markup=markup)
+            
+        except Exception as e:
+            error_msg = f"❌ Error retrieving Supreme dashboard: {str(e)}"
+            if edit_message and call_obj:
+                bot.edit_message_text(error_msg, chat_id, message_id)
+            else:
+                bot.send_message(chat_id, error_msg)
+            logging.error(f"Supreme dashboard error for user {user_id}: {str(e)}")
+    else:
+        # User is not a Supreme member
+        error_msg = (
+            "⭐ *Supreme Dashboard Access Restricted*\n\n"
+            "This feature is exclusively for Supreme membership holders. "
+            "To upgrade your membership, use /start and select 'Purchase Membership'."
+        )
+        
+        if edit_message and call_obj:
+            bot.edit_message_text(error_msg, chat_id, message_id, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, error_msg, parse_mode="Markdown")
+
+# Add a callback handler for dashboard buttons
+@bot.callback_query_handler(func=lambda call: call.data == "start_renewal")
+def handle_renewal_button(call):
+    """Handle renewal button from dashboard"""
+    try:
+        # Simulate the /start command followed by renewal choice
+        PENDING_USERS[call.from_user.id] = {
+            'status': 'choosing_mentorship_type',
+            'is_renewal': True
+        }
+        save_pending_users()
+        
+        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
+        
+        bot.send_message(
+            call.from_user.id, 
+            "Thank you for choosing to renew! Please select your preferred mentorship level:",
+            reply_markup=markup
+        )
+        
+        # Answer the callback to close the loading indicator
+        bot.answer_callback_query(call.id, "Starting renewal process...")
+        
+        # Edit the message to remove buttons
+        bot.edit_message_reply_markup(
+            call.message.chat.id, 
+            call.message.message_id,
+            reply_markup=None
+        )
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}")
+        logging.error(f"Error in renewal button handler: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "view_leaderboard")
+def handle_leaderboard_button(call):
+    """Show leaderboard from dashboard button"""
+    try:
+        # Generate daily leaderboard for current date
+        now = datetime.now(pytz.timezone('Asia/Manila'))
+        leaderboard_text = generate_daily_leaderboard_text(now)
+        
+        # Send leaderboard
+        bot.send_message(
+            call.from_user.id,
+            leaderboard_text,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "Showing current leaderboard")
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}")
+        logging.error(f"Error in leaderboard button handler: {e}")
 
 # Command to post a new changelog entry (creator only)
 @bot.message_handler(commands=['post_changelog'])
@@ -3097,19 +7664,88 @@ def get_topic_id(message):
         
 @bot.message_handler(commands=['jarvis'])
 def handle_jarvis_command(message):
-    """Send a Jarvis image to the group chat"""
+    """Send a Jarvis image to the group chat with global usage limits"""
     if message.chat.type not in ['group', 'supergroup']:
         bot.reply_to(message, "❌ This command can only be used in group chats.")
         return
         
+    current_time = datetime.now()
+    
     try:
+        # Get global usage data
+        global_data = jarvis_usage_collection.find_one({"_id": "global_counter"})
+        
+        if not global_data:
+            # First time the command is being used after implementation
+            global_data = {
+                "_id": "global_counter",
+                "count": 0,
+                "last_reset": current_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        
+        # Check if 6 hours have passed since last reset
+        last_reset = datetime.strptime(global_data["last_reset"], '%Y-%m-%d %H:%M:%S')
+        hours_passed = (current_time - last_reset).total_seconds() / 3600
+        
+        # Reset counter if 6 hours have passed
+        if hours_passed >= 6:
+            global_data = {
+                "_id": "global_counter",
+                "count": 0,
+                "last_reset": current_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        
+        # Check if global limit has been reached
+        if global_data["count"] >= 4:
+            next_reset_time = last_reset + timedelta(hours=6)
+            time_until_reset = next_reset_time - current_time
+            hours, remainder = divmod(time_until_reset.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            
+            # Send message and self-destruct after 5 seconds
+            limit_msg = bot.reply_to(
+                message, 
+                f"⏳ The Jarvis command has reached its global limit (4 uses per 6 hours).\nTry again in {hours} hours and {minutes} minutes."
+            )
+            
+            # Create a thread to delete BOTH messages after 5 seconds
+            def delete_after_delay(chat_id, message_ids):
+                time.sleep(3)
+                for msg_id in message_ids:
+                    try:
+                        bot.delete_message(chat_id, msg_id)
+                        logging.info(f"Auto-deleted message ID {msg_id} in chat {chat_id}")
+                    except Exception as e:
+                        logging.error(f"Failed to auto-delete message ID {msg_id}: {e}")
+            
+            # Delete both the original command message and the rate limit message
+            threading.Thread(target=delete_after_delay, 
+                         args=(message.chat.id, [message.message_id, limit_msg.message_id])).start()
+            return
+        
+        # Increment the global usage counter
+        global_data["count"] += 1
+        jarvis_usage_collection.replace_one({"_id": "global_counter"}, global_data, upsert=True)
+        
+        remaining = 4 - global_data["count"]
+        
         # Path to the Jarvis image
         jarvis_image = "gifs/jarvis.png"  # Using existing GIFs directory
         
-        # Send the image without caption
+        # Send the image with usage info
         with open(jarvis_image, 'rb') as photo:
-            bot.send_photo(message.chat.id, photo)
-            logging.info(f"Sent Jarvis image in chat {message.chat.id} (requested by {message.from_user.id})")
+            bot.send_photo(
+                message.chat.id, 
+                photo,
+            )
+            logging.info(f"Sent Jarvis image in chat {message.chat.id} (requested by {message.from_user.id}, {remaining} global uses remaining)")
+            
+            # Also delete the original command after sending the image for cleaner chat
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception as e:
+                logging.error(f"Failed to delete original command message: {e}")
+                
     except FileNotFoundError:
         bot.reply_to(message, "❌ Image not found.")
         logging.warning(f"Jarvis image not found (requested by {message.from_user.id})")
@@ -3128,10 +7764,14 @@ def list_available_commands(message):
         ("/start", "Begin the bot interaction or return to main menu"),
         ("/verify", "Submit payment proof for verification"),
         ("/dashboard", "View your membership status and details"),
+        ("/confess", "Submit an anonymous confession"),
+        ("/cancel", "Cancel an in-progress action"),
+        ("/commands", "Show this list of commands"),
         ("/ping", "Check if the bot is online"),
         ("/tip", "Support the bot creator"),
         ("/jarvis", "Display the Jarvis AI image"),
-        ("/changelogs", "View recent updates to the bot/academy")
+        ("/changelogs", "View recent updates to the bot/academy"),
+        ("/dm", "Send a direct message to a user")
     ]
     
     admin_commands = [
@@ -3139,6 +7779,8 @@ def list_available_commands(message):
         ("/challenge", "Manually trigger a daily challenge"),
         ("/admin_dashboard", "Access admin controls"),
         ("/leaderboard", "Manually trigger leaderboard update"),
+        ("/resend", "Force cleanup and resend of payment reminders"),
+        ("/dm", "Send a direct message to a user")
     ]
     
     creator_commands = [
@@ -3148,6 +7790,8 @@ def list_available_commands(message):
         ("/setannouncementtopic", "Set the topic ID for announcements"),
         ("/setaccountabilitytopic", "Set the topic ID for accountability roster"),
         ("/setleaderboardtopic", "Set the topic ID for leaderboards"),
+        ("/setconfessiontopic", "Set the topic ID for confessions"),
+        ("/refreshexpired", "Refresh expired members status flags"),
         ("/remove", "Remove yourself from pending users list"),
         ("/check", "Check MongoDB connection status")
     ]
@@ -3770,14 +8414,33 @@ def send_daily_leaderboard():
                     # Send after a short delay
                     time.sleep(3)
                     
-                    if LEADERBOARD_TOPIC_ID:
+                    # MODIFIED: Send monthly leaderboard to ANNOUNCEMENT_TOPIC_ID if available
+                    if ANNOUNCEMENT_TOPIC_ID:
+                        # Send to announcements topic for better visibility
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            monthly_leaderboard,
+                            parse_mode="Markdown",
+                            message_thread_id=ANNOUNCEMENT_TOPIC_ID
+                        )
+                        logging.info(f"Sent monthly leaderboard to announcements topic {ANNOUNCEMENT_TOPIC_ID}")
+                    elif LEADERBOARD_TOPIC_ID:
+                        # Fall back to regular leaderboard topic if announcements not configured
                         bot.send_message(
                             PAID_GROUP_ID, 
                             monthly_leaderboard,
                             parse_mode="Markdown",
                             message_thread_id=LEADERBOARD_TOPIC_ID
                         )
-                        logging.info(f"Sent monthly leaderboard to topic {LEADERBOARD_TOPIC_ID}")
+                        logging.info(f"Sent monthly leaderboard to leaderboard topic {LEADERBOARD_TOPIC_ID}")
+                    else:
+                        # Last resort: send to main group if no topics configured
+                        bot.send_message(
+                            PAID_GROUP_ID, 
+                            monthly_leaderboard,
+                            parse_mode="Markdown"
+                        )
+                        logging.info("Sent monthly leaderboard to main group (no topic IDs configured)")
                 
                 # Update last leaderboard date
                 last_leaderboard_date = now.strftime('%Y-%m-%d')
@@ -3931,13 +8594,24 @@ def start_confession(message):
     
     USERS_CONFESSING[user_id] = {'status': 'awaiting_confession'}
     
-    # Personalize the instruction for better engagement
+    # Personalize the instruction for better engagement - now with media support instructions
     welcome_messages = [
-        "🔒 *Anonymous Confession*\n\nShare your trading frustrations, wins, or anything on your mind. Your identity will remain hidden.\n\nType your confession now or send /cancel to stop.",
+        "🔒 *Anonymous Confession*\n\nShare your trading frustrations, wins, or anything on your mind. Your identity will remain hidden.\n\n"
+        "📝 *Send text* for a regular confession\n"
+        "📸 *Send a photo* to share an image anonymously\n"
+        "🎞️ *Send a GIF* or video to share media anonymously\n\n"
+        "Type your confession now or send /cancel to stop.",
         
-        "🤫 *Secret Sharing*\n\nGot something to get off your chest about your trading journey? No one will know it's you.\n\nType your confession now or send /cancel to stop.",
+        "🤫 *Secret Sharing*\n\nGot something to get off your chest about your trading journey? No one will know it's you.\n\n"
+        "You can now include:\n"
+        "• Text messages\n"
+        "• Photos/Screenshots\n"
+        "• GIFs or Videos\n\n"
+        "Send your confession now or use /cancel to stop.",
         
-        "🎭 *Anonymous Message*\n\nShare your trading experiences, market observations, or personal thoughts anonymously with the community.\n\nType your confession now or send /cancel to stop."
+        "🎭 *Anonymous Message*\n\nShare your trading experiences, market observations, or personal thoughts anonymously with the community.\n\n"
+        "✨ *NEW:* You can now include images, GIFs, and videos in your confessions!\n\n"
+        "Send your confession now or use /cancel to stop."
     ]
     
     bot.send_message(user_id, random.choice(welcome_messages), parse_mode="Markdown")
@@ -3958,12 +8632,12 @@ def cancel_confession(message):
     else:
         bot.send_message(user_id, "❓ You don't have any active confession to cancel.")
 
-# Handle confession messages
+# Add handler for text confessions (existing handler)
 @bot.message_handler(func=lambda message: message.chat.type == 'private' and 
                     message.from_user.id in USERS_CONFESSING and 
                     USERS_CONFESSING[message.from_user.id]['status'] == 'awaiting_confession')
-def handle_confession(message):
-    """Process a user's confession"""
+def handle_text_confession(message):
+    """Process a user's text confession"""
     user_id = message.from_user.id
     confession_text = message.text
     
@@ -4007,7 +8681,7 @@ def handle_confession(message):
             )
         
         # Log the confession (not linking to the user for privacy)
-        logging.info(f"Confession #{CONFESSION_COUNTER} sent to group")
+        logging.info(f"Text confession #{CONFESSION_COUNTER} sent to group")
         
         # Send confirmation to user
         confirmation_messages = [
@@ -4018,7 +8692,7 @@ def handle_confession(message):
         
         bot.send_message(user_id, random.choice(confirmation_messages), parse_mode="Markdown")
         
-        # Get user info
+        # Get user info for admin records
         try:
             user_info = bot.get_chat(user_id)
             username = user_info.username
@@ -4033,7 +8707,6 @@ def handle_confession(message):
             # Escape any Markdown characters in user_display
             user_display = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', user_display)
         except Exception as e:
-            # Fallback if we can't get user info
             logging.error(f"Error getting user info for confession: {e}")
             user_display = f"User ID: {user_id}"
 
@@ -4045,6 +8718,165 @@ def handle_confession(message):
     except Exception as e:
         logging.error(f"Error sending confession: {e}")
         bot.send_message(user_id, "❌ There was an error sending your confession. Please try again later.")
+    
+    # Remove user from confessing dict
+    USERS_CONFESSING.pop(user_id, None)
+
+# Add new handler for photo confessions
+@bot.message_handler(content_types=['photo'], func=lambda message: message.chat.type == 'private' and 
+                    message.from_user.id in USERS_CONFESSING and 
+                    USERS_CONFESSING[message.from_user.id]['status'] == 'awaiting_confession')
+def handle_photo_confession(message):
+    """Process a user's photo confession"""
+    user_id = message.from_user.id
+    photo_id = message.photo[-1].file_id  # Get the highest resolution photo
+    caption = message.caption or ""
+    
+    # Increment the confession counter
+    global CONFESSION_COUNTER
+    CONFESSION_COUNTER += 1
+    save_confession_counter(CONFESSION_COUNTER)
+    
+    try:
+        # Send anonymously to the group
+        if CONFESSION_TOPIC_ID:
+            sent_message = bot.send_photo(
+                PAID_GROUP_ID,
+                photo_id,
+                caption=f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{caption}" if caption else f"🔐 *Confession #{CONFESSION_COUNTER}*",
+                parse_mode="Markdown",
+                message_thread_id=CONFESSION_TOPIC_ID
+            )
+        else:
+            sent_message = bot.send_photo(
+                PAID_GROUP_ID,
+                photo_id,
+                caption=f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{caption}" if caption else f"🔐 *Confession #{CONFESSION_COUNTER}*",
+                parse_mode="Markdown"
+            )
+            
+        # Log the confession
+        logging.info(f"Photo confession #{CONFESSION_COUNTER} sent to group")
+        
+        # Send confirmation to user
+        bot.send_message(user_id, "✅ Your photo confession has been sent anonymously.")
+        
+        # Admin record
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username
+            user_display = f"@{username}" if username else f"User ID: {user_id}"
+            user_display = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', user_display)
+            
+            admin_record = f"📝 *Admin Log*\n\nPhoto confession #{CONFESSION_COUNTER} was submitted by {user_display}"
+            bot.send_message(CREATOR_ID, admin_record, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Error sending admin log for photo confession: {e}")
+    
+    except Exception as e:
+        logging.error(f"Error sending photo confession: {e}")
+        bot.send_message(user_id, "❌ There was an error sending your photo confession.")
+    
+    # Remove user from confessing dict
+    USERS_CONFESSING.pop(user_id, None)
+
+# Add handler for GIF/animation confessions
+@bot.message_handler(content_types=['animation', 'document'], func=lambda message: message.chat.type == 'private' and 
+                    message.from_user.id in USERS_CONFESSING and 
+                    USERS_CONFESSING[message.from_user.id]['status'] == 'awaiting_confession' and
+                    (hasattr(message, 'animation') or (hasattr(message, 'document') and message.document.mime_type == 'image/gif')))
+def handle_gif_confession(message):
+    """Process a user's GIF confession"""
+    user_id = message.from_user.id
+    gif_id = message.animation.file_id if hasattr(message, 'animation') else message.document.file_id
+    caption = message.caption or ""
+    
+    # Increment the confession counter
+    global CONFESSION_COUNTER
+    CONFESSION_COUNTER += 1
+    save_confession_counter(CONFESSION_COUNTER)
+    
+    try:
+        # Send anonymously to the group
+        if CONFESSION_TOPIC_ID:
+            sent_message = bot.send_animation(
+                PAID_GROUP_ID,
+                gif_id,
+                caption=f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{caption}" if caption else f"🔐 *Confession #{CONFESSION_COUNTER}*",
+                parse_mode="Markdown",
+                message_thread_id=CONFESSION_TOPIC_ID
+            )
+        else:
+            sent_message = bot.send_animation(
+                PAID_GROUP_ID,
+                gif_id,
+                caption=f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{caption}" if caption else f"🔐 *Confession #{CONFESSION_COUNTER}*",
+                parse_mode="Markdown"
+            )
+            
+        # Log the confession
+        logging.info(f"GIF confession #{CONFESSION_COUNTER} sent to group")
+        
+        # Send confirmation to user
+        bot.send_message(user_id, "✅ Your GIF confession has been sent anonymously.")
+        
+        # Admin record
+        admin_record = f"📝 *Admin Log*\n\nGIF confession #{CONFESSION_COUNTER} was submitted by User ID: {user_id}"
+        bot.send_message(CREATOR_ID, admin_record, parse_mode="Markdown")
+    
+    except Exception as e:
+        logging.error(f"Error sending GIF confession: {e}")
+        bot.send_message(user_id, "❌ There was an error sending your GIF confession.")
+    
+    # Remove user from confessing dict
+    USERS_CONFESSING.pop(user_id, None)
+
+# Add handler for video confessions
+@bot.message_handler(content_types=['video'], func=lambda message: message.chat.type == 'private' and 
+                    message.from_user.id in USERS_CONFESSING and 
+                    USERS_CONFESSING[message.from_user.id]['status'] == 'awaiting_confession')
+def handle_video_confession(message):
+    """Process a user's video confession"""
+    user_id = message.from_user.id
+    video_id = message.video.file_id
+    caption = message.caption or ""
+    
+    # Increment the confession counter
+    global CONFESSION_COUNTER
+    CONFESSION_COUNTER += 1
+    save_confession_counter(CONFESSION_COUNTER)
+    
+    try:
+        # Send anonymously to the group
+        if CONFESSION_TOPIC_ID:
+            sent_message = bot.send_video(
+                PAID_GROUP_ID,
+                video_id,
+                caption=f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{caption}" if caption else f"🔐 *Confession #{CONFESSION_COUNTER}*",
+                parse_mode="Markdown",
+                message_thread_id=CONFESSION_TOPIC_ID
+            )
+        else:
+            sent_message = bot.send_video(
+                PAID_GROUP_ID,
+                video_id,
+                caption=f"🔐 *Confession #{CONFESSION_COUNTER}*\n\n{caption}" if caption else f"🔐 *Confession #{CONFESSION_COUNTER}*",
+                parse_mode="Markdown"
+            )
+            
+        # Log the confession
+        logging.info(f"Video confession #{CONFESSION_COUNTER} sent to group")
+        
+        # Send confirmation to user
+        bot.send_message(user_id, "✅ Your video confession has been sent anonymously.")
+        
+        # Admin record
+        admin_record = f"📝 *Admin Log*\n\nVideo confession #{CONFESSION_COUNTER} was submitted by User ID: {user_id}"
+        bot.send_message(CREATOR_ID, admin_record, parse_mode="Markdown")
+    
+    except Exception as e:
+        logging.error(f"Error sending video confession: {e}")
+        bot.send_message(user_id, "❌ There was an error sending your video confession.")
     
     # Remove user from confessing dict
     USERS_CONFESSING.pop(user_id, None)
@@ -4272,6 +9104,4769 @@ def resend_reminders(message):
         bot.reply_to(message, f"❌ Error during resend operation: {str(e)}")
         logging.error(f"Error in resend_reminders command: {e}")
 
+@bot.message_handler(commands=['discount'])
+def start_discount_setup(message):
+    """Start discount setup process"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Start the discount setup process - first ask for the event name
+    bot.reply_to(message, "🏷️ *Discount Setup*\n\nPlease enter the name of the discount event:", parse_mode="Markdown")
+    
+    # Set user state
+    PENDING_USERS[message.from_user.id] = {'status': 'discount_event_name'}
+    save_pending_users()
+
+@bot.message_handler(commands=['remove_discount'])
+def remove_discount(message):
+    """Remove active discount"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    args = message.text.split()
+    
+    if len(args) < 2:
+        # Show both discounts status and ask which one to remove
+        reg_status = "🟢 Active" if DISCOUNTS.get('regular') else "🔴 Not active"
+        sup_status = "🟢 Active" if DISCOUNTS.get('supreme') else "🔴 Not active"
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        if DISCOUNTS.get('regular'):
+            markup.add(InlineKeyboardButton("Remove Regular Discount", callback_data="remove_discount_regular"))
+        if DISCOUNTS.get('supreme'):
+            markup.add(InlineKeyboardButton("Remove Supreme Discount", callback_data="remove_discount_supreme"))
+        if DISCOUNTS.get('regular') and DISCOUNTS.get('supreme'):
+            markup.add(InlineKeyboardButton("Remove Both Discounts", callback_data="remove_discount_both"))
+        
+        if not markup.keyboard:
+            bot.reply_to(message, "❌ There are no active discounts to remove.")
+            return
+            
+        bot.reply_to(
+            message, 
+            f"📊 *Current Discount Status*\n\n"
+            f"• Regular Discount: {reg_status}\n"
+            f"• Supreme Discount: {sup_status}\n\n"
+            f"Please select which discount to remove:",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        return
+    
+    # If a specific discount type was specified in command
+    discount_type = args[1].lower()
+    
+    if discount_type not in ['regular', 'supreme', 'both']:
+        bot.reply_to(message, "❌ Invalid discount type. Use 'regular', 'supreme', or 'both'.")
+        return
+    
+    # Handle the removal based on type
+    if discount_type == 'both':
+        removed = []
+        if DISCOUNTS.get('regular'):
+            old_discount = DISCOUNTS['regular'].copy()
+            DISCOUNTS['regular'] = None
+            save_discount(None, 'regular')
+            removed.append(f"Regular: {old_discount.get('name')} ({old_discount.get('percentage')}%)")
+            
+        if DISCOUNTS.get('supreme'):
+            old_discount = DISCOUNTS['supreme'].copy()
+            DISCOUNTS['supreme'] = None
+            save_discount(None, 'supreme')
+            removed.append(f"Supreme: {old_discount.get('name')} ({old_discount.get('percentage')}%)")
+            
+        if removed:
+            bot.reply_to(message, f"✅ Discounts removed successfully!\n\n{', '.join(removed)}")
+        else:
+            bot.reply_to(message, "❌ There were no active discounts to remove.")
+            
+    else:  # regular or supreme
+        if not DISCOUNTS.get(discount_type):
+            bot.reply_to(message, f"❌ There is no active {discount_type} discount to remove.")
+            return
+            
+        # Remove the specific discount
+        old_discount = DISCOUNTS[discount_type].copy()
+        DISCOUNTS[discount_type] = None
+        save_discount(None, discount_type)
+        
+        bot.reply_to(
+            message, 
+            f"✅ {discount_type.capitalize()} discount removed successfully!\n\n"
+            f"Removed discount: {old_discount['name']} ({old_discount['percentage']}% off)"
+        )
+
+# Add callback handler for discount removal buttons
+@bot.callback_query_handler(func=lambda call: call.data.startswith("remove_discount_"))
+def handle_remove_discount_callback(call):
+    user_id = call.from_user.id
+    
+    # Check if user is admin or creator
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    discount_type = call.data.split("_")[2]  # regular, supreme, or both
+    
+    if discount_type == "both":
+        removed = []
+        if DISCOUNTS.get('regular'):
+            old_discount = DISCOUNTS['regular'].copy()
+            DISCOUNTS['regular'] = None
+            save_discount(None, 'regular')
+            removed.append(f"Regular: {old_discount.get('name')} ({old_discount.get('percentage')}%)")
+            
+        if DISCOUNTS.get('supreme'):
+            old_discount = DISCOUNTS['supreme'].copy()
+            DISCOUNTS['supreme'] = None
+            save_discount(None, 'supreme')
+            removed.append(f"Supreme: {old_discount.get('name')} ({old_discount.get('percentage')}%)")
+        
+        # Update the message
+        if removed:
+            bot.edit_message_text(
+                f"✅ *Discounts Removed Successfully*\n\n" + "\n".join(removed),
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.edit_message_text(
+                "❌ There were no active discounts to remove.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+        
+    else:  # regular or supreme
+        if DISCOUNTS.get(discount_type):
+            old_discount = DISCOUNTS[discount_type].copy()
+            DISCOUNTS[discount_type] = None
+            save_discount(None, discount_type)
+            
+            bot.edit_message_text(
+                f"✅ *{discount_type.capitalize()} Discount Removed*\n\n"
+                f"Name: {old_discount['name']}\n"
+                f"Percentage: {old_discount['percentage']}% off",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.edit_message_text(
+                f"❌ There is no active {discount_type} discount to remove.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+    
+    bot.answer_callback_query(call.id, f"Discount removal processed")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_event_name')
+def process_discount_event_name(message):
+    user_id = message.from_user.id
+    discount_name = message.text.strip()
+    
+    if len(discount_name) < 3:
+        bot.send_message(user_id, "❌ Discount name must be at least 3 characters long. Please try again:")
+        return
+    
+    # Store the discount name
+    PENDING_USERS[user_id]['discount_name'] = discount_name
+    PENDING_USERS[user_id]['status'] = 'discount_regular_percentage'
+    save_pending_users()
+    
+    # Ask for regular mentorship percentage
+    bot.send_message(user_id, "🔢 What is the discount percentage for *Regular Mentorship*?\n\nPlease enter a number between 1 and 99:", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_regular_percentage')
+def process_discount_regular_percentage(message):
+    user_id = message.from_user.id
+    
+    try:
+        # Try to parse the percentage
+        percentage = int(message.text.strip())
+        
+        # Validate percentage range
+        if percentage < 1 or percentage > 99:
+            bot.send_message(user_id, "❌ Percentage must be between 1 and 99. Please try again:")
+            return
+        
+        # Store the regular percentage
+        PENDING_USERS[user_id]['regular_percentage'] = percentage
+        PENDING_USERS[user_id]['status'] = 'discount_supreme_percentage'
+        save_pending_users()
+        
+        # Ask for supreme membership percentage
+        bot.send_message(user_id, "🔢 What is the discount percentage for *Supreme Mentorship*?\n\nPlease enter a number between 1 and 99:", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.send_message(user_id, "❌ Invalid percentage. Please enter a number between 1 and 99:")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_supreme_percentage')
+def process_discount_supreme_percentage(message):
+    user_id = message.from_user.id
+    
+    try:
+        # Try to parse the percentage
+        percentage = int(message.text.strip())
+        
+        # Validate percentage range
+        if percentage < 1 or percentage > 99:
+            bot.send_message(user_id, "❌ Percentage must be between 1 and 99. Please try again:")
+            return
+        
+        # Store the supreme percentage
+        PENDING_USERS[user_id]['supreme_percentage'] = percentage
+        PENDING_USERS[user_id]['status'] = 'discount_regular_expiry'
+        save_pending_users()
+        
+        # Ask for regular mentorship expiry
+        bot.send_message(
+            user_id, 
+            "📅 When will the *Regular Mentorship* discount end?\n\nPlease select the duration:",
+            parse_mode="Markdown",
+            reply_markup=create_duration_keyboard()
+        )
+        
+    except ValueError:
+        bot.send_message(user_id, "❌ Invalid percentage. Please enter a number between 1 and 99:")
+
+# Helper function to create duration keyboard
+def create_duration_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("1 day", "3 days", "1 week")
+    markup.row("2 weeks", "1 month", "3 months")
+    markup.row("Custom date")
+    return markup
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_regular_expiry')
+def process_discount_regular_expiry(message):
+    user_id = message.from_user.id
+    expiry_text = message.text.strip()
+    
+    # Calculate end date based on selection
+    end_date = calculate_end_date(expiry_text)
+    
+    if end_date:
+        # Store the regular expiry date
+        PENDING_USERS[user_id]['regular_end_date'] = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        PENDING_USERS[user_id]['status'] = 'discount_supreme_expiry'
+        save_pending_users()
+        
+        # Ask for supreme mentorship expiry
+        bot.send_message(
+            user_id, 
+            "📅 When will the *Supreme Mentorship* discount end?\n\nPlease select the duration:",
+            parse_mode="Markdown",
+            reply_markup=create_duration_keyboard()
+        )
+    elif expiry_text == "Custom date":
+        PENDING_USERS[user_id]['status'] = 'discount_regular_custom_date'
+        save_pending_users()
+        bot.send_message(user_id, "📅 Please enter the end date for Regular Membership in format YYYY-MM-DD HH:MM:SS\n\nFor example: 2025-05-15 23:59:59")
+    else:
+        bot.send_message(user_id, "❌ Invalid selection. Please choose from the keyboard or enter 'Custom date'.")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_regular_custom_date')
+def process_discount_regular_custom_date(message):
+    user_id = message.from_user.id
+    end_date_str = message.text.strip()
+    
+    try:
+        # Try to parse the date
+        naive_end_date = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
+        
+        # Make it timezone-aware in Manila timezone
+        manila_tz = pytz.timezone('Asia/Manila')
+        end_date = manila_tz.localize(naive_end_date)
+        
+        # Check if date is in the future
+        now = datetime.now(manila_tz)
+        if end_date <= now:
+            bot.send_message(user_id, "❌ End date must be in the future. Please try again:")
+            return
+        
+        # Store the regular expiry date
+        PENDING_USERS[user_id]['regular_end_date'] = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        PENDING_USERS[user_id]['status'] = 'discount_supreme_expiry'
+        save_pending_users()
+        
+        # Ask for supreme mentorship expiry
+        bot.send_message(
+            user_id, 
+            "📅 When will the *Supreme Mentorship* discount end?\n\nPlease select the duration:",
+            parse_mode="Markdown",
+            reply_markup=create_duration_keyboard()
+        )
+        
+    except ValueError:
+        bot.send_message(user_id, "❌ Invalid date format. Please enter in format YYYY-MM-DD HH:MM:SS")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_supreme_expiry')
+def process_discount_supreme_expiry(message):
+    user_id = message.from_user.id
+    expiry_text = message.text.strip()
+    
+    # Calculate end date based on selection
+    end_date = calculate_end_date(expiry_text)
+    
+    if end_date:
+        # Store the supreme expiry date
+        PENDING_USERS[user_id]['supreme_end_date'] = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        PENDING_USERS[user_id]['status'] = 'discount_regular_limit'
+        save_pending_users()
+        
+        # Ask for regular mentorship user limit
+        bot.send_message(user_id, "👥 How many users can use the *Regular Mentorship* discount? Enter a number, or type 'unlimited' for no limit:", parse_mode="Markdown")
+    elif expiry_text == "Custom date":
+        PENDING_USERS[user_id]['status'] = 'discount_supreme_custom_date'
+        save_pending_users()
+        bot.send_message(user_id, "📅 Please enter the end date for Supreme Membership in format YYYY-MM-DD HH:MM:SS\n\nFor example: 2025-05-15 23:59:59")
+    else:
+        bot.send_message(user_id, "❌ Invalid selection. Please choose from the keyboard or enter 'Custom date'.")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_supreme_custom_date')
+def process_discount_supreme_custom_date(message):
+    user_id = message.from_user.id
+    end_date_str = message.text.strip()
+    
+    try:
+        # Try to parse the date
+        naive_end_date = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S')
+        
+        # Make it timezone-aware in Manila timezone
+        manila_tz = pytz.timezone('Asia/Manila')
+        end_date = manila_tz.localize(naive_end_date)
+        
+        # Check if date is in the future
+        now = datetime.now(manila_tz)
+        if end_date <= now:
+            bot.send_message(user_id, "❌ End date must be in the future. Please try again:")
+            return
+        
+        # Store the supreme expiry date
+        PENDING_USERS[user_id]['supreme_end_date'] = end_date.strftime('%Y-%m-%d %H:%M:%S')
+        PENDING_USERS[user_id]['status'] = 'discount_regular_limit'
+        save_pending_users()
+        
+        # Ask for regular mentorship user limit
+        bot.send_message(user_id, "👥 How many users can use the *Regular Mentorship* discount? Enter a number, or type 'unlimited' for no limit:", parse_mode="Markdown")
+        
+    except ValueError:
+        bot.send_message(user_id, "❌ Invalid date format. Please enter in format YYYY-MM-DD HH:MM:SS")
+
+# Helper function to calculate end date based on duration
+def calculate_end_date(duration_text):
+    now = datetime.now(pytz.timezone('Asia/Manila'))
+    
+    if duration_text == "1 day":
+        return now + timedelta(days=1)
+    elif duration_text == "3 days":
+        return now + timedelta(days=3)
+    elif duration_text == "1 week":
+        return now + timedelta(days=7)
+    elif duration_text == "2 weeks":
+        return now + timedelta(days=14)
+    elif duration_text == "1 month":
+        return now + timedelta(days=30)
+    elif duration_text == "3 months":
+        return now + timedelta(days=90)
+    elif duration_text == "Custom date":
+        return None
+    else:
+        return None
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_regular_limit')
+def process_discount_regular_limit(message):
+    user_id = message.from_user.id
+    limit_text = message.text.strip().lower()
+    
+    # Process the limit input
+    if limit_text == 'unlimited':
+        user_limit = None  # No limit
+    else:
+        try:
+            user_limit = int(limit_text)
+            if user_limit < 1:
+                bot.send_message(user_id, "❌ User limit must be at least 1. Please try again, or type 'unlimited':")
+                return
+        except ValueError:
+            bot.send_message(user_id, "❌ Invalid input. Please enter a number or type 'unlimited':")
+            return
+    
+    # Store the regular user limit
+    PENDING_USERS[user_id]['regular_user_limit'] = user_limit
+    PENDING_USERS[user_id]['status'] = 'discount_supreme_limit'
+    save_pending_users()
+    
+    # Ask for supreme mentorship user limit
+    bot.send_message(user_id, "👥 How many users can use the *Supreme Mentorship* discount? Enter a number, or type 'unlimited' for no limit:", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_supreme_limit')
+def process_discount_supreme_limit(message):
+    user_id = message.from_user.id
+    limit_text = message.text.strip().lower()
+    
+    # Process the limit input
+    if limit_text == 'unlimited':
+        user_limit = None  # No limit
+    else:
+        try:
+            user_limit = int(limit_text)
+            if user_limit < 1:
+                bot.send_message(user_id, "❌ User limit must be at least 1. Please try again, or type 'unlimited':")
+                return
+        except ValueError:
+            bot.send_message(user_id, "❌ Invalid input. Please enter a number or type 'unlimited':")
+            return
+    
+    # Store the supreme user limit
+    PENDING_USERS[user_id]['supreme_user_limit'] = user_limit
+    PENDING_USERS[user_id]['status'] = 'discount_regular_transaction_type'
+    save_pending_users()
+    
+    # Ask for regular mentorship transaction type with a keyboard
+    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add(KeyboardButton("New Purchases Only"))
+    markup.add(KeyboardButton("Renewals Only"))
+    markup.add(KeyboardButton("Both New Purchases & Renewals"))
+    
+    bot.send_message(
+        user_id, 
+        "🛍️ Who can use the *Regular Mentorship* discount?\n\nPlease select which transaction types this discount applies to:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_regular_transaction_type')
+def process_discount_regular_transaction_type(message):
+    user_id = message.from_user.id
+    transaction_type = message.text.strip()
+    
+    # Validate the input
+    valid_types = ["New Purchases Only", "Renewals Only", "Both New Purchases & Renewals"]
+    if transaction_type not in valid_types:
+        bot.send_message(user_id, "❌ Invalid option. Please select from the keyboard.")
+        return
+    
+    # Determine transaction type code
+    if transaction_type == "New Purchases Only":
+        transaction_code = "new"
+    elif transaction_type == "Renewals Only":
+        transaction_code = "renewal"
+    else:  # Both
+        transaction_code = "both"
+    
+    # Store the regular transaction type
+    PENDING_USERS[user_id]['regular_transaction_type'] = transaction_code
+    PENDING_USERS[user_id]['status'] = 'discount_supreme_transaction_type'
+    save_pending_users()
+    
+    # Ask for supreme mentorship transaction type with a keyboard
+    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    markup.add(KeyboardButton("New Purchases Only"))
+    markup.add(KeyboardButton("Renewals Only"))
+    markup.add(KeyboardButton("Both New Purchases & Renewals"))
+    
+    bot.send_message(
+        user_id, 
+        "🛍️ Who can use the *Supreme Mentorship* discount?\n\nPlease select which transaction types this discount applies to:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_supreme_transaction_type')
+def process_discount_supreme_transaction_type(message):
+    user_id = message.from_user.id
+    transaction_type = message.text.strip()
+    
+    # Validate the input
+    valid_types = ["New Purchases Only", "Renewals Only", "Both New Purchases & Renewals"]
+    if transaction_type not in valid_types:
+        bot.send_message(user_id, "❌ Invalid option. Please select from the keyboard.")
+        return
+    
+    # Determine transaction type code
+    if transaction_type == "New Purchases Only":
+        transaction_code = "new"
+    elif transaction_type == "Renewals Only":
+        transaction_code = "renewal"
+    else:  # Both
+        transaction_code = "both"
+    
+    # Store the supreme transaction type
+    PENDING_USERS[user_id]['supreme_transaction_type'] = transaction_code
+    PENDING_USERS[user_id]['status'] = 'discount_custom_message'
+    save_pending_users()
+    
+    # Ask for custom announcement message
+    bot.send_message(
+        user_id, 
+        "📢 *Add Custom Announcement Message* (Optional)\n\n"
+        "Please enter a custom message to include in the discount announcement to all members.\n\n"
+        "This could be additional details, special instructions, or promotional text.\n\n"
+        "Type your message or send 'skip' to use the default announcement format.",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'discount_custom_message')
+def process_discount_custom_message(message):
+    user_id = message.from_user.id
+    custom_message = message.text.strip()
+    
+    # Handle skip option
+    if custom_message.lower() == 'skip':
+        custom_message = ""
+    
+    # Store the custom message
+    PENDING_USERS[user_id]['custom_message'] = custom_message
+    PENDING_USERS[user_id]['status'] = 'discount_finalize'
+    save_pending_users()
+    
+    # Create discount objects for both membership types
+    discount_name = PENDING_USERS[user_id]['discount_name']
+    custom_message = PENDING_USERS[user_id]['custom_message']
+    
+    # Regular Membership Discount
+    regular_discount = {
+        'name': discount_name,
+        'end_date': PENDING_USERS[user_id]['regular_end_date'],
+        'percentage': PENDING_USERS[user_id]['regular_percentage'],
+        'user_limit': PENDING_USERS[user_id]['regular_user_limit'],
+        'transaction_type': PENDING_USERS[user_id]['regular_transaction_type'],
+        'users_used': [],
+        'active': True,
+        'custom_message': custom_message,
+        'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'created_by': user_id
+    }
+    
+    # Supreme Membership Discount
+    supreme_discount = {
+        'name': discount_name,
+        'end_date': PENDING_USERS[user_id]['supreme_end_date'],
+        'percentage': PENDING_USERS[user_id]['supreme_percentage'],
+        'user_limit': PENDING_USERS[user_id]['supreme_user_limit'],
+        'transaction_type': PENDING_USERS[user_id]['supreme_transaction_type'],
+        'users_used': [],
+        'active': True,
+        'custom_message': custom_message,
+        'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'created_by': user_id
+    }
+    
+    # Update global discounts
+    global DISCOUNTS
+    DISCOUNTS['regular'] = regular_discount
+    DISCOUNTS['supreme'] = supreme_discount
+    
+    # Save to database
+    save_discount(regular_discount, 'regular')
+    save_discount(supreme_discount, 'supreme')
+    
+    # Clear user from pending
+    PENDING_USERS.pop(user_id, None)
+    delete_pending_user(user_id)
+    
+    # Remove custom keyboard
+    markup = ReplyKeyboardRemove()
+    
+    # Send confirmation message
+    reg_end_date = datetime.strptime(regular_discount['end_date'], '%Y-%m-%d %H:%M:%S')
+    sup_end_date = datetime.strptime(supreme_discount['end_date'], '%Y-%m-%d %H:%M:%S')
+    
+    reg_limit = "No limit" if regular_discount['user_limit'] is None else f"{regular_discount['user_limit']} users"
+    sup_limit = "No limit" if supreme_discount['user_limit'] is None else f"{supreme_discount['user_limit']} users"
+    
+    # Get transaction type displays
+    reg_type_display = get_transaction_type_display(regular_discount['transaction_type'])
+    sup_type_display = get_transaction_type_display(supreme_discount['transaction_type'])
+    
+    confirmation_message = (
+        f"🎉 *Discount Created Successfully!*\n\n"
+        f"*Discount Name:* {discount_name}\n\n"
+        f"*REGULAR MENTORSHIP*\n"
+        f"• Discount: {regular_discount['percentage']}% off\n"
+        f"• User Limit: {reg_limit}\n"
+        f"• Applies to: {reg_type_display}\n"
+        f"• Ends: {reg_end_date.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"*SUPREME MENTORSHIP*\n"
+        f"• Discount: {supreme_discount['percentage']}% off\n"
+        f"• User Limit: {sup_limit}\n"
+        f"• Applies to: {sup_type_display}\n"
+        f"• Ends: {sup_end_date.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    
+    # Add custom message in the confirmation if provided
+    if custom_message:
+        confirmation_message += f"*Custom Message:*\n\"{custom_message}\"\n\n"
+    
+    confirmation_message += "Both discounts are now active!"
+    
+    bot.send_message(
+        user_id, 
+        confirmation_message,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    notify_discount_created(discount_name, regular_discount, supreme_discount)
+    # Generate announcement message for preview
+    announcement = create_discount_announcement(discount_name, regular_discount, supreme_discount)
+    
+    # Send announcement preview
+    bot.send_message(
+        user_id,
+        f"*Preview of announcement:*\n\n{announcement}",
+        parse_mode="Markdown"
+    )
+    
+    # Automatically announce the discount to the announcement topic
+    try:
+        if ANNOUNCEMENT_TOPIC_ID:
+            sent_msg = bot.send_message(
+                PAID_GROUP_ID,
+                announcement,
+                parse_mode="Markdown",
+                message_thread_id=ANNOUNCEMENT_TOPIC_ID
+            )
+            bot.send_message(
+                user_id, 
+                f"✅ Discount has been automatically announced in the announcements topic!"
+            )
+            logging.info(f"Discount '{discount_name}' announced to announcement topic automatically")
+        else:
+            # If no announcement topic is set, send to main group
+            sent_msg = bot.send_message(
+                PAID_GROUP_ID,
+                announcement,
+                parse_mode="Markdown"
+            )
+            bot.send_message(
+                user_id, 
+                f"✅ Discount has been announced in the main group! (No announcement topic configured)"
+            )
+            logging.info(f"Discount '{discount_name}' announced to main group (no topic configured)")
+    except Exception as e:
+        bot.send_message(
+            user_id,
+            f"❌ Failed to automatically announce the discount: {str(e)}\n\nThe discount is still active, but you'll need to announce it manually."
+        )
+        logging.error(f"Failed to announce discount: {e}")
+    
+    # Notify all admins about the new discount
+    admin_username = "Unknown"
+    try:
+        user_info = bot.get_chat(user_id)
+        admin_username = user_info.username or f"Admin {user_id}"
+    except:
+        pass
+        
+    for admin_id in ADMIN_IDS:
+        if admin_id != user_id:  # Don't notify the admin who created it
+            try:
+                bot.send_message(
+                    admin_id,
+                    f"📝 *New Discount Created*\n\n"
+                    f"@{admin_username} has created a new discount:\n"
+                    f"• Name: {discount_name}\n"
+                    f"• Regular: {regular_discount['percentage']}% off (ends {reg_end_date.strftime('%Y-%m-%d')})\n"
+                    f"• Supreme: {supreme_discount['percentage']}% off (ends {sup_end_date.strftime('%Y-%m-%d')})\n\n"
+                    f"The discount is now active and has been automatically announced.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logging.error(f"Failed to notify admin {admin_id} about new discount: {e}")
+
+# Helper function to create announcement message
+def create_discount_announcement(discount_name, regular_discount, supreme_discount):
+    reg_end_date = datetime.strptime(regular_discount['end_date'], '%Y-%m-%d %H:%M:%S')
+    sup_end_date = datetime.strptime(supreme_discount['end_date'], '%Y-%m-%d %H:%M:%S')
+    
+    reg_limit = "Unlimited" if regular_discount['user_limit'] is None else f"Limited to {regular_discount['user_limit']} users"
+    sup_limit = "Unlimited" if supreme_discount['user_limit'] is None else f"Limited to {supreme_discount['user_limit']} users"
+    
+    # Get transaction type info
+    reg_transaction_info = get_transaction_note(regular_discount['transaction_type'])
+    sup_transaction_info = get_transaction_note(supreme_discount['transaction_type'])
+    
+    # Get custom message (will be the same for both discounts)
+    custom_message = regular_discount.get('custom_message', '')
+    
+    announcement = (
+        f"🔥 *SPECIAL DISCOUNT ALERT!* 🔥\n\n"
+        f"📢 **{discount_name}**\n\n"
+    )
+    
+    # Add custom message if provided
+    if custom_message:
+        announcement += f"{custom_message}\n\n"
+    
+    announcement += (
+        f"*REGULAR MEMBERSHIP PLANS*\n"
+        f"💰 **{regular_discount['percentage']}% OFF** on all regular membership plans!\n"
+        f"⏰ Valid until: {reg_end_date.strftime('%B %d, %Y at %I:%M %p')}\n"
+        f"👥 {reg_limit}\n"
+    )
+    
+    # Add regular transaction info if not "both"
+    if reg_transaction_info:
+        announcement += f"{reg_transaction_info}\n"
+    
+    announcement += (
+        f"\n*SUPREME MEMBERSHIP PLANS*\n"
+        f"💰 **{supreme_discount['percentage']}% OFF** on all supreme membership plans!\n"
+        f"⏰ Valid until: {sup_end_date.strftime('%B %d, %Y at %I:%M %p')}\n"
+        f"👥 {sup_limit}\n"
+    )
+    
+    # Add supreme transaction info if not "both"
+    if sup_transaction_info:
+        announcement += f"{sup_transaction_info}\n"
+    
+    announcement += (
+        f"\n🔸 Regular plans include: Trial, Momentum & Legacy\n"
+        f"🔸 Supreme plans include: Apprentice, Disciple & Lifetime\n\n"
+        f"Act fast! Use the /start command in a private message with the bot to take advantage of this limited-time offer!"
+    )
+    
+    return announcement
+
+# Helper functions for transaction type display
+def get_transaction_type_display(transaction_type):
+    if transaction_type == "new":
+        return "New Purchases Only"
+    elif transaction_type == "renewal":
+        return "Renewals Only"
+    else:
+        return "Both New Purchases & Renewals"
+
+def get_transaction_note(transaction_type):
+    if transaction_type == "new":
+        return "🆕 *Available for new purchases only*"
+    elif transaction_type == "renewal":
+        return "🔄 *Available for membership renewals only*"
+    return ""  # Empty for "both"
+
+# Update the discount expiry check function to handle both discount types
+def check_discount_expiry():
+    """Check if the current discounts have expired and remove them if needed"""
+    global DISCOUNTS
+    
+    for discount_type in ['regular', 'supreme']:
+        discount = DISCOUNTS.get(discount_type)
+        if discount and discount.get('active'):
+            try:
+                # Parse the stored end date (naive datetime)
+                naive_end_date = datetime.strptime(discount.get('end_date'), '%Y-%m-%d %H:%M:%S')
+                
+                # Make it timezone-aware by adding Manila timezone
+                manila_tz = pytz.timezone('Asia/Manila')
+                end_date = manila_tz.localize(naive_end_date)
+                
+                # Compare with current time in Manila timezone
+                now = datetime.now(manila_tz)
+                
+                if now >= end_date:
+                    # Discount has expired
+                    old_discount = discount.copy()
+                    DISCOUNTS[discount_type] = None
+                    save_discount(None, discount_type)
+                    logging.info(f"{discount_type.capitalize()} discount '{old_discount.get('name')}' has expired and has been removed at {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    
+                    # Notify admins about expired discount
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            bot.send_message(admin_id, 
+                                f"🕒 *{discount_type.capitalize()} Discount Expired*\n\n"
+                                f"The '{old_discount.get('name')}' discount ({old_discount.get('percentage')}% off) "
+                                f"for {discount_type.capitalize()} memberships has ended and has been automatically removed.\n\n"
+                                f"Expired at: {end_date.strftime('%Y-%m-%d %I:%M:%S %p')} Manila time",
+                                parse_mode="Markdown"
+                            )
+                        except Exception as e:
+                            logging.error(f"Failed to notify admin {admin_id} about expired discount: {e}")
+            except Exception as e:
+                logging.error(f"Error checking {discount_type} discount expiry: {e}")
+
+def discount_expiry_thread():
+    """Thread to check for expired discounts"""
+    logging.info("Discount expiry check thread started")
+    while True:
+        try:
+            check_discount_expiry()
+            time.sleep(60)  # Check every minute
+        except Exception as e:
+            logging.error(f"Error in discount expiry thread: {e}")
+            time.sleep(60)  # Wait a minute on error before trying again
+
+@bot.message_handler(commands=['export_forms'])
+def export_form_responses(message):
+    """Export onboarding form responses to a professionally formatted Excel file"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    try:
+        # Send processing message with more detail
+        processing_msg = bot.reply_to(message, "📊 *Generating Form Responses Export*\n\nCollecting data and creating beautiful report...", parse_mode="Markdown")
+        
+        # Collect form data from PENDING_USERS and completed forms
+        form_records = []
+        
+        # First check PENDING_USERS for users with form responses
+        for user_id, data in PENDING_USERS.items():
+            if 'form_answers' in data and data['form_answers']:
+                # Get user info
+                try:
+                    user_info = bot.get_chat(user_id)
+                    username = user_info.username or "No Username"
+                    first_name = user_info.first_name or ""
+                    last_name = user_info.last_name or ""
+                except:
+                    username = "Unknown"
+                    first_name = ""
+                    last_name = ""
+                
+                # Get membership type to determine which fields to extract
+                membership_type = data.get('membership_type', 'regular').lower()
+                form_answers = data['form_answers']
+                
+                # Create base record with user info
+                record = {
+                    'user_id': user_id,
+                    'username': username,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'mentorship_type': membership_type,
+                    'form_completion_date': datetime.now().strftime('%Y-%m-%d')
+                }
+                
+                # Add plan info if available
+                if str(user_id) in PAYMENT_DATA:
+                    record['plan'] = PAYMENT_DATA[str(user_id)].get('payment_plan', 'Unknown')
+                else:
+                    record['plan'] = 'Unknown'
+                
+                # Extract form answers based on membership type
+                if membership_type == 'supreme':
+                    # Supreme form fields
+                    record.update({
+                        'full_name': form_answers.get('full_name', 'Not provided'),
+                        'birthday': form_answers.get('birthday', 'Not provided'),
+                        'phone_number': form_answers.get('phone_number', 'Not provided'),
+                        'time_zone': form_answers.get('time_zone', 'Not provided'),
+                        'expertise_level': form_answers.get('expertise_level', 'Not provided'),
+                        'trading_time': form_answers.get('trading_time_commitment', 'Not provided'),
+                        'interest_reason': form_answers.get('interest_reason', 'Not provided'),
+                        'personal_goals': form_answers.get('personal_goals', 'Not provided'),
+                        'call_preference': form_answers.get('call_preference', 'Not provided'),
+                        'challenges': form_answers.get('challenges', 'Not provided')
+                    })
+                else:
+                    # Regular form fields
+                    record.update({
+                        'full_name': form_answers.get('full_name', 'Not provided'),
+                        'age_birth_year': form_answers.get('age_birth_year', 'Not provided'),
+                        'experience_level': form_answers.get('experience_level', 'Not provided'),
+                        'learning_goals': form_answers.get('learning_goals', 'Not provided'),
+                        'source': form_answers.get('source', 'Not provided')
+                    })
+                
+                form_records.append(record)
+        
+        # Now check for any users in PAYMENT_DATA that might have form responses stored
+        for user_id_str, payment_data in PAYMENT_DATA.items():
+            # Check if we already have this user from PENDING_USERS
+            user_id = int(user_id_str)
+            if user_id in [r['user_id'] for r in form_records]:
+                continue
+                
+            # Check if this user has form data stored in their payment record
+            if 'form_answers' in payment_data:
+                # Get user info
+                username = payment_data.get('username', 'No Username')
+                
+                # Get membership type
+                membership_type = payment_data.get('mentorship_type', 'regular').lower()
+                form_answers = payment_data['form_answers']
+                
+                # Create base record
+                record = {
+                    'user_id': user_id,
+                    'username': username,
+                    'first_name': '',  # Not available in payment data
+                    'last_name': '',   # Not available in payment data
+                    'mentorship_type': membership_type,
+                    'plan': payment_data.get('payment_plan', 'Unknown'),
+                    'form_completion_date': payment_data.get('form_completion_date', 'Unknown')
+                }
+                
+                # Extract form answers based on membership type
+                if membership_type == 'supreme':
+                    # Supreme form fields
+                    record.update({
+                        'full_name': form_answers.get('full_name', 'Not provided'),
+                        'birthday': form_answers.get('birthday', 'Not provided'),
+                        'phone_number': form_answers.get('phone_number', 'Not provided'),
+                        'time_zone': form_answers.get('time_zone', 'Not provided'),
+                        'expertise_level': form_answers.get('expertise_level', 'Not provided'),
+                        'trading_time': form_answers.get('trading_time_commitment', 'Not provided'),
+                        'interest_reason': form_answers.get('interest_reason', 'Not provided'),
+                        'personal_goals': form_answers.get('personal_goals', 'Not provided'),
+                        'call_preference': form_answers.get('call_preference', 'Not provided'),
+                        'challenges': form_answers.get('challenges', 'Not provided')
+                    })
+                else:
+                    # Regular form fields
+                    record.update({
+                        'full_name': form_answers.get('full_name', 'Not provided'),
+                        'age_birth_year': form_answers.get('age_birth_year', 'Not provided'),
+                        'experience_level': form_answers.get('experience_level', 'Not provided'),
+                        'learning_goals': form_answers.get('learning_goals', 'Not provided'),
+                        'source': form_answers.get('source', 'Not provided')
+                    })
+                
+                form_records.append(record)
+        
+        # Check if we have data to export
+        if not form_records:
+            bot.edit_message_text("❌ No form responses found to export.", 
+                                 chat_id=message.chat.id, 
+                                 message_id=processing_msg.message_id)
+            return
+        
+        # Create DataFrame for processing
+        df = pd.DataFrame(form_records)
+        
+        # Sort by membership type and username
+        df = df.sort_values(by=['mentorship_type', 'username'])
+        
+        # Update processing message
+        bot.edit_message_text("📊 Creating beautifully formatted Excel workbook...", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # Create workbook
+        wb = Workbook()
+        
+        # Create cover sheet (Dashboard)
+        dashboard = wb.active
+        dashboard.title = "Dashboard"
+        
+        # Define modern color scheme
+        colors = {
+            'primary': '4472C4',      # Modern blue
+            'secondary': '5B9BD5',     # Lighter blue
+            'accent1': '70AD47',      # Green
+            'accent2': 'ED7D31',      # Orange
+            'accent3': 'FFC000',      # Yellow
+            'light_bg': 'F2F2F2',     # Light gray
+            'dark_text': '262626',    # Dark gray
+            'header_bg': '203864',    # Dark blue
+            'alt_row': 'E6F0FF'       # Very light blue
+        }
+        
+        # ---- DASHBOARD SHEET ----
+        
+        # Add logo placeholder and title
+        dashboard.merge_cells('A1:H1')
+        title_cell = dashboard['A1']
+        title_cell.value = "PRODIGY TRADING ACADEMY"
+        title_cell.font = Font(size=28, bold=True, color=colors['dark_text'], name='Calibri')
+        title_cell.alignment = Alignment(horizontal='center', vertical='center')
+        dashboard.row_dimensions[1].height = 45
+        
+        # Add subtitle
+        dashboard.merge_cells('A2:H2')
+        subtitle_cell = dashboard['A2']
+        subtitle_cell.value = "Member Onboarding Form Responses"
+        subtitle_cell.font = Font(size=16, italic=True, color=colors['dark_text'], name='Calibri')
+        subtitle_cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Add export date
+        dashboard.merge_cells('A3:H3')
+        date_cell = dashboard['A3']
+        date_cell.value = f"Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
+        date_cell.font = Font(size=12, color=colors['dark_text'], name='Calibri')
+        date_cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Add some space
+        dashboard.row_dimensions[4].height = 20
+        
+        # Calculate summary statistics
+        regular_members = len([r for r in form_records if r.get('mentorship_type') == 'regular'])
+        supreme_members = len([r for r in form_records if r.get('mentorship_type') == 'supreme'])
+        total_members = len(form_records)
+        
+        experience_levels = Counter([r.get('expertise_level', '').split('.')[0].strip() if r.get('expertise_level') else '' 
+                                   for r in form_records])
+        
+        # Add summary section header
+        dashboard.merge_cells('B5:G5')
+        summary_header = dashboard['B5']
+        summary_header.value = "MEMBERSHIP SUMMARY"
+        summary_header.font = Font(size=14, bold=True, color="FFFFFF", name='Calibri')
+        summary_header.alignment = Alignment(horizontal='center', vertical='center')
+        summary_header.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+        
+        # Add key statistics in a modern card layout
+        stats = [
+            ["Total Members", total_members, colors['primary']],
+            ["Regular Members", regular_members, colors['secondary']],
+            ["Supreme Members", supreme_members, colors['accent1']]
+        ]
+        
+        # Create stat cards
+        for i, (label, value, color) in enumerate(stats):
+            col = chr(ord('B') + i*2)  # B, D, F
+            
+            # Merge cells for each stat card
+            dashboard.merge_cells(f'{col}6:{chr(ord(col)+1)}7')
+            dashboard.merge_cells(f'{col}8:{chr(ord(col)+1)}9')
+            
+            # Add label
+            label_cell = dashboard[f'{col}6']
+            label_cell.value = label
+            label_cell.font = Font(size=12, color="FFFFFF", name='Calibri')
+            label_cell.alignment = Alignment(horizontal='center', vertical='center')
+            label_cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+            
+            # Add value
+            value_cell = dashboard[f'{col}8']
+            value_cell.value = value
+            value_cell.font = Font(size=24, bold=True, color=colors['dark_text'], name='Calibri')
+            value_cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Add border to value cell
+            thin_border = Border(
+                left=Side(style='thin', color=color),
+                right=Side(style='thin', color=color),
+                top=Side(style='thin', color=color),
+                bottom=Side(style='thin', color=color)
+            )
+            value_cell.border = thin_border
+        
+        # Add some space
+        dashboard.row_dimensions[10].height = 30
+        
+        # Add navigation section
+        dashboard.merge_cells('B11:G11')
+        nav_header = dashboard['B11']
+        nav_header.value = "NAVIGATION"
+        nav_header.font = Font(size=14, bold=True, color="FFFFFF", name='Calibri')
+        nav_header.alignment = Alignment(horizontal='center', vertical='center')
+        nav_header.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+        
+        # Add sheet links (note: these aren't actual hyperlinks but act as a visual guide)
+        nav_items = [
+            ["Regular Members", "View detailed information for all regular members"],
+            ["Supreme Members", "View detailed information for all supreme members"]
+        ]
+        
+        for i, (name, desc) in enumerate(nav_items):
+            row = 12 + i
+            
+            # Sheet name
+            cell_b = dashboard[f'B{row}']
+            cell_b.value = name
+            cell_b.font = Font(size=12, bold=True, color=colors['primary'], underline="single", name='Calibri')
+            
+            # Description
+            dashboard.merge_cells(f'C{row}:G{row}')
+            cell_c = dashboard[f'C{row}']
+            cell_c.value = desc
+            cell_c.font = Font(size=11, color=colors['dark_text'], name='Calibri')
+        
+        # Add some space and copyright/footer
+        dashboard.row_dimensions[15].height = 30
+        
+        dashboard.merge_cells('B16:G16')
+        footer = dashboard['B16']
+        footer.value = "Confidential - For Administrative Use Only"
+        footer.font = Font(size=10, italic=True, color=colors['dark_text'], name='Calibri')
+        footer.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Set column widths for dashboard
+        for col in ['A', 'H']:
+            dashboard.column_dimensions[col].width = 2  # Margin columns
+        
+        for col in ['B', 'C', 'D', 'E', 'F', 'G']:
+            dashboard.column_dimensions[col].width = 15
+        
+        # ---- REGULAR MEMBERS SHEET ----
+        ws_regular = wb.create_sheet(title="Regular Members")
+        
+        # Regular membership headers
+        regular_headers = [
+            'User ID', 'Username', 'Full Name', 'Age/Birth Year', 
+            'Experience Level', 'Learning Goals', 'Found Us Via',
+            'Membership Plan', 'Completion Date'
+        ]
+        
+        # Add table header for regular sheet
+        for col_idx, header in enumerate(regular_headers, 1):
+            cell = ws_regular.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF", size=12, name='Calibri')
+            cell.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = Border(
+                bottom=Side(border_style="medium", color="FFFFFF")
+            )
+        
+        # Make the header row taller
+        ws_regular.row_dimensions[1].height = 30
+            
+        # ---- SUPREME MEMBERS SHEET ----
+        ws_supreme = wb.create_sheet(title="Supreme Members")
+        
+        # Supreme membership headers
+        supreme_headers = [
+            'User ID', 'Username', 'Full Name', 'Birthday', 'Phone Number',
+            'Time Zone', 'Expertise Level', 'Trading Time', 'Interest Reason',
+            'Personal Goals', 'Call Preference', 'Challenges', 
+            'Membership Plan', 'Completion Date'
+        ]
+        
+        # Add table header for supreme sheet with the same styling
+        for col_idx, header in enumerate(supreme_headers, 1):
+            cell = ws_supreme.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF", size=12, name='Calibri')
+            cell.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = Border(
+                bottom=Side(border_style="medium", color="FFFFFF")
+            )
+        
+        # Make the header row taller
+        ws_supreme.row_dimensions[1].height = 30
+        
+        # Split data by membership type and add to appropriate sheet
+        regular_row = 2
+        supreme_row = 2
+        
+        # Update processing message
+        bot.edit_message_text("📊 Populating data with modern formatting...", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        for record in form_records:
+            if record.get('mentorship_type') == 'supreme':
+                # Add to supreme sheet
+                ws_supreme.cell(row=supreme_row, column=1, value=record.get('user_id'))
+                ws_supreme.cell(row=supreme_row, column=2, value=record.get('username'))
+                ws_supreme.cell(row=supreme_row, column=3, value=record.get('full_name'))
+                ws_supreme.cell(row=supreme_row, column=4, value=record.get('birthday'))
+                ws_supreme.cell(row=supreme_row, column=5, value=record.get('phone_number'))
+                ws_supreme.cell(row=supreme_row, column=6, value=record.get('time_zone'))
+                ws_supreme.cell(row=supreme_row, column=7, value=record.get('expertise_level'))
+                ws_supreme.cell(row=supreme_row, column=8, value=record.get('trading_time'))
+                ws_supreme.cell(row=supreme_row, column=9, value=record.get('interest_reason'))
+                ws_supreme.cell(row=supreme_row, column=10, value=record.get('personal_goals'))
+                ws_supreme.cell(row=supreme_row, column=11, value=record.get('call_preference'))
+                ws_supreme.cell(row=supreme_row, column=12, value=record.get('challenges'))
+                ws_supreme.cell(row=supreme_row, column=13, value=record.get('plan'))
+                ws_supreme.cell(row=supreme_row, column=14, value=record.get('form_completion_date'))
+                
+                # Apply alternating row colors with modern styling
+                if supreme_row % 2 == 0:
+                    for col in range(1, 15):
+                        cell = ws_supreme.cell(row=supreme_row, column=col)
+                        cell.fill = PatternFill(start_color=colors['alt_row'], end_color=colors['alt_row'], fill_type="solid")
+                        # Add light border
+                        cell.border = Border(
+                            bottom=Side(border_style="thin", color="D3D3D3")
+                        )
+                else:
+                    # Add just the bottom border to odd rows
+                    for col in range(1, 15):
+                        cell = ws_supreme.cell(row=supreme_row, column=col)
+                        cell.border = Border(
+                            bottom=Side(border_style="thin", color="D3D3D3")
+                        )
+                
+                supreme_row += 1
+            else:
+                # Add to regular sheet
+                ws_regular.cell(row=regular_row, column=1, value=record.get('user_id'))
+                ws_regular.cell(row=regular_row, column=2, value=record.get('username'))
+                ws_regular.cell(row=regular_row, column=3, value=record.get('full_name'))
+                ws_regular.cell(row=regular_row, column=4, value=record.get('age_birth_year'))
+                ws_regular.cell(row=regular_row, column=5, value=record.get('experience_level'))
+                ws_regular.cell(row=regular_row, column=6, value=record.get('learning_goals'))
+                ws_regular.cell(row=regular_row, column=7, value=record.get('source'))
+                ws_regular.cell(row=regular_row, column=8, value=record.get('plan'))
+                ws_regular.cell(row=regular_row, column=9, value=record.get('form_completion_date'))
+                
+                # Apply alternating row colors with modern styling
+                if regular_row % 2 == 0:
+                    for col in range(1, 10):
+                        cell = ws_regular.cell(row=regular_row, column=col)
+                        cell.fill = PatternFill(start_color=colors['alt_row'], end_color=colors['alt_row'], fill_type="solid")
+                        # Add light border
+                        cell.border = Border(
+                            bottom=Side(border_style="thin", color="D3D3D3")
+                        )
+                else:
+                    # Add just the bottom border to odd rows
+                    for col in range(1, 10):
+                        cell = ws_regular.cell(row=regular_row, column=col)
+                        cell.border = Border(
+                            bottom=Side(border_style="thin", color="D3D3D3")
+                        )
+                
+                regular_row += 1
+        
+        # Auto-adjust column widths for regular sheet
+        for col in ws_regular.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+            adjusted_width = (max_length + 3) if max_length < 50 else 50
+            ws_regular.column_dimensions[column].width = adjusted_width
+            
+        # Auto-adjust column widths for supreme sheet
+        for col in ws_supreme.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+            adjusted_width = (max_length + 3) if max_length < 50 else 50
+            ws_supreme.column_dimensions[column].width = adjusted_width
+        
+        # Add table totals row for each sheet
+        # Regular sheet
+        total_row = regular_row
+        ws_regular.cell(row=total_row, column=1, value="TOTAL")
+        ws_regular.cell(row=total_row, column=2, value=f"{regular_row - 2} members")
+        ws_regular.merge_cells(f'A{total_row}:B{total_row}')
+        
+        for col in range(1, 10):
+            cell = ws_regular.cell(row=total_row, column=col)
+            cell.font = Font(bold=True, color=colors['dark_text'])
+            cell.fill = PatternFill(start_color=colors['secondary'], end_color=colors['secondary'], fill_type="solid")
+        
+        # Supreme sheet
+        total_row = supreme_row
+        ws_supreme.cell(row=total_row, column=1, value="TOTAL")
+        ws_supreme.cell(row=total_row, column=2, value=f"{supreme_row - 2} members")
+        ws_supreme.merge_cells(f'A{total_row}:B{total_row}')
+        
+        for col in range(1, 15):
+            cell = ws_supreme.cell(row=total_row, column=col)
+            cell.font = Font(bold=True, color=colors['dark_text'])
+            cell.fill = PatternFill(start_color=colors['secondary'], end_color=colors['secondary'], fill_type="solid")
+        
+        # Update processing message
+        bot.edit_message_text("📊 Finalizing export with professional formatting...", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # Freeze panes to keep headers visible on scroll
+        ws_regular.freeze_panes = "A2"
+        ws_supreme.freeze_panes = "A2"
+        
+        # Save to BytesIO
+        excel_bytes = io.BytesIO()
+        wb.save(excel_bytes)
+        excel_bytes.seek(0)
+        
+        # Prepare for sending with more descriptive filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        excel_bytes.name = f"PTA_Member_Forms_{timestamp}.xlsx"
+        
+        # Edit processing message to show success
+        bot.edit_message_text("✅ Modern export generated successfully!", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # Generate stats for the caption
+        regular_count = regular_row - 2
+        supreme_count = supreme_row - 2
+        total_count = regular_count + supreme_count
+        
+        # Send Excel file as document with more professional caption
+        bot.send_document(
+            message.chat.id, 
+            excel_bytes, 
+            caption=f"📊 *Member Form Responses Export*\n\n• *Total Members:* {total_count}\n• *Regular Members:* {regular_count}\n• *Supreme Members:* {supreme_count}\n\nExported on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}",
+            parse_mode="Markdown"
+        )
+        
+        # Log the export activity
+        admin_username = message.from_user.username or f"Admin {message.from_user.id}"
+        logging.info(f"Form responses exported by {admin_username} ({message.from_user.id})")
+        
+        # Also notify all other admins for transparency
+        for admin_id in ADMIN_IDS:
+            if admin_id != message.from_user.id:  # Don't send to the admin who requested it
+                try:
+                    bot.send_message(
+                        admin_id, 
+                        f"📊 *Form Data Export*\n\n"
+                        f"@{admin_username} has exported member form responses containing data for {total_count} members.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to notify admin {admin_id} about form data export: {e}")
+        
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error generating export: {str(e)}", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        logging.error(f"Error in export_form_responses: {e}")
+
+@bot.message_handler(commands=['enrollment'])
+def handle_enrollment_command(message):
+    """Toggle enrollment status (admin only)"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Create a keyboard with enrollment options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🟢 Open Enrollment", callback_data="enrollment_open"),
+        InlineKeyboardButton("🔴 Close Enrollment", callback_data="enrollment_close")
+    )
+    
+    # Get current status
+    enrollment_open = BOT_SETTINGS.get('enrollment_open', False)  # Default to open
+    current_status = "🟢 OPEN" if enrollment_open else "🔴 CLOSED"
+    
+    bot.reply_to(
+        message,
+        f"🔄 *ENROLLMENT STATUS CONTROL*\n\n"
+        f"Current Status: *{current_status}*\n\n"
+        f"Select an option to change the status:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+# Update this in the handle_enrollment_callback function
+@bot.callback_query_handler(func=lambda call: call.data.startswith("enrollment_"))
+def handle_enrollment_callback(call):
+    """Handle enrollment status change callbacks"""
+    global BOT_SETTINGS
+    
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Handle the different options
+    if call.data == "enrollment_open":
+        # Open enrollment
+        BOT_SETTINGS['enrollment_open'] = True
+        save_settings(BOT_SETTINGS)
+        
+        # Update the message
+        bot.edit_message_text(
+            "✅ *Enrollment Status Updated*\n\n"
+            "Enrollment is now *🟢 OPEN*\n\n"
+            "New users can now purchase memberships.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "Enrollment is now OPEN")
+        
+        # Log the action
+        admin_username = call.from_user.username or f"Admin {call.from_user.id}"
+        logging.info(f"Enrollment opened by {admin_username}")
+        
+        # Notify other admins
+        for admin_id in ADMIN_IDS:
+            if admin_id != call.from_user.id:  # Don't send to the admin who performed the action
+                bot.send_message(
+                    admin_id,
+                    f"ℹ️ *Enrollment Status Changed*\n\n"
+                    f"@{safe_markdown_escape(admin_username)} has *OPENED* enrollment.\n\n"
+                    f"New users can now purchase memberships.",
+                    parse_mode="Markdown"
+                )
+        
+        # Notify subscribers about the enrollment opening
+        notify_enrollment_change(True)
+        
+    elif call.data == "enrollment_close":
+        # Close enrollment
+        BOT_SETTINGS['enrollment_open'] = False
+        save_settings(BOT_SETTINGS)
+        
+        # Update the message
+        bot.edit_message_text(
+            "✅ *Enrollment Status Updated*\n\n"
+            "Enrollment is now *🔴 CLOSED*\n\n"
+            "Only existing members can renew their memberships.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "Enrollment is now CLOSED")
+        
+        # Log the action
+        admin_username = call.from_user.username or f"Admin {call.from_user.id}"
+        logging.info(f"Enrollment closed by {admin_username}")
+        
+        # Notify other admins
+        for admin_id in ADMIN_IDS:
+            if admin_id != call.from_user.id:  # Don't send to the admin who performed the action
+                bot.send_message(
+                    admin_id,
+                    f"ℹ️ *Enrollment Status Changed*\n\n"
+                    f"@{safe_markdown_escape(admin_username)} has *CLOSED* enrollment.\n\n"
+                    f"Only existing members can renew their memberships.",
+                    parse_mode="Markdown"
+                )
+                
+        # Notify subscribers about the enrollment closing
+        notify_enrollment_change(False)
+
+@bot.message_handler(commands=['export_payments'])
+def export_payment_data(message):
+    """Export payment data to a professionally formatted Excel file"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    try:
+        # Send processing message
+        processing_msg = bot.reply_to(message, "📊 *Generating Payment Data Export*\n\nCollecting payment records and creating report...", parse_mode="Markdown")
+        
+        # ADDED: Refresh payment data from MongoDB before checking
+        global PAYMENT_DATA
+        PAYMENT_DATA = load_payment_data()
+        
+        # Check if there's any payment data to export
+        if not PAYMENT_DATA:
+            bot.edit_message_text("❌ No payment records found to export.", 
+                                 chat_id=message.chat.id, 
+                                 message_id=processing_msg.message_id)
+            return
+        
+        # Collect payment records into a list of dictionaries
+        payment_records = []
+        
+        for user_id_str, data in PAYMENT_DATA.items():
+            # Get user info for display
+            username = data.get('username', 'No Username')
+            
+            # Calculate payment status
+            has_paid = data.get('haspayed', False)
+            cancelled = data.get('cancelled', False)
+            
+            if has_paid and cancelled:
+                status = "Cancelled (Active)"
+            elif has_paid:
+                status = "Active"
+            elif cancelled:
+                status = "Cancelled"
+            else:
+                status = "Inactive"
+            
+            # Calculate days remaining in subscription
+            days_remaining = None
+            expiry_date = None
+            
+            if 'due_date' in data:
+                try:
+                    due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                    current_date = datetime.now()
+                    days_remaining = (due_date - current_date).days
+                    expiry_date = due_date.strftime('%Y-%m-%d')
+                except Exception:
+                    expiry_date = data['due_date']
+            
+            # Calculate lifetime value (never expires)
+            is_lifetime = False
+            if data.get('payment_plan') == 'Legacy' and data.get('mentorship_type', '').lower() == 'supreme':
+                is_lifetime = True
+            
+            # Create the record
+            record = {
+                'user_id': user_id_str,
+                'username': username,
+                'status': status,
+                'plan': data.get('payment_plan', 'Unknown'),
+                'mentorship_type': data.get('mentorship_type', 'Unknown'),
+                'payment_method': data.get('payment_mode', 'Unknown'),
+                'expiry_date': "Lifetime" if is_lifetime else expiry_date,
+                'days_remaining': "∞" if is_lifetime else days_remaining,
+                'terms_accepted': data.get('terms_accepted', False),
+                'privacy_accepted': data.get('privacy_accepted', False),
+                'signup_date': data.get('signup_date', 'Unknown'),
+                'last_renewal': data.get('last_renewal_date', 'Unknown'),
+                'cancelled_date': data.get('cancellation_date', 'N/A') if cancelled else 'N/A',
+                'has_form_data': 'form_answers' in data
+            }
+            
+            payment_records.append(record)
+        
+        # Sort records by status and expiry date
+        sorted_records = sorted(payment_records, key=lambda x: (0 if x['status'] == 'Active' else 1, 
+                                                             x['expiry_date'] if x['expiry_date'] != 'Lifetime' else '9999-12-31'))
+        
+        # Create DataFrame for processing
+        df = pd.DataFrame(sorted_records)
+        
+        # Update processing message
+        bot.edit_message_text("📊 Creating beautifully formatted Excel workbook...", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # Create workbook
+        wb = Workbook()
+        
+        # Create cover sheet (Dashboard)
+        dashboard = wb.active
+        dashboard.title = "Dashboard"
+        
+        # Define modern color scheme
+        colors = {
+            'primary': '4472C4',      # Modern blue
+            'secondary': '5B9BD5',     # Lighter blue
+            'accent1': '70AD47',      # Green
+            'accent2': 'ED7D31',      # Orange
+            'accent3': 'FFC000',      # Yellow
+            'red': 'FF0000',          # Red for expired
+            'light_bg': 'F2F2F2',     # Light gray
+            'dark_text': '262626',    # Dark gray
+            'header_bg': '203864',    # Dark blue
+            'alt_row': 'E6F0FF'       # Very light blue
+        }
+        
+        # ---- DASHBOARD SHEET ----
+        
+        # Add title
+        dashboard.merge_cells('A1:H1')
+        title_cell = dashboard['A1']
+        title_cell.value = "PRODIGY TRADING ACADEMY"
+        title_cell.font = Font(size=28, bold=True, color=colors['dark_text'], name='Calibri')
+        title_cell.alignment = Alignment(horizontal='center', vertical='center')
+        dashboard.row_dimensions[1].height = 45
+        
+        # Add subtitle
+        dashboard.merge_cells('A2:H2')
+        subtitle_cell = dashboard['A2']
+        subtitle_cell.value = "Member Payment Records"
+        subtitle_cell.font = Font(size=16, italic=True, color=colors['dark_text'], name='Calibri')
+        subtitle_cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Add export date
+        dashboard.merge_cells('A3:H3')
+        date_cell = dashboard['A3']
+        date_cell.value = f"Generated on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
+        date_cell.font = Font(size=12, color=colors['dark_text'], name='Calibri')
+        date_cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Add some space
+        dashboard.row_dimensions[4].height = 20
+        
+        # Calculate key metrics
+        active_members = len([r for r in payment_records if r['status'] == 'Active'])
+        cancelled_members = len([r for r in payment_records if 'Cancelled' in r['status']])
+        inactive_members = len([r for r in payment_records if r['status'] == 'Inactive'])
+        regular_members = len([r for r in payment_records if r['mentorship_type'].lower() == 'regular' and r['status'] == 'Active'])
+        supreme_members = len([r for r in payment_records if r['mentorship_type'].lower() == 'supreme' and r['status'] == 'Active'])
+        lifetime_members = len([r for r in payment_records if r['expiry_date'] == 'Lifetime' and r['status'] == 'Active'])
+        
+        # Add expiring soon count (within 7 days but still active)
+        expiring_soon = len([r for r in payment_records if r['status'] == 'Active' and 
+                             isinstance(r['days_remaining'], int) and
+                             0 <= r['days_remaining'] <= 7])
+        
+        # Add expired count (negative days remaining)
+        expired = len([r for r in payment_records if isinstance(r['days_remaining'], int) and r['days_remaining'] < 0])
+        
+        # Add summary section header
+        dashboard.merge_cells('B5:G5')
+        summary_header = dashboard['B5']
+        summary_header.value = "MEMBERSHIP SUMMARY"
+        summary_header.font = Font(size=14, bold=True, color="FFFFFF", name='Calibri')
+        summary_header.alignment = Alignment(horizontal='center', vertical='center')
+        summary_header.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+        
+        # Add key statistics in a modern card layout - first row
+        stats_row1 = [
+            ["Total Members", len(payment_records), colors['primary']],
+            ["Active Members", active_members, colors['accent1']],
+            ["Inactive Members", inactive_members, colors['secondary']]
+        ]
+        
+        # Create stat cards - first row
+        for i, (label, value, color) in enumerate(stats_row1):
+            col = chr(ord('B') + i*2)  # B, D, F
+            
+            # Merge cells for each stat card
+            dashboard.merge_cells(f'{col}6:{chr(ord(col)+1)}7')
+            dashboard.merge_cells(f'{col}8:{chr(ord(col)+1)}9')
+            
+            # Add label
+            label_cell = dashboard[f'{col}6']
+            label_cell.value = label
+            label_cell.font = Font(size=12, color="FFFFFF", name='Calibri')
+            label_cell.alignment = Alignment(horizontal='center', vertical='center')
+            label_cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+            
+            # Add value
+            value_cell = dashboard[f'{col}8']
+            value_cell.value = value
+            value_cell.font = Font(size=24, bold=True, color=colors['dark_text'], name='Calibri')
+            value_cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Add border to value cell
+            thin_border = Border(
+                left=Side(style='thin', color=color),
+                right=Side(style='thin', color=color),
+                top=Side(style='thin', color=color),
+                bottom=Side(style='thin', color=color)
+            )
+            value_cell.border = thin_border
+        
+        # Second row of stats
+        stats_row2 = [
+            ["Lifetime Members", lifetime_members, colors['accent3']],
+            ["Expiring Soon", expiring_soon, colors['accent2']],
+            ["Expired", expired, colors['red']]
+        ]
+        
+        # Create stat cards - second row
+        for i, (label, value, color) in enumerate(stats_row2):
+            col = chr(ord('B') + i*2)  # B, D, F
+            row_offset = 5  # Move down 5 rows from first set of cards
+            
+            # Merge cells for each stat card
+            dashboard.merge_cells(f'{col}{6+row_offset}:{chr(ord(col)+1)}{7+row_offset}')
+            dashboard.merge_cells(f'{col}{8+row_offset}:{chr(ord(col)+1)}{9+row_offset}')
+            
+            # Add label
+            label_cell = dashboard[f'{col}{6+row_offset}']
+            label_cell.value = label
+            label_cell.font = Font(size=12, color="FFFFFF", name='Calibri')
+            label_cell.alignment = Alignment(horizontal='center', vertical='center')
+            label_cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+            
+            # Add value
+            value_cell = dashboard[f'{col}{8+row_offset}']
+            value_cell.value = value
+            value_cell.font = Font(size=24, bold=True, color=colors['dark_text'], name='Calibri')
+            value_cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Add border to value cell
+            thin_border = Border(
+                left=Side(style='thin', color=color),
+                right=Side(style='thin', color=color),
+                top=Side(style='thin', color=color),
+                bottom=Side(style='thin', color=color)
+            )
+            value_cell.border = thin_border
+        
+        # Add third row with additional stats (membership types)
+        membership_stats = [
+            ["Regular Members", regular_members, colors['secondary']],
+            ["Supreme Members", supreme_members, colors['primary']],
+            ["Cancelled", cancelled_members, colors['accent2']]
+        ]
+        
+        # Create stat cards - third row
+        for i, (label, value, color) in enumerate(membership_stats):
+            col = chr(ord('B') + i*2)  # B, D, F
+            row_offset = 10  # Move down 10 rows from first set of cards
+            
+            # Merge cells for each stat card
+            dashboard.merge_cells(f'{col}{6+row_offset}:{chr(ord(col)+1)}{7+row_offset}')
+            dashboard.merge_cells(f'{col}{8+row_offset}:{chr(ord(col)+1)}{9+row_offset}')
+            
+            # Add label
+            label_cell = dashboard[f'{col}{6+row_offset}']
+            label_cell.value = label
+            label_cell.font = Font(size=12, color="FFFFFF", name='Calibri')
+            label_cell.alignment = Alignment(horizontal='center', vertical='center')
+            label_cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+            
+            # Add value
+            value_cell = dashboard[f'{col}{8+row_offset}']
+            value_cell.value = value
+            value_cell.font = Font(size=24, bold=True, color=colors['dark_text'], name='Calibri')
+            value_cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Add border to value cell
+            thin_border = Border(
+                left=Side(style='thin', color=color),
+                right=Side(style='thin', color=color),
+                top=Side(style='thin', color=color),
+                bottom=Side(style='thin', color=color)
+            )
+            value_cell.border = thin_border
+        
+        # Add navigation section
+        row_pos = 27  # Position after the third row of stat cards
+        dashboard.merge_cells(f'B{row_pos}:G{row_pos}')
+        nav_header = dashboard[f'B{row_pos}']
+        nav_header.value = "PAYMENT RECORDS"
+        nav_header.font = Font(size=14, bold=True, color="FFFFFF", name='Calibri')
+        nav_header.alignment = Alignment(horizontal='center', vertical='center')
+        nav_header.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+        
+        # Add footer
+        dashboard.merge_cells(f'B{row_pos+4}:G{row_pos+4}')
+        footer = dashboard[f'B{row_pos+4}']
+        footer.value = "Confidential - For Administrative Use Only"
+        footer.font = Font(size=10, italic=True, color=colors['dark_text'], name='Calibri')
+        footer.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Set column widths for dashboard
+        for col in ['A', 'H']:
+            dashboard.column_dimensions[col].width = 2  # Margin columns
+        
+        for col in ['B', 'C', 'D', 'E', 'F', 'G']:
+            dashboard.column_dimensions[col].width = 15
+        
+        # Update processing message
+        bot.edit_message_text("📊 Creating payment records sheet...", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # ---- PAYMENT RECORDS SHEET ----
+        payment_sheet = wb.create_sheet(title="Payment Records")
+        
+        # Payment records headers
+        headers = [
+            'User ID', 'Username', 'Status', 'Type', 'Plan', 'Payment Method',
+            'Expiry Date', 'Days Remaining', 'Signup Date', 'Last Renewal', 'Cancellation Date'
+        ]
+        
+        # Add table header with stylish formatting
+        for col_idx, header in enumerate(headers, 1):
+            cell = payment_sheet.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF", size=12, name='Calibri')
+            cell.fill = PatternFill(start_color=colors['header_bg'], end_color=colors['header_bg'], fill_type="solid")
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = Border(
+                bottom=Side(border_style="medium", color="FFFFFF")
+            )
+        
+        # Make the header row taller
+        payment_sheet.row_dimensions[1].height = 30
+        
+        # Populate the payment records with data
+        for row_idx, record in enumerate(sorted_records, 2):
+            payment_sheet.cell(row=row_idx, column=1, value=record['user_id'])
+            payment_sheet.cell(row=row_idx, column=2, value=record['username'])
+            payment_sheet.cell(row=row_idx, column=3, value=record['status'])
+            payment_sheet.cell(row=row_idx, column=4, value=record['mentorship_type'])
+            payment_sheet.cell(row=row_idx, column=5, value=record['plan'])
+            payment_sheet.cell(row=row_idx, column=6, value=record['payment_method'])
+            payment_sheet.cell(row=row_idx, column=7, value=record['expiry_date'])
+            
+            # Format days remaining column
+            days_cell = payment_sheet.cell(row=row_idx, column=8)
+            if record['days_remaining'] == "∞":
+                days_cell.value = "∞"
+            else:
+                days_cell.value = record['days_remaining']
+                # Color code based on days remaining
+                if isinstance(record['days_remaining'], int):
+                    if record['days_remaining'] < 0:
+                        days_cell.font = Font(color="FF0000", bold=True)  # Red for expired
+                    elif record['days_remaining'] <= 7:
+                        days_cell.font = Font(color="FF9900", bold=True)  # Orange for expiring soon
+            
+            payment_sheet.cell(row=row_idx, column=9, value=record['signup_date'])
+            payment_sheet.cell(row=row_idx, column=10, value=record['last_renewal'])
+            payment_sheet.cell(row=row_idx, column=11, value=record['cancelled_date'])
+            
+            # Apply alternating row colors
+            if row_idx % 2 == 0:
+                for col in range(1, len(headers) + 1):
+                    cell = payment_sheet.cell(row=row_idx, column=col)
+                    cell.fill = PatternFill(start_color=colors['alt_row'], end_color=colors['alt_row'], fill_type="solid")
+                    cell.border = Border(bottom=Side(border_style="thin", color="D3D3D3"))
+            else:
+                for col in range(1, len(headers) + 1):
+                    cell = payment_sheet.cell(row=row_idx, column=col)
+                    cell.border = Border(bottom=Side(border_style="thin", color="D3D3D3"))
+        
+        # Add table totals row
+        totals_row = len(sorted_records) + 2
+        payment_sheet.cell(row=totals_row, column=1, value="TOTAL")
+        payment_sheet.cell(row=totals_row, column=2, value=f"{len(sorted_records)} members")
+        payment_sheet.merge_cells(f'A{totals_row}:B{totals_row}')
+        
+        for col in range(1, len(headers) + 1):
+            cell = payment_sheet.cell(row=totals_row, column=col)
+            cell.font = Font(bold=True, color=colors['dark_text'])
+            cell.fill = PatternFill(start_color=colors['secondary'], end_color=colors['secondary'], fill_type="solid")
+        
+        # Auto-adjust column widths
+        for col in payment_sheet.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+            adjusted_width = (max_length + 3) if max_length < 50 else 50
+            payment_sheet.column_dimensions[column].width = adjusted_width
+        
+        # Freeze panes to keep headers visible on scroll
+        payment_sheet.freeze_panes = "A2"
+        
+        # Update processing message
+        bot.edit_message_text("📊 Finalizing export with professional formatting...", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # Save to BytesIO
+        excel_bytes = io.BytesIO()
+        wb.save(excel_bytes)
+        excel_bytes.seek(0)
+        
+        # Prepare for sending with descriptive filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        excel_bytes.name = f"PTA_Payment_Records_{timestamp}.xlsx"
+        
+        # Edit processing message to show success
+        bot.edit_message_text("✅ Payment records export generated successfully!", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        
+        # Send Excel file as document with professional caption
+        bot.send_document(
+            message.chat.id, 
+            excel_bytes, 
+            caption=f"📊 *Payment Records Export*\n\n• *Total Records:* {len(payment_records)}\n• *Active Members:* {active_members}\n• *Expiring Soon:* {expiring_soon}\n\nExported on {datetime.now().strftime('%B %d, %Y at %I:%M %p')}",
+            parse_mode="Markdown"
+        )
+        
+        # Log the export activity
+        admin_username = message.from_user.username or f"Admin {message.from_user.id}"
+        logging.info(f"Payment records exported by {admin_username} ({message.from_user.id})")
+        
+        # Also notify all other admins for transparency
+        for admin_id in ADMIN_IDS:
+            if admin_id != message.from_user.id:  # Don't send to the admin who requested it
+                try:
+                    bot.send_message(
+                        admin_id, 
+                        f"📊 *Payment Records Export*\n\n"
+                        f"@{admin_username} has exported payment records containing data for {len(payment_records)} members.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to notify admin {admin_id} about payment export: {e}")
+        
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error generating payment export: {str(e)}", 
+                             chat_id=message.chat.id, 
+                             message_id=processing_msg.message_id)
+        logging.error(f"Error in export_payment_data: {e}")
+
+def cleanup_inactive_pending_users():
+    """Clean up inactive pending users every 30 minutes, except those waiting for payment approval"""
+    logging.info("Pending users cleanup thread started")
+    
+    while True:
+        try:
+            # Sleep first to avoid immediate cleanup after startup
+            time.sleep(1800)  # 30 minutes
+            
+            # Get the current time for logging
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Track statistics for logging
+            users_before = len(PENDING_USERS)
+            removed_count = 0
+            preserved_count = 0
+            
+            # Create a copy of keys to avoid modifying dictionary during iteration
+            user_ids = list(PENDING_USERS.keys())
+            
+            for user_id in user_ids:
+                # Get user status
+                status = PENDING_USERS[user_id].get('status', '')
+                
+                # Preserve users waiting for payment approval
+                if status == 'waiting_approval':
+                    preserved_count += 1
+                    continue
+                
+                # Remove all other pending users
+                PENDING_USERS.pop(user_id, None)
+                delete_pending_user(user_id)  # Remove from MongoDB
+                removed_count += 1
+                
+            # Save changes
+            save_pending_users()
+            
+            # Log the cleanup results
+            users_after = len(PENDING_USERS)
+            logging.info(f"Pending users cleanup completed at {current_time}: "
+                        f"Removed {removed_count} inactive users, "
+                        f"preserved {preserved_count} users waiting for approval. "
+                        f"Users before: {users_before}, users after: {users_after}")
+            
+        except Exception as e:
+            logging.error(f"Error in pending users cleanup: {e}")
+            time.sleep(300)  # Wait 5 minutes on error before trying again
+
+@bot.message_handler(commands=['remove_all'])
+def remove_all_pending_users(message):
+    """Manually remove all pending users except those waiting for payment approval"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    try:
+        # Send processing message
+        processing_msg = bot.reply_to(message, "🔄 Removing pending users... Please wait.")
+        
+        # Track statistics
+        users_before = len(PENDING_USERS)
+        removed_count = 0
+        preserved_count = 0
+        
+        # Create a copy of keys to avoid modifying dictionary during iteration
+        user_ids = list(PENDING_USERS.keys())
+        
+        for user_id in user_ids:
+            # Get user status
+            status = PENDING_USERS[user_id].get('status', '')
+            
+            # Preserve users waiting for payment approval
+            if status == 'waiting_approval':
+                preserved_count += 1
+                continue
+            
+            # Remove all other pending users
+            PENDING_USERS.pop(user_id, None)
+            delete_pending_user(user_id)  # Remove from MongoDB
+            removed_count += 1
+        
+        # Save changes
+        save_pending_users()
+        
+        # Send completion message with statistics
+        users_after = len(PENDING_USERS)
+        bot.edit_message_text(
+            f"✅ *Pending Users Cleanup Complete*\n\n"
+            f"• *Removed:* {removed_count} inactive users\n"
+            f"• *Preserved:* {preserved_count} users waiting for payment approval\n"
+            f"• *Before:* {users_before} total users\n"
+            f"• *After:* {users_after} total users",
+            chat_id=message.chat.id,
+            message_id=processing_msg.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Log the action
+        admin_username = message.from_user.username or f"Admin {message.from_user.id}"
+        logging.info(f"Manual cleanup of pending users by {admin_username}: removed {removed_count}, preserved {preserved_count}")
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error removing pending users: {str(e)}")
+        logging.error(f"Error in manual pending users cleanup: {e}")
+
+@bot.message_handler(commands=['april8'])
+def handle_april8_command(message):
+    """Send an April 8 meme GIF to the group chat with global usage limits"""
+    if message.chat.type not in ['group', 'supergroup']:
+        bot.reply_to(message, "❌ This command can only be used in group chats.")
+        return
+        
+    current_time = datetime.now()
+    
+    try:
+        # Get global usage data
+        global_data = jarvis_usage_collection.find_one({"_id": "april8_counter"})
+        
+        if not global_data:
+            # First time the command is being used after implementation
+            global_data = {
+                "_id": "april8_counter",
+                "count": 0,
+                "last_reset": current_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        
+        # Check if 6 hours have passed since last reset
+        last_reset = datetime.strptime(global_data["last_reset"], '%Y-%m-%d %H:%M:%S')
+        hours_passed = (current_time - last_reset).total_seconds() / 3600
+        
+        # Reset counter if 6 hours have passed
+        if hours_passed >= 6:
+            global_data = {
+                "_id": "april8_counter",
+                "count": 0,
+                "last_reset": current_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        
+        # Check if global limit has been reached
+        if global_data["count"] >= 4:
+            next_reset_time = last_reset + timedelta(hours=6)
+            time_until_reset = next_reset_time - current_time
+            hours, remainder = divmod(time_until_reset.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            
+            # Send message and self-destruct after 5 seconds
+            limit_msg = bot.reply_to(
+                message, 
+                f"⏳ The April 8 command has reached its global limit (4 uses per 6 hours).\nTry again in {hours} hours and {minutes} minutes."
+            )
+            
+            # Create a thread to delete BOTH messages after 5 seconds
+            def delete_after_delay(chat_id, message_ids):
+                time.sleep(3)
+                for msg_id in message_ids:
+                    try:
+                        bot.delete_message(chat_id, msg_id)
+                        logging.info(f"Auto-deleted message ID {msg_id} in chat {chat_id}")
+                    except Exception as e:
+                        logging.error(f"Failed to auto-delete message ID {msg_id}: {e}")
+            
+            # Delete both the original command message and the rate limit message
+            threading.Thread(target=delete_after_delay, 
+                         args=(message.chat.id, [message.message_id, limit_msg.message_id])).start()
+            return
+        
+        # Increment the global usage counter
+        global_data["count"] += 1
+        jarvis_usage_collection.replace_one({"_id": "april8_counter"}, global_data, upsert=True)
+        
+        remaining = 4 - global_data["count"]
+        
+        # Path to the April 8 GIF
+        april8_gif = "gifs/april8.gif"  # Using existing GIFs directory
+        
+        # Send the GIF
+        with open(april8_gif, 'rb') as animation:
+            bot.send_animation(
+                message.chat.id, 
+                animation,
+                timeout=60
+            )
+            logging.info(f"Sent April 8 GIF in chat {message.chat.id} (requested by {message.from_user.id}, {remaining} global uses remaining)")
+            
+            # Also delete the original command after sending the GIF for cleaner chat
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception as e:
+                logging.error(f"Failed to delete original command message: {e}")
+                
+    except FileNotFoundError:
+        bot.reply_to(message, "❌ GIF not found.")
+        logging.warning(f"April 8 GIF not found (requested by {message.from_user.id})")
+    except Exception as e:
+        bot.reply_to(message, "❌ Error sending GIF.")
+        logging.error(f"Error in April 8 command: {e}")
+
+@bot.message_handler(commands=['announce'])
+def start_announcement(message):
+    """Start the announcement creation process for admins"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    user_id = message.from_user.id
+    
+    # Initialize announcement state
+    ADMIN_ANNOUNCING[user_id] = {
+        'status': 'waiting_for_announcement',
+        'sent_to': set()  # Track where the announcement has been sent
+    }
+    
+    bot.reply_to(
+        message,
+        "📣 *ANNOUNCEMENT CREATION*\n\n"
+        "Please send your announcement message below.\n"
+        "You can include text formatting, links, images, GIFs or videos.\n\n"
+        "Type /cancel to abort the announcement.",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: message.from_user.id in ADMIN_ANNOUNCING 
+                    and ADMIN_ANNOUNCING[message.from_user.id]['status'] == 'waiting_for_announcement')
+def handle_announcement_message(message):
+    """Process the announcement message from the admin"""
+    user_id = message.from_user.id
+    
+    # Store the announcement message
+    ADMIN_ANNOUNCING[user_id]['message'] = message
+    ADMIN_ANNOUNCING[user_id]['status'] = 'selecting_destinations'
+    
+    # Create keyboard with destination options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("📣 Send to All Destinations", callback_data="announce_all"))
+    markup.add(InlineKeyboardButton("🔍 Choose Specific Destinations", callback_data="announce_choose"))
+    markup.add(InlineKeyboardButton("❌ Cancel Announcement", callback_data="announce_cancel"))
+    
+    # Send confirmation with the announcement preview
+    preview_msg = get_announcement_preview(message)
+    
+    bot.send_message(
+        user_id,
+        f"📝 *Announcement Preview*\n\n{preview_msg}\n\n"
+        f"Where would you like to send this announcement?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+def get_announcement_preview(message):
+    """Generate a preview of the announcement message"""
+    # For text messages, return the content
+    if message.content_type == 'text':
+        return message.text[:200] + ('...' if len(message.text) > 200 else '')
+    # For media messages, return a description
+    elif message.content_type == 'photo':
+        caption = message.caption or ""
+        return f"[IMAGE] {caption[:200]}" + ('...' if len(caption) > 200 else '')
+    elif message.content_type == 'video':
+        caption = message.caption or ""
+        return f"[VIDEO] {caption[:200]}" + ('...' if len(caption) > 200 else '')
+    elif message.content_type == 'animation':
+        caption = message.caption or ""
+        return f"[GIF] {caption[:200]}" + ('...' if len(caption) > 200 else '')
+    elif message.content_type == 'document':
+        caption = message.caption or ""
+        return f"[DOCUMENT] {caption[:200]}" + ('...' if len(caption) > 200 else '')
+    # For other types
+    else:
+        return f"[{message.content_type.upper()}]"
+
+@bot.message_handler(commands=['cancel'])
+def cancel_announcement(message):
+    """Cancel an in-progress announcement"""
+    user_id = message.from_user.id
+    
+    # Check if user is in announcing mode
+    if user_id in ADMIN_ANNOUNCING:
+        ADMIN_ANNOUNCING.pop(user_id)
+        bot.send_message(user_id, "✅ Announcement process canceled.")
+    else:
+        # This might be for another cancellation action or invalid command
+        pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("announce_"))
+def handle_announcement_callback(call):
+    """Handle announcement destination selection callbacks"""
+    user_id = call.from_user.id
+    
+    # Check if user is admin and is in announcing mode
+    if user_id not in ADMIN_ANNOUNCING or user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Add logging to debug callback data
+    logging.info(f"Announcement callback received: {call.data}")
+    
+    if call.data == "announce_all":
+        # Send to all destinations
+        handle_send_to_all(call)
+    
+    elif call.data == "announce_choose":
+        # Show list of destinations to choose from
+        show_destination_choices(call)
+    
+    elif call.data == "announce_cancel":
+        # Cancel the announcement
+        ADMIN_ANNOUNCING.pop(user_id, None)
+        
+        bot.edit_message_text(
+            "❌ Announcement cancelled.",
+            call.message.chat.id,
+            call.message.message_id
+        )
+        
+        bot.answer_callback_query(call.id, "Announcement cancelled")
+    
+    elif call.data == "announce_done":
+        # Finish the announcement process
+        sent_count = len(ADMIN_ANNOUNCING[user_id]['sent_to'])
+        ADMIN_ANNOUNCING.pop(user_id, None)
+        
+        bot.edit_message_text(
+            f"✅ Announcement completed! Sent to {sent_count} destination(s).",
+            call.message.chat.id,
+            call.message.message_id
+        )
+        
+        bot.answer_callback_query(call.id, "Announcement process completed")
+    
+    elif call.data.startswith("announce_dest_"):
+        # Improved error handling for destination extraction
+        try:
+            parts = call.data.split("_")
+            if len(parts) >= 3:
+                # Get everything after "announce_dest_" as the destination key
+                destination_key = "_".join(parts[2:])
+                logging.info(f"Extracted destination key: '{destination_key}'")
+                
+                # Log available destinations for debugging
+                logging.info(f"Available destinations: {list(ANNOUNCEMENT_DESTINATIONS.keys())}")
+                
+                handle_send_to_destination(call, destination_key)
+            else:
+                logging.error(f"Invalid callback data format: {call.data}")
+                bot.answer_callback_query(call.id, "❌ Invalid callback data format", show_alert=True)
+        except Exception as e:
+            logging.error(f"Error processing announcement destination: {e}")
+            bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+def handle_send_to_all(call):
+    """Send announcement to all configured destinations"""
+    user_id = call.from_user.id
+    announcement_data = ADMIN_ANNOUNCING[user_id]
+    message = announcement_data['message']
+    
+    # Update the message to show progress
+    bot.edit_message_text(
+        "🔄 Sending announcement to all destinations...",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    
+    # Counter for successful sends
+    success_count = 0
+    
+    # Send to each destination
+    for key, destination in ANNOUNCEMENT_DESTINATIONS.items():
+        try:
+            # Get destination details
+            dest_id = destination['id']
+            topic_id = destination['topic_id']
+            
+            # Send the announcement based on message type
+            send_success = send_announcement_to_destination(message, dest_id, topic_id)
+            
+            if send_success:
+                # Mark destination as sent
+                announcement_data['sent_to'].add(key)
+                success_count += 1
+                
+                # Log the successful send
+                logging.info(f"Announcement sent to {destination['name']} by admin {user_id}")
+            else:
+                logging.error(f"Failed to send announcement to {destination['name']}")
+            
+        except Exception as e:
+            logging.error(f"Error sending announcement to {destination['name']}: {e}")
+    
+    # Update message to show completion
+    bot.edit_message_text(
+        f"✅ Announcement sent successfully to {success_count}/{len(ANNOUNCEMENT_DESTINATIONS)} destination(s)!",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    
+    # Clean up
+    ADMIN_ANNOUNCING.pop(user_id, None)
+    
+    bot.answer_callback_query(call.id, f"Sent to {success_count} destination(s)")
+
+def show_destination_choices(call):
+    """Show buttons for each destination the admin can send to"""
+    user_id = call.from_user.id
+    announcement_data = ADMIN_ANNOUNCING[user_id]
+    
+    # Create keyboard with all destinations
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    for key, destination in ANNOUNCEMENT_DESTINATIONS.items():
+        # Skip destinations that have already received the announcement
+        if key in announcement_data['sent_to']:
+            continue
+            
+        markup.add(InlineKeyboardButton(
+            f"📍 {destination['name']}", 
+            callback_data=f"announce_dest_{key}"
+        ))
+    
+    # Add Done button
+    markup.add(InlineKeyboardButton("✅ Done", callback_data="announce_done"))
+    
+    # Update message with destination choices
+    bot.edit_message_text(
+        "📍 *SELECT DESTINATIONS*\n\n"
+        "Choose where to send your announcement:\n"
+        "(Buttons will be removed after sending to that destination)",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id, "Select destinations")
+
+def handle_send_to_destination(call, destination_key):
+    """Send announcement to a specific destination"""
+    user_id = call.from_user.id
+    announcement_data = ADMIN_ANNOUNCING[user_id]
+    message = announcement_data['message']
+    
+    # Check if the destination exists
+    if destination_key not in ANNOUNCEMENT_DESTINATIONS:
+        bot.answer_callback_query(call.id, "❌ Invalid destination", show_alert=True)
+        return
+    
+    destination = ANNOUNCEMENT_DESTINATIONS[destination_key]
+    dest_id = destination['id']
+    topic_id = destination['topic_id']
+    
+    try:
+        # Send the announcement
+        send_success = send_announcement_to_destination(message, dest_id, topic_id)
+        
+        if send_success:
+            # Mark destination as sent
+            announcement_data['sent_to'].add(destination_key)
+            
+            # Log the successful send
+            logging.info(f"Announcement sent to {destination['name']} by admin {user_id}")
+            
+            # Show updated destination choices with this destination removed
+            show_destination_choices(call)
+            
+            bot.answer_callback_query(call.id, f"Sent to {destination['name']}")
+        else:
+            bot.answer_callback_query(call.id, f"❌ Failed to send to {destination['name']}", show_alert=True)
+        
+    except Exception as e:
+        logging.error(f"Error sending announcement to {destination['name']}: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}", show_alert=True)
+
+def send_announcement_to_destination(message, dest_id, topic_id=None):
+    """Send a message to a destination with proper support for media types"""
+    try:
+        # Handle different message types
+        if message.content_type == 'text':
+            # Text message
+            kwargs = {
+                'chat_id': dest_id,
+                'text': message.text,
+                'parse_mode': 'Markdown'
+            }
+            
+            # Add topic_id if applicable
+            if topic_id:
+                kwargs['message_thread_id'] = topic_id
+                
+            bot.send_message(**kwargs)
+            
+        elif message.content_type == 'photo':
+            # Photo message
+            photo = message.photo[-1].file_id  # Get highest resolution
+            caption = message.caption or ""
+            
+            kwargs = {
+                'chat_id': dest_id,
+                'photo': photo,
+                'caption': caption,
+                'parse_mode': 'Markdown'
+            }
+            
+            if topic_id:
+                kwargs['message_thread_id'] = topic_id
+                
+            bot.send_photo(**kwargs)
+            
+        elif message.content_type == 'video':
+            # Video message
+            video = message.video.file_id
+            caption = message.caption or ""
+            
+            kwargs = {
+                'chat_id': dest_id,
+                'video': video,
+                'caption': caption,
+                'parse_mode': 'Markdown'
+            }
+            
+            if topic_id:
+                kwargs['message_thread_id'] = topic_id
+                
+            bot.send_video(**kwargs)
+            
+        elif message.content_type == 'animation':
+            # GIF/Animation message
+            animation = message.animation.file_id
+            caption = message.caption or ""
+            
+            kwargs = {
+                'chat_id': dest_id,
+                'animation': animation,
+                'caption': caption,
+                'parse_mode': 'Markdown'
+            }
+            
+            if topic_id:
+                kwargs['message_thread_id'] = topic_id
+                
+            bot.send_animation(**kwargs)
+            
+        elif message.content_type == 'document':
+            # Document message
+            document = message.document.file_id
+            caption = message.caption or ""
+            
+            kwargs = {
+                'chat_id': dest_id,
+                'document': document,
+                'caption': caption,
+                'parse_mode': 'Markdown'
+            }
+            
+            if topic_id:
+                kwargs['message_thread_id'] = topic_id
+                
+            bot.send_document(**kwargs)
+            
+        else:
+            # Unsupported message type
+            logging.warning(f"Unsupported message type for announcement: {message.content_type}")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error in send_announcement_to_destination: {e}")
+        return False
+
+# Command to add a new announcement destination
+@bot.message_handler(commands=['add_destination'])
+def add_destination_command(message):
+    """Command to add a new announcement destination"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Start the add destination wizard
+    bot.reply_to(message, 
+                "🔍 *Add Announcement Destination*\n\n"
+                "Let's set up a new destination where announcements can be sent.\n\n"
+                "First, please provide a name for this destination (e.g., 'Main Group', 'Announcements Channel'):",
+                parse_mode="Markdown")
+    
+    # Set user state
+    PENDING_USERS[message.from_user.id] = {
+        'status': 'add_destination_name'
+    }
+    save_pending_users()
+
+# Handle destination name
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'add_destination_name')
+def handle_destination_name(message):
+    user_id = message.from_user.id
+    dest_name = message.text.strip()
+    
+    # Validate name
+    if len(dest_name) < 3 or len(dest_name) > 30:
+        bot.send_message(user_id, "❌ Destination name must be between 3-30 characters. Please try again:")
+        return
+    
+    # Store name and ask for destination type
+    PENDING_USERS[user_id]['dest_name'] = dest_name
+    PENDING_USERS[user_id]['status'] = 'add_destination_type'
+    save_pending_users()
+    
+    # Create keyboard for destination type
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("Group", "Channel")
+    
+    bot.send_message(
+        user_id,
+        "📝 Is this destination a Group or a Channel?",
+        reply_markup=markup
+    )
+
+# Handle destination type
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'add_destination_type')
+def handle_destination_type(message):
+    user_id = message.from_user.id
+    dest_type = message.text.strip().lower()
+    
+    # Validate type
+    if dest_type not in ["group", "channel"]:
+        bot.send_message(user_id, "❌ Please select either 'Group' or 'Channel'.")
+        return
+    
+    # Store type and ask for destination ID
+    PENDING_USERS[user_id]['dest_type'] = dest_type
+    PENDING_USERS[user_id]['status'] = 'add_destination_id'
+    save_pending_users()
+    
+    bot.send_message(
+        user_id,
+        f"🆔 Please enter the {dest_type} ID for this destination.\n\n"
+        f"You can use the /gettopic command in the {dest_type} to get its ID.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+# Handle destination ID
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'add_destination_id')
+def handle_destination_id(message):
+    user_id = message.from_user.id
+    
+    try:
+        # Try to parse as integer
+        dest_id = int(message.text.strip())
+        
+        # Store ID and ask if it has a topic
+        PENDING_USERS[user_id]['dest_id'] = dest_id
+        PENDING_USERS[user_id]['status'] = 'add_destination_has_topic'
+        save_pending_users()
+        
+        # Create keyboard for yes/no
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.row("Yes", "No")
+        
+        bot.send_message(
+            user_id,
+            "❓ Does this destination have a specific topic ID where announcements should be posted?",
+            reply_markup=markup
+        )
+    except ValueError:
+        bot.send_message(user_id, "❌ Invalid ID. Please enter a valid numeric ID.")
+
+# Handle has topic response
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'add_destination_has_topic')
+def handle_destination_has_topic(message):
+    user_id = message.from_user.id
+    has_topic = message.text.strip().lower()
+    
+    if has_topic == "yes":
+        # Ask for topic ID
+        PENDING_USERS[user_id]['status'] = 'add_destination_topic_id'
+        save_pending_users()
+        
+        bot.send_message(
+            user_id,
+            "🆔 Please enter the topic ID.\n\n"
+            "You can use the /gettopic command in the specific topic to get its ID.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    elif has_topic == "no":
+        # No topic, set topic_id to None
+        PENDING_USERS[user_id]['dest_topic_id'] = None
+        show_destination_confirmation(user_id)
+    else:
+        bot.send_message(user_id, "❌ Please select either 'Yes' or 'No'.")
+
+# Handle topic ID
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'add_destination_topic_id')
+def handle_destination_topic_id(message):
+    user_id = message.from_user.id
+    
+    try:
+        # Try to parse as integer
+        topic_id = int(message.text.strip())
+        
+        # Store topic ID
+        PENDING_USERS[user_id]['dest_topic_id'] = topic_id
+        show_destination_confirmation(user_id)
+    except ValueError:
+        bot.send_message(user_id, "❌ Invalid topic ID. Please enter a valid numeric ID.")
+
+def show_destination_confirmation(user_id):
+    """Show confirmation message for the new destination"""
+    # Change status
+    PENDING_USERS[user_id]['status'] = 'add_destination_confirm'
+    save_pending_users()
+    
+    # Get destination details
+    dest_name = PENDING_USERS[user_id]['dest_name']
+    dest_type = PENDING_USERS[user_id]['dest_type']
+    dest_id = PENDING_USERS[user_id]['dest_id']
+    dest_topic_id = PENDING_USERS[user_id].get('dest_topic_id')
+    
+    # Create destination ID (slug) from name
+    dest_slug = dest_name.lower().replace(' ', '_')
+    PENDING_USERS[user_id]['dest_slug'] = dest_slug
+    
+    # Create confirmation message
+    confirmation = (
+        f"✅ *Destination Summary*\n\n"
+        f"• *Name:* {dest_name}\n"
+        f"• *Type:* {dest_type.capitalize()}\n"
+        f"• *ID:* {dest_id}\n"
+    )
+    
+    if dest_topic_id:
+        confirmation += f"• *Topic ID:* {dest_topic_id}\n"
+    else:
+        confirmation += "• *Topic ID:* None (Main chat)\n"
+        
+    confirmation += f"\nDestination ID will be: `{dest_slug}`"
+    
+    # Create confirm/cancel keyboard
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("✅ Confirm", "❌ Cancel")
+    
+    bot.send_message(
+        user_id,
+        f"{confirmation}\n\nIs this correct?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+# Handle confirmation
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'add_destination_confirm')
+def handle_destination_confirmation(message):
+    user_id = message.from_user.id
+    response = message.text.strip()
+    
+    if response == "✅ Confirm":
+        # Get destination details
+        dest_slug = PENDING_USERS[user_id]['dest_slug']
+        dest_name = PENDING_USERS[user_id]['dest_name']
+        dest_type = PENDING_USERS[user_id]['dest_type']
+        dest_id = PENDING_USERS[user_id]['dest_id']
+        dest_topic_id = PENDING_USERS[user_id].get('dest_topic_id')
+        
+        # Create destination object
+        destination_data = {
+            'name': dest_name,
+            'type': dest_type,
+            'id': dest_id,
+            'topic_id': dest_topic_id
+        }
+        
+        # Save to database
+        success = save_announcement_destination(dest_slug, destination_data)
+        
+        # Update global destinations dictionary
+        global ANNOUNCEMENT_DESTINATIONS
+        ANNOUNCEMENT_DESTINATIONS = load_announcement_destinations()
+        
+        if success:
+            bot.send_message(
+                user_id,
+                f"✅ *Success!*\n\nThe destination '{dest_name}' has been added successfully.\n\n"
+                f"You can now use it when sending announcements.",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        else:
+            bot.send_message(
+                user_id,
+                "❌ There was an error saving the destination. Please try again later.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+    elif response == "❌ Cancel":
+        bot.send_message(
+            user_id,
+            "❌ Destination creation cancelled.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    else:
+        bot.send_message(user_id, "❌ Please select either '✅ Confirm' or '❌ Cancel'.")
+        return
+    
+    # Clean up
+    PENDING_USERS.pop(user_id, None)
+    delete_pending_user(user_id)
+
+# Command to list all announcement destinations
+@bot.message_handler(commands=['list_destinations'])
+def list_destinations_command(message):
+    """Command to list all configured announcement destinations"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Check if there are any destinations
+    if not ANNOUNCEMENT_DESTINATIONS:
+        bot.reply_to(message, "ℹ️ No announcement destinations configured.")
+        return
+    
+    # Build the list
+    destination_list = "📋 *Configured Announcement Destinations*\n\n"
+    
+    for dest_id, dest in ANNOUNCEMENT_DESTINATIONS.items():
+        destination_list += f"*{dest.get('name', 'Unknown')}* (`{dest_id}`)\n"
+        destination_list += f"• Type: {dest.get('type', 'Unknown').capitalize()}\n"
+        destination_list += f"• ID: `{dest.get('id', 'Unknown')}`\n"
+        
+        if dest.get('topic_id'):
+            destination_list += f"• Topic ID: `{dest.get('topic_id')}`\n"
+        else:
+            destination_list += f"• Topic ID: None (Main chat)\n"
+            
+        destination_list += "\n"
+    
+    # Add instructions
+    destination_list += "Use `/add_destination` to add a new destination or `/remove_destination` to remove one."
+    
+    bot.reply_to(message, destination_list, parse_mode="Markdown")
+
+# Command to remove an announcement destination
+@bot.message_handler(commands=['remove_destination'])
+def remove_destination_command(message):
+    """Command to remove an announcement destination"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    args = message.text.split()
+    
+    # Show list of destinations if no ID provided
+    if len(args) < 2:
+        # Create inline buttons for each destination
+        markup = InlineKeyboardMarkup(row_width=1)
+        
+        for dest_id, dest in ANNOUNCEMENT_DESTINATIONS.items():
+            markup.add(InlineKeyboardButton(
+                f"❌ {dest.get('name', 'Unknown')} ({dest_id})",
+                callback_data=f"remove_dest_{dest_id}"
+            ))
+        
+        if not markup.keyboard:
+            bot.reply_to(message, "ℹ️ No announcement destinations configured.")
+            return
+            
+        bot.reply_to(
+            message,
+            "🗑️ *Remove Announcement Destination*\n\n"
+            "Please select a destination to remove:",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        return
+    
+    # If a destination ID is provided
+    dest_id = args[1]
+    remove_destination(message.chat.id, dest_id)
+
+# Handle destination removal via callback
+@bot.callback_query_handler(func=lambda call: call.data.startswith("remove_dest_"))
+def handle_remove_destination_callback(call):
+    """Handle removal of announcement destination via inline button"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract destination ID
+    dest_id = call.data[len("remove_dest_"):]
+    
+    # Create confirmation markup
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✅ Yes, delete it", callback_data=f"confirm_remove_dest_{dest_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove_dest")
+    )
+    
+    # Get destination name
+    dest_name = ANNOUNCEMENT_DESTINATIONS.get(dest_id, {}).get('name', 'Unknown')
+    
+    # Update message with confirmation
+    bot.edit_message_text(
+        f"🗑️ *Confirm Removal*\n\n"
+        f"Are you sure you want to remove the destination:\n"
+        f"*{dest_name}* (`{dest_id}`)?\n\n"
+        f"This action cannot be undone.",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+# Handle removal confirmation
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_remove_dest_"))
+def handle_confirm_remove_destination(call):
+    """Handle confirmation of destination removal"""
+    global ANNOUNCEMENT_DESTINATIONS  # Add global declaration at the top
+    
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract destination ID
+    dest_id = call.data[len("confirm_remove_dest_"):]
+    
+    # Delete from database
+    success = delete_announcement_destination(dest_id)
+    
+    # Update global destinations dictionary
+    ANNOUNCEMENT_DESTINATIONS = load_announcement_destinations()
+    
+    if success:
+        bot.edit_message_text(
+            f"✅ Destination `{dest_id}` has been removed successfully.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+    else:
+        bot.edit_message_text(
+            f"❌ Error removing destination `{dest_id}`. It may not exist or there was a database error.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+    
+    bot.answer_callback_query(call.id, "Destination removal processed")
+
+# Handle cancellation of removal
+@bot.callback_query_handler(func=lambda call: call.data == "cancel_remove_dest")
+def handle_cancel_remove_destination(call):
+    """Handle cancellation of destination removal"""
+    bot.edit_message_text(
+        "❌ Destination removal cancelled.",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    
+    bot.answer_callback_query(call.id, "Removal cancelled")
+
+def remove_destination(chat_id, dest_id):
+    """Remove a destination by ID"""
+    global ANNOUNCEMENT_DESTINATIONS  # Move global declaration to the top
+    
+    # Check if destination exists
+    if dest_id not in ANNOUNCEMENT_DESTINATIONS:
+        bot.send_message(chat_id, f"❌ Destination `{dest_id}` not found.", parse_mode="Markdown")
+        return
+    
+    # Get destination name for confirmation
+    dest_name = ANNOUNCEMENT_DESTINATIONS[dest_id]['name']
+    
+    # Delete from database
+    success = delete_announcement_destination(dest_id)
+    
+    # Update global destinations dictionary
+    ANNOUNCEMENT_DESTINATIONS = load_announcement_destinations()
+    
+    if success:
+        bot.send_message(
+            chat_id,
+            f"✅ Destination *{dest_name}* (`{dest_id}`) has been removed successfully.",
+            parse_mode="Markdown"
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            f"❌ Error removing destination `{dest_id}`. Please try again later.",
+            parse_mode="Markdown"
+        )
+
+@bot.message_handler(commands=['config'])
+def handle_config_command(message):
+    """Central configuration menu for admin commands"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Create inline keyboard with configuration options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🔓 Enrollment Status", callback_data="config_enrollment"),
+        InlineKeyboardButton("💰 Manage Discounts", callback_data="config_discount"),
+        InlineKeyboardButton("🎟️ Serial Number Management", callback_data="config_serial"),
+        InlineKeyboardButton("🌐 Destination Management", callback_data="config_destinations"),
+        InlineKeyboardButton("📢 Send Announcement", callback_data="config_announce"),
+        InlineKeyboardButton("📊 Data Export", callback_data="config_export")
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "⚙️ *ADMIN CONFIGURATION PANEL*\n\n"
+        "Select an option to configure:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("config_"))
+def handle_config_callbacks(call):
+    """Handle config menu callbacks"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+        
+    option = call.data.split("_")[1]
+    
+    if option == "enrollment":
+        # Show enrollment status menu
+        show_enrollment_options(call)
+    elif option == "discount":
+        # Show discount options
+        show_discount_options(call)
+    elif option == "serial":
+        # Show serial number options
+        show_serial_options(call)
+    elif option == "announce":
+        # Start the announcement process
+        handle_start_announcement(call)
+    elif option == "export":
+        # Show data export options
+        show_export_options(call)
+    elif option == "destinations":
+        # Show destination management options
+        show_destination_management(call)
+    elif option == "back":
+        # Return to main config menu
+        show_config_menu(call)
+
+def show_enrollment_options(call):
+    """Show enrollment status options"""
+    # Get current status
+    enrollment_open = BOT_SETTINGS.get('enrollment_open', False)  # Default to open
+    current_status = "🟢 OPEN" if enrollment_open else "🔴 CLOSED"
+    
+    # Create keyboard with options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🟢 Open Enrollment", callback_data="enrollment_open"),
+        InlineKeyboardButton("🔴 Close Enrollment", callback_data="enrollment_close"),
+        InlineKeyboardButton("« Back to Config Menu", callback_data="config_back")
+    )
+    
+    # Edit the message with enrollment options
+    bot.edit_message_text(
+        f"🔓 *ENROLLMENT STATUS*\n\n"
+        f"Current Status: *{current_status}*\n\n"
+        f"Select an option to change the status:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+def show_discount_options(call):
+    """Show discount management options"""
+    # Get current discount status
+    reg_status = "🟢 Active" if DISCOUNTS.get('regular') else "🔴 Not active"
+    sup_status = "🟢 Active" if DISCOUNTS.get('supreme') else "🔴 Not active"
+    
+    # Create keyboard with options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("➕ Create New Discount", callback_data="start_discount"),
+        InlineKeyboardButton("❌ Remove Discount", callback_data="remove_discount")
+    )
+    
+    # Add discount-specific removal buttons if discounts are active
+    if DISCOUNTS.get('regular'):
+        markup.add(InlineKeyboardButton("❌ Remove Regular Discount", callback_data="remove_discount_regular"))
+    if DISCOUNTS.get('supreme'):
+        markup.add(InlineKeyboardButton("❌ Remove Supreme Discount", callback_data="remove_discount_supreme"))
+    
+    markup.add(InlineKeyboardButton("« Back to Config Menu", callback_data="config_back"))
+    
+    # Edit the message with discount options
+    bot.edit_message_text(
+        f"💰 *DISCOUNT MANAGEMENT*\n\n"
+        f"Current Status:\n"
+        f"• Regular Discount: {reg_status}\n"
+        f"• Supreme Discount: {sup_status}\n\n"
+        f"Select an option to manage discounts:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+def show_config_menu(call):
+    """Show main config menu (for back button)"""
+    # Create inline keyboard with configuration options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🔓 Enrollment Status", callback_data="config_enrollment"),
+        InlineKeyboardButton("💰 Manage Discounts", callback_data="config_discount"),
+        InlineKeyboardButton("🎟️ Serial Number Management", callback_data="config_serial"),
+        InlineKeyboardButton("🌐 Destination Management", callback_data="config_destinations"),
+        InlineKeyboardButton("📢 Send Announcement", callback_data="config_announce"),
+        InlineKeyboardButton("📊 Data Export", callback_data="config_export")
+    )
+    
+    # Edit the message with main config menu
+    bot.edit_message_text(
+        "⚙️ *ADMIN CONFIGURATION PANEL*\n\n"
+        "Select an option to configure:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_discount")
+def handle_start_discount_callback(call):
+    """Start the discount creation process"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    user_id = call.from_user.id
+    
+    # Answer the callback first
+    bot.answer_callback_query(call.id)
+    
+    # Edit the message to acknowledge the action
+    bot.edit_message_text(
+        "💰 *DISCOUNT CREATION*\n\n"
+        "Starting discount creation process...\n"
+        "Please check your messages for the next steps.",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown"
+    )
+    
+    # Simulate the /discount command
+    fake_message = types.Message(
+        message_id=0,
+        from_user=types.User(
+            id=user_id,
+            is_bot=False,
+            first_name="Admin",
+            username=call.from_user.username,
+        ),
+        date=0,
+        chat=types.Chat(
+            id=user_id,  # Send to the user's private chat
+            type="private",
+        ),
+        content_type="text",
+        options={},
+        json_string="{}",
+    )
+    fake_message.text = "/discount"
+    
+    # Call the discount command handler
+    start_discount_setup(fake_message)
+
+@bot.callback_query_handler(func=lambda call: call.data == "remove_discount")
+def handle_remove_discount_callback(call):
+    """Start the discount removal process"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    user_id = call.from_user.id
+    
+    # Answer the callback first
+    bot.answer_callback_query(call.id)
+    
+    # Simulate the /remove_discount command
+    fake_message = types.Message(
+        message_id=0,
+        from_user=types.User(
+            id=user_id,
+            is_bot=False,
+            first_name="Admin",
+            username=call.from_user.username,
+        ),
+        date=0,
+        chat=types.Chat(
+            id=call.message.chat.id,
+            type="private",
+        ),
+        content_type="text",
+        options={},
+        json_string="{}",
+    )
+    fake_message.text = "/remove_discount"
+    
+    # Call the remove_discount command handler
+    remove_discount(fake_message)
+
+# Add this new function
+def show_export_options(call):
+    """Show data export options"""
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📋 Export Form Responses", callback_data="export_forms"),
+        InlineKeyboardButton("💵 Export Payment Records", callback_data="export_payments"),
+        InlineKeyboardButton("« Back to Config Menu", callback_data="config_back")
+    )
+    
+    bot.edit_message_text(
+        "📊 *DATA EXPORT OPTIONS*\n\n"
+        "Select what data you want to export:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["export_forms", "export_payments"])
+def handle_export_callbacks(call):
+    """Handle export button callbacks"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Update message to show processing
+    bot.edit_message_text(
+        "🔄 Starting export process...\n\nPlease check your messages for the exported file.",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    
+    # Simulate the appropriate export command
+    fake_message = types.Message(
+        message_id=0,
+        from_user=types.User(
+            id=call.from_user.id,
+            is_bot=False,
+            first_name="Admin",
+            username=call.from_user.username,
+        ),
+        date=0,
+        chat=types.Chat(
+            id=call.from_user.id,
+            type="private",
+        ),
+        content_type="text",
+        options={},
+        json_string="{}",
+    )
+    
+    if call.data == "export_forms":
+        fake_message.text = "/export_forms"
+        export_form_responses(fake_message)
+    else:  # export_payments
+        fake_message.text = "/export_payments"
+        export_payment_data(fake_message)
+    
+    bot.answer_callback_query(call.id)
+
+def handle_start_announcement(call):
+    """Start the announcement creation process from config menu"""
+    user_id = call.from_user.id
+    
+    # Answer the callback first
+    bot.answer_callback_query(call.id)
+    
+    # Edit the message to acknowledge the action
+    bot.edit_message_text(
+        "📢 *ANNOUNCEMENT CREATION*\n\n"
+        "Starting announcement creation process...\n"
+        "Please check your messages for the next steps.",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown"
+    )
+    
+    # Simulate the /announce command
+    fake_message = types.Message(
+        message_id=0,
+        from_user=types.User(
+            id=user_id,
+            is_bot=False,
+            first_name="Admin",
+            username=call.from_user.username,
+        ),
+        date=0,
+        chat=types.Chat(
+            id=user_id,  # Send to the user's private chat
+            type="private",
+        ),
+        content_type="text",
+        options={},
+        json_string="{}",
+    )
+    fake_message.text = "/announce"
+    
+    # Call the announcement command handler
+    start_announcement(fake_message)
+
+def show_destination_management(call):
+    """Show destination management options"""
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📋 List All Destinations", callback_data="list_destinations"),
+        InlineKeyboardButton("➕ Add New Destination", callback_data="add_destination"),
+        InlineKeyboardButton("🗑️ Remove Destination", callback_data="remove_dest")
+    )
+    markup.add(InlineKeyboardButton("« Back to Config Menu", callback_data="config_back"))
+    
+    bot.edit_message_text(
+        "🌐 *DESTINATION MANAGEMENT*\n\n"
+        "Configure channels and groups where announcements can be sent:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["list_destinations", "add_destination", "remove_dest"])
+def handle_destination_callbacks(call):
+    """Handle destination management callbacks"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    user_id = call.from_user.id
+    
+    # Answer the callback first
+    bot.answer_callback_query(call.id)
+    
+    if call.data == "list_destinations":
+        # Use existing list_destinations functionality
+        if not ANNOUNCEMENT_DESTINATIONS:
+            bot.edit_message_text(
+                "🌐 *DESTINATION MANAGEMENT*\n\n"
+                "ℹ️ No announcement destinations configured yet.\n\n"
+                "Use the 'Add New Destination' option to create one.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("« Back", callback_data="config_destinations")
+                )
+            )
+            return
+        
+        # Build the list
+        destination_list = "🌐 *CONFIGURED DESTINATIONS*\n\n"
+        
+        for dest_id, dest in ANNOUNCEMENT_DESTINATIONS.items():
+            destination_list += f"*{dest.get('name', 'Unknown')}* (`{dest_id}`)\n"
+            destination_list += f"• Type: {dest.get('type', 'Unknown').capitalize()}\n"
+            destination_list += f"• ID: `{dest.get('id', 'Unknown')}`\n"
+            
+            if dest.get('topic_id'):
+                destination_list += f"• Topic ID: `{dest.get('topic_id')}`\n"
+            else:
+                destination_list += f"• Topic ID: None (Main chat)\n"
+                
+            destination_list += "\n"
+        
+        # Add back button
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("« Back", callback_data="config_destinations"))
+        
+        bot.edit_message_text(
+            destination_list,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    elif call.data == "add_destination":
+        # Simulate /add_destination command
+        fake_message = types.Message(
+            message_id=0,
+            from_user=types.User(
+                id=user_id,
+                is_bot=False,
+                first_name="Admin",
+                username=call.from_user.username,
+            ),
+            date=0,
+            chat=types.Chat(
+                id=user_id,  # Send to user's private chat
+                type="private",
+            ),
+            content_type="text",
+            options={},
+            json_string="{}",
+        )
+        fake_message.text = "/add_destination"
+        
+        # Call the add_destination command handler
+        add_destination_command(fake_message)
+        
+        # Update the message to indicate the action
+        bot.edit_message_text(
+            "🌐 *DESTINATION MANAGEMENT*\n\n"
+            "➕ Add destination process started!\n\n"
+            "Please check your direct messages to continue setting up the new destination.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Back to Config Menu", callback_data="config_back")
+            )
+        )
+        
+    elif call.data == "remove_dest":
+        # Show list of destinations to remove
+        markup = InlineKeyboardMarkup(row_width=1)
+        
+        for dest_id, dest in ANNOUNCEMENT_DESTINATIONS.items():
+            markup.add(InlineKeyboardButton(
+                f"❌ {dest.get('name', 'Unknown')} ({dest_id})",
+                callback_data=f"remove_dest_{dest_id}"
+            ))
+        
+        # Add back button
+        markup.add(InlineKeyboardButton("« Back", callback_data="config_destinations"))
+        
+        if not markup.keyboard or len(markup.keyboard) == 1:  # Only back button exists
+            bot.edit_message_text(
+                "🌐 *DESTINATION MANAGEMENT*\n\n"
+                "ℹ️ No destinations available to remove.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("« Back", callback_data="config_destinations")
+                )
+            )
+        else:
+            bot.edit_message_text(
+                "🗑️ *REMOVE DESTINATION*\n\n"
+                "Select a destination to remove:",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+
+def show_serial_options(call):
+    """Show serial number management options"""
+    try:
+        # Count available and used serials
+        total_serials = len(SERIAL_NUMBERS) if SERIAL_NUMBERS else 0
+        used_serials = sum(1 for data in SERIAL_NUMBERS.values() if data.get('used', False)) if SERIAL_NUMBERS else 0
+        available_serials = total_serials - used_serials
+        
+        # Create keyboard with options
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("➕ Generate New Serial", callback_data="serial_generate"),
+            InlineKeyboardButton("❌ Delete Serial", callback_data="serial_delete"),
+            InlineKeyboardButton("« Back to Config Menu", callback_data="config_back")
+        )
+        
+        # Edit the message with serial options
+        bot.edit_message_text(
+            f"🎟️ *SERIAL NUMBER MANAGEMENT*\n\n"
+            f"Current Status:\n"
+            f"• Total Serials: {total_serials}\n"
+            f"• Available Serials: {available_serials}\n"
+            f"• Used Serials: {used_serials}\n\n"
+            f"Select an option to manage serial numbers:",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        bot.answer_callback_query(call.id)
+        
+    except Exception as e:
+        # Log the error
+        logging.error(f"Error in show_serial_options: {e}")
+        
+        # Try to notify user
+        try:
+            bot.answer_callback_query(call.id, "Error showing options", show_alert=True)
+        except:
+            pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("serial_"))
+def handle_serial_callbacks(call):
+    """Handle serial number management callbacks"""
+    # Check if user is admin or creator
+    if call.from_user.id not in ADMIN_IDS and call.from_user.id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    try:
+        option = call.data.split("_")[1]
+        user_id = call.from_user.id
+        
+        # Log the callback for debugging
+        logging.info(f"Serial callback received: {call.data} from user {user_id}")
+        
+        if option == "generate":
+            # Start the serial generation process
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                "🎟️ *SERIAL NUMBER GENERATION*\n\n"
+                "Starting serial generation process...\n"
+                "Please check your messages for the next steps.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+            
+            # Simulate the /generate command
+            fake_message = types.Message(
+                message_id=0,
+                from_user=types.User(
+                    id=user_id,
+                    is_bot=False,
+                    first_name="Admin",
+                    username=call.from_user.username,
+                ),
+                date=0,
+                chat=types.Chat(
+                    id=user_id,  # Send to the user's private chat
+                    type="private",
+                ),
+                content_type="text",
+                options={},
+                json_string="{}",
+            )
+            fake_message.text = "/generate"
+            
+            # Call the generate command handler
+            generate_serial(fake_message)
+            
+        elif option == "list_all" or option == "list_available" or option == "list_used":
+            # Determine filter status
+            filter_status = None
+            if option == "list_available":
+                filter_status = False
+            elif option == "list_used":
+                filter_status = True
+            
+            # Log filter info
+            logging.info(f"Listing serials with filter_status: {filter_status}")
+            
+            # Check if SERIAL_NUMBERS is properly loaded
+            if not SERIAL_NUMBERS:
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial"))
+                
+                bot.edit_message_text(
+                    "🔑 *SERIAL NUMBERS*\n\n"
+                    "No serial numbers found in database.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+                bot.answer_callback_query(call.id, "No serial numbers found")
+                return
+            
+            # Build the list
+            serial_list = "🔑 *SERIAL NUMBERS*\n\n"
+            count = 0
+            
+            # Create a safe copy for iteration
+            serials_to_process = dict(SERIAL_NUMBERS)
+            
+            # Process each serial based on filter
+            for serial, data in serials_to_process.items():
+                is_used = data.get('used', False)
+                
+                # Apply filter if specified
+                if filter_status is not None and is_used != filter_status:
+                    continue
+                
+                count += 1
+                if count > 20:  # Limit to 20 serials to avoid message length issues
+                    serial_list += f"\n... and {len(serials_to_process) - 20} more serials."
+                    break
+                
+                # Format serial info
+                status = "✅ Used" if is_used else "⏳ Available"
+                mentorship_type = data.get('mentorship_type', 'regular').capitalize()
+                plan = data.get('plan', 'Unknown')
+                
+                serial_list += f"*{serial}*\n"
+                serial_list += f"• Status: {status}\n"
+                serial_list += f"• Type: {mentorship_type}\n"
+                serial_list += f"• Plan: {plan}\n"
+                
+                if is_used:
+                    used_by = data.get('used_by', 'Unknown')
+                    used_at = data.get('used_at', 'Unknown date')
+                    serial_list += f"• Used by: User {used_by}\n"
+                    serial_list += f"• Used on: {used_at}\n"
+                
+                serial_list += "\n"
+            
+            # Create back button
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial"))
+            
+            # Add filter info
+            filter_note = ""
+            if filter_status is not None:
+                filter_type = "used" if filter_status else "available"
+                filter_note = f" (filtered: {filter_type} only)"
+            
+            # Handle no matching serials case
+            if count == 0:
+                if filter_status is not None:
+                    msg = f"No {filter_type} serials found."
+                else:
+                    msg = "No serials found."
+                
+                bot.edit_message_text(
+                    f"🔑 *SERIAL NUMBERS*\n\n{msg}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+            else:
+                # Complete the message with count note
+                serial_list += f"Total: {count} serials{filter_note}"
+                
+                # Edit the message with the serial list
+                try:
+                    bot.edit_message_text(
+                        serial_list,
+                        call.message.chat.id,
+                        call.message.message_id,
+                        parse_mode="Markdown",
+                        reply_markup=markup
+                    )
+                except Exception as e:
+                    logging.error(f"Error sending serial list: {e}")
+                    # Try sending without markdown if that might be the issue
+                    bot.edit_message_text(
+                        f"Error with markdown formatting. {count} serials found.",
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=markup
+                    )
+            
+            bot.answer_callback_query(call.id, f"Showing {count} serials")
+            logging.info(f"Listed {count} serials with filter {filter_status}")
+            
+        elif option == "delete":
+            # Show serial deletion interface
+            show_serial_deletion(call)
+        
+    except Exception as e:
+        # Log the error
+        logging.error(f"Error in serial_callbacks: {e}")
+        
+        # Try to send an error message
+        try:
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial"))
+            
+            bot.edit_message_text(
+                "❌ *An error occurred*\n\nThe operation could not be completed.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            bot.answer_callback_query(call.id, "Error occurred", show_alert=True)
+        except:
+            # Last resort attempt
+            try:
+                bot.answer_callback_query(call.id, "Error handling request", show_alert=True)
+            except:
+                pass
+
+def show_serial_deletion(call):
+    """Show interface to delete a serial number"""
+    # Check if there are any serials
+    if not SERIAL_NUMBERS:
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial"))
+        
+        bot.edit_message_text(
+            "🔑 *DELETE SERIAL*\n\n"
+            "No serials found to delete.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id)
+        return
+    
+    # Edit message to guide user
+    bot.edit_message_text(
+        "🔑 *DELETE SERIAL*\n\n"
+        "Please enter the serial number you want to delete in the chat.\n\n"
+        "Or use the inline keyboard to go back.",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial")
+        )
+    )
+    
+    # Set user state to handle the delete in the next message
+    PENDING_USERS[call.from_user.id] = {
+        'status': 'deleting_serial',
+        'config_msg_id': call.message.message_id,
+        'config_chat_id': call.message.chat.id
+    }
+    save_pending_users()
+    
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'deleting_serial')
+def handle_delete_serial_input(message):
+    """Process admin's input of serial to delete"""
+    user_id = message.from_user.id
+    
+    # Check if user is admin or creator
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        return
+    
+    # Get the serial number
+    serial = message.text.strip()
+    
+    # Get stored message info
+    config_chat_id = PENDING_USERS[user_id].get('config_chat_id')
+    config_msg_id = PENDING_USERS[user_id].get('config_msg_id')
+    
+    # Check if serial exists
+    if serial not in SERIAL_NUMBERS:
+        bot.reply_to(message, f"❌ Serial `{serial}` not found.", parse_mode="Markdown")
+        return
+    
+    # Get serial info for confirmation
+    serial_data = SERIAL_NUMBERS[serial]
+    status = "Used" if serial_data.get('used', False) else "Available"
+    mentorship_type = serial_data.get('mentorship_type', 'regular').capitalize()
+    plan = serial_data.get('plan', 'Unknown')
+    
+    # Create a confirmation keyboard
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("✅ Yes, delete this serial", callback_data=f"confirm_delete_serial_{serial}"),
+        InlineKeyboardButton("❌ No, cancel", callback_data="config_serial")
+    )
+    
+    # Send confirmation message
+    bot.send_message(
+        user_id,
+        f"🗑️ *CONFIRM SERIAL DELETION*\n\n"
+        f"Are you sure you want to delete this serial?\n\n"
+        f"*Serial:* `{serial}`\n"
+        f"*Status:* {status}\n"
+        f"*Type:* {mentorship_type}\n"
+        f"*Plan:* {plan}\n\n"
+        f"⚠️ This action cannot be undone.",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Update the config menu message to avoid confusion
+    if config_chat_id and config_msg_id:
+        try:
+            bot.edit_message_text(
+                "🔑 *DELETE SERIAL*\n\n"
+                "Please check your most recent message for the deletion confirmation.",
+                config_chat_id,
+                config_msg_id,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial")
+                )
+            )
+        except:
+            pass  # Ignore errors if message can't be edited
+    
+    # Clean up user state
+    PENDING_USERS.pop(user_id, None)
+    delete_pending_user(user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_delete_serial_"))
+def handle_confirm_delete_serial(call):
+    """Handle confirmation of serial deletion"""
+    user_id = call.from_user.id
+    
+    # Check if user is admin or creator
+    if user_id not in ADMIN_IDS and user_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to perform this action.", show_alert=True)
+        return
+    
+    # Extract the serial number
+    serial = call.data[len("confirm_delete_serial_"):]
+    
+    # Check if serial exists
+    if serial not in SERIAL_NUMBERS:
+        bot.edit_message_text(
+            "❌ Error: Serial not found.",
+            call.message.chat.id,
+            call.message.message_id
+        )
+        bot.answer_callback_query(call.id, "Serial not found")
+        return
+    
+    # Store serial info before deleting
+    serial_data = SERIAL_NUMBERS[serial]
+    status = "Used" if serial_data.get('used', False) else "Available"
+    mentorship_type = serial_data.get('mentorship_type', 'regular').capitalize()
+    plan = serial_data.get('plan', 'Unknown')
+    
+    # Delete from database
+    try:
+        serial_numbers_collection.delete_one({"serial": serial})
+        del SERIAL_NUMBERS[serial]
+        
+        # Update message to show success
+        bot.edit_message_text(
+            f"✅ *SERIAL DELETED SUCCESSFULLY*\n\n"
+            f"*Serial:* `{serial}`\n"
+            f"*Status:* {status}\n"
+            f"*Type:* {mentorship_type}\n"
+            f"*Plan:* {plan}\n\n"
+            f"This serial has been permanently deleted.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial")
+            )
+        )
+        
+        # Log the action
+        admin_username = call.from_user.username or f"Admin {user_id}"
+        logging.info(f"Serial {serial} deleted by {admin_username}")
+        
+        # Notify other admins for transparency
+        for admin_id in ADMIN_IDS:
+            if admin_id != user_id:  # Don't send to the admin who deleted it
+                try:
+                    bot.send_message(
+                        admin_id,
+                        f"🗑️ *SERIAL DELETED*\n\n"
+                        f"Admin @{admin_username} has deleted serial:\n"
+                        f"`{serial}`\n\n"
+                        f"*Type:* {mentorship_type}\n"
+                        f"*Plan:* {plan}\n"
+                        f"*Status:* {status}",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to notify admin {admin_id} about serial deletion: {e}")
+        
+        bot.answer_callback_query(call.id, "Serial deleted successfully")
+        
+    except Exception as e:
+        # Handle error
+        bot.edit_message_text(
+            f"❌ Error deleting serial: {str(e)}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("« Back to Serial Menu", callback_data="config_serial")
+            )
+        )
+        logging.error(f"Error deleting serial {serial}: {e}")
+        bot.answer_callback_query(call.id, "Error deleting serial")
+
+def send_birthday_greetings():
+    """Check for birthdays and send greetings to users"""
+    logging.info("Running birthday greeting check")
+    
+    # Get current date in Manila timezone for consistency
+    manila_tz = pytz.timezone('Asia/Manila')
+    now = datetime.now(manila_tz)
+    today_day = now.day
+    today_month = now.month
+    
+    # Count for logging
+    greetings_sent = 0
+    
+    # Check each user in PAYMENT_DATA
+    for user_id_str, data in PAYMENT_DATA.items():
+        # Skip users who aren't active members
+        if not data.get('haspayed', False) or data.get('cancelled', False):
+            continue
+            
+        try:
+            # Get birthday from form answers if available
+            birthday = None
+            if 'form_answers' in data and 'birthday' in data['form_answers']:
+                birthday = data['form_answers']['birthday']
+                
+            # Skip if no birthday info
+            if not birthday:
+                continue
+                
+            # Try to parse birthday in DD/MM/YYYY format
+            try:
+                day, month, year = map(int, birthday.split('/'))
+                
+                # Check if today is their birthday (day and month match)
+                if day == today_day and month == today_month:
+                    # Get username or full name for personalization
+                    user_id = int(user_id_str)
+                    username = data.get('username', '')
+                    full_name = data.get('form_answers', {}).get('full_name', '')
+                    display_name = full_name or f"@{username}" or f"User {user_id}"
+                    
+                    # Calculate age
+                    age = now.year - year
+                    
+                    # Send birthday greeting with personalized touches
+                    greeting_templates = [
+                        f"🎂 *Happy Birthday, {display_name}!* 🎉\n\nWishing you a fantastic day filled with joy and success! May your {age}th year be your best trading year yet! 📈",
+                        
+                        f"🎈 *Birthday Alert!* 🎈\n\nHappy Birthday to {display_name}! The entire Prodigy Trading Academy team wishes you an amazing {age}th birthday. May your candles be many and your losses few! 💰",
+                        
+                        f"🥳 *Special Day Alert!* 🎁\n\n{display_name}, happy {age}th birthday! May your charts be green, your strategies profitable, and your year ahead absolutely spectacular!"
+                    ]
+                    
+                    greeting = random.choice(greeting_templates)
+                    
+                    # Send the greeting
+                    bot.send_message(
+                        user_id,
+                        greeting,
+                        parse_mode="Markdown"
+                    )
+                    
+                    # Log successful greeting
+                    logging.info(f"Birthday greeting sent to user {user_id} ({display_name})")
+                    greetings_sent += 1
+                    
+                    # Optional: If you want to announce birthdays in the group
+                    if ANNOUNCEMENT_TOPIC_ID:
+                        # Only share first name for privacy in public
+                        first_name = full_name.split()[0] if full_name else (username or f"one of our members")
+                        
+                        # Send more generic announcement to the group
+                        bot.send_message(
+                            PAID_GROUP_ID,
+                            f"🎂 *Happy Birthday!* 🎉\n\nPlease join us in wishing {first_name} a wonderful birthday today! 🥳",
+                            parse_mode="Markdown",
+                            message_thread_id=ANNOUNCEMENT_TOPIC_ID
+                        )
+            except (ValueError, IndexError):
+                # Skip users with incorrectly formatted birthdays
+                logging.warning(f"Invalid birthday format for user {user_id_str}: {birthday}")
+                continue
+                
+        except Exception as e:
+            logging.error(f"Error processing birthday for user {user_id_str}: {e}")
+            continue
+    
+    logging.info(f"Birthday check complete. Sent {greetings_sent} birthday greetings")
+
+def birthday_check_thread():
+    """Thread to check for user birthdays daily"""
+    logging.info("Birthday check thread started")
+    
+    # Track the last date we checked birthdays
+    last_check_date = None
+    
+    while True:
+        try:
+            # Get current time in Manila timezone
+            manila_tz = pytz.timezone('Asia/Manila')
+            now = datetime.now(manila_tz)
+            current_time = now.strftime('%H:%M')
+            current_date = now.strftime('%Y-%m-%d')
+            
+            # Run birthday checks at 9:00 AM Manila time, once per day
+            if current_time == '09:00' and current_date != last_check_date:
+                send_birthday_greetings()
+                
+                # Update the last check date
+                last_check_date = current_date
+            
+            # Calculate the time to sleep until the start of the next minute
+            sleep_time = 60 - now.second - now.microsecond / 1_000_000
+            time.sleep(sleep_time)
+            
+        except Exception as e:
+            logging.error(f"Error in birthday check thread: {e}")
+            time.sleep(60)  # Wait a minute on error before trying again
+
+@bot.message_handler(commands=['test_birthday'])
+def test_birthday_message(message):
+    """Admin command to test birthday messages"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    args = message.text.split()
+    
+    if len(args) < 2:
+        # Send to the admin who requested it
+        user_id = message.from_user.id
+        display_name = message.from_user.first_name
+        
+        # Send a test greeting
+        greeting = f"🎂 *Happy Birthday, {display_name}!* 🎉\n\nThis is a test birthday greeting. Your real one will look similar to this!"
+        
+        bot.send_message(
+            user_id,
+            greeting,
+            parse_mode="Markdown"
+        )
+        
+        bot.reply_to(message, "✅ Test birthday message sent to you. To send to another user, use /test_birthday [user_id]")
+    else:
+        try:
+            # Send to specified user
+            target_user_id = int(args[1])
+            
+            # Check if user exists in PAYMENT_DATA
+            if str(target_user_id) in PAYMENT_DATA:
+                data = PAYMENT_DATA[str(target_user_id)]
+                username = data.get('username', '')
+                full_name = data.get('form_answers', {}).get('full_name', '')
+                display_name = full_name or f"@{username}" or f"User {target_user_id}"
+                
+                # Send a test greeting
+                greeting = f"🎂 *Happy Birthday, {display_name}!* 🎉\n\n(This is a test birthday greeting sent by an admin)"
+                
+                bot.send_message(
+                    target_user_id,
+                    greeting,
+                    parse_mode="Markdown"
+                )
+                
+                bot.reply_to(message, f"✅ Test birthday message sent to user {target_user_id}")
+            else:
+                bot.reply_to(message, f"❌ User {target_user_id} not found in payment data")
+        except ValueError:
+            bot.reply_to(message, "❌ Invalid user ID. Please provide a numeric ID.")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Error sending test birthday message: {str(e)}")
+
+@bot.message_handler(commands=['generate'])
+def generate_serial(message):
+    """Generate a serial number for giveaways (admin only)"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+        
+    # Ask for mentorship type
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("Regular Mentorship", "Supreme Mentorship")
+    
+    msg = bot.reply_to(
+        message,
+        "🎁 *SERIAL NUMBER GENERATOR*\n\n"
+        "What type of mentorship is this serial for?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Set user state
+    PENDING_USERS[message.from_user.id] = {
+        'status': 'generating_serial_type',
+        'message_id': msg.message_id
+    }
+    save_pending_users()
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'generating_serial_type')
+def handle_serial_mentorship_type(message):
+    """Handle mentorship type selection for serial generation"""
+    user_id = message.from_user.id
+    mentorship_type = message.text.strip().lower()
+    
+    # Validate mentorship type
+    valid_types = ["regular mentorship", "supreme mentorship"]
+    if mentorship_type not in valid_types:
+        bot.send_message(user_id, "❌ Invalid selection. Please choose Regular or Supreme Mentorship.")
+        return
+    
+    # Extract type
+    mentorship_type = mentorship_type.split()[0].lower()  # "regular" or "supreme"
+    
+    # Store the selection
+    PENDING_USERS[user_id]['mentorship_type'] = mentorship_type
+    PENDING_USERS[user_id]['status'] = 'generating_serial_plan'
+    save_pending_users()
+    
+    # Create plan selection keyboard
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    
+    if mentorship_type == "regular":
+        markup.row("Trial Plan (1 Month)")
+        markup.row("Momentum Plan (3 Months)")
+        markup.row("Legacy Plan (Year)")
+    else:  # Supreme
+        markup.row("Apprentice Plan (3 Month)")
+        markup.row("Disciple Plan (6 Months)")
+        markup.row("Lifetime Plan (Permanent)")
+    
+    # Ask for plan selection
+    bot.send_message(
+        user_id,
+        f"📝 *SELECT PLAN*\n\n"
+        f"Which {mentorship_type.capitalize()} Mentorship plan is this serial for?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'generating_serial_plan')
+def handle_serial_plan(message):
+    """Handle plan selection for serial generation"""
+    user_id = message.from_user.id
+    plan_text = message.text.strip()
+    
+    # Extract plan ID from text
+    if "trial" in plan_text.lower():
+        plan_id = "Trial"
+    elif "momentum" in plan_text.lower():
+        plan_id = "Momentum"
+    elif "legacy" in plan_text.lower():
+        plan_id = "Legacy"
+    elif "apprentice" in plan_text.lower():
+        plan_id = "Apprentice"
+    elif "disciple" in plan_text.lower():
+        plan_id = "Disciple"
+    elif "lifetime" in plan_text.lower():
+        plan_id = "Legacy"  # Using Legacy for Lifetime plan
+    else:
+        bot.send_message(user_id, "❌ Invalid plan selection. Please select from the provided options.")
+        return
+    
+    # Store the plan
+    PENDING_USERS[user_id]['plan'] = plan_id
+    PENDING_USERS[user_id]['mentorship_type_display'] = PENDING_USERS[user_id]['mentorship_type'].capitalize()
+    PENDING_USERS[user_id]['status'] = 'confirming_serial_generation'
+    save_pending_users()
+    
+    # Create confirmation keyboard
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("✅ Yes, Generate Serial", "❌ No, Cancel")
+    
+    # Ask for confirmation
+    bot.send_message(
+        user_id,
+        f"🔍 *CONFIRM SERIAL GENERATION*\n\n"
+        f"You are about to generate a serial for:\n\n"
+        f"• *Mentorship Type:* {PENDING_USERS[user_id]['mentorship_type_display']}\n"
+        f"• *Plan:* {plan_id}\n\n"
+        f"Is this correct?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'confirming_serial_generation')
+def handle_serial_confirmation(message):
+    """Handle confirmation for serial generation"""
+    user_id = message.from_user.id
+    response = message.text.strip()
+    
+    # Create a keyboard remover
+    markup = ReplyKeyboardRemove()
+    
+    if response == "✅ Yes, Generate Serial":
+        # Proceed with generation
+        # Call the function without parameters and process the result
+        serial = generate_unique_serial()
+        process_generated_serial(user_id, message, serial)
+    elif response == "❌ No, Cancel":
+        bot.send_message(
+            user_id,
+            "❌ Serial generation cancelled.",
+            reply_markup=markup
+        )
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+    else:
+        bot.send_message(user_id, "❌ Invalid response. Please select one of the provided options.")
+
+
+def generate_unique_serial():
+    """Generate a unique serial number in Synapse X style format"""
+    while True:
+        # Generate UUID-like components using hexadecimal characters
+        hex_chars = '0123456789abcdef'
+        
+        # Generate the 5 parts with appropriate lengths
+        part1 = ''.join(random.choice(hex_chars) for _ in range(8))
+        part2 = ''.join(random.choice(hex_chars) for _ in range(4))
+        part3 = ''.join(random.choice(hex_chars) for _ in range(4))
+        part4 = ''.join(random.choice(hex_chars) for _ in range(4))
+        part5 = ''.join(random.choice(hex_chars) for _ in range(12))
+        
+        # Combine with hyphens in Synapse X format
+        serial = f"{part1}-{part2}-{part3}-{part4}-{part5}"
+        
+        # Check if serial already exists
+        if serial not in SERIAL_NUMBERS:
+            return serial
+
+
+def process_generated_serial(user_id, message, serial):
+    """Process a newly generated serial number"""
+    # Create a keyboard remover
+    markup = ReplyKeyboardRemove()
+    
+    # Get the user data from the pending users dict
+    user_data = PENDING_USERS.get(user_id, {})
+    mentorship_type = user_data.get('mentorship_type', 'regular')
+    plan = user_data.get('plan', 'Trial')
+    
+    # Create a document for the serial
+    serial_doc = {
+        "serial": serial,
+        "mentorship_type": mentorship_type,
+        "plan": plan,
+        "created_by": user_id,
+        "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "used": False
+    }
+    
+    # Save to database
+    try:
+        serial_numbers_collection.insert_one(serial_doc)
+        
+        # Update the global dictionary
+        SERIAL_NUMBERS[serial] = serial_doc
+        
+        # Format mentorship type for display
+        mentorship_display = mentorship_type.capitalize()
+        
+        # Send confirmation with the serial
+        bot.send_message(
+            user_id,
+            f"✅ *SERIAL GENERATED SUCCESSFULLY*\n\n"
+            f"• *Serial:* `{serial}`\n"
+            f"• *Mentorship Type:* {mentorship_display}\n"
+            f"• *Plan:* {plan}\n\n"
+            f"This serial can be redeemed using the `/redeem` command.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        # Log the action
+        admin_username = message.from_user.username or f"Admin {user_id}"
+        logging.info(f"Serial {serial} generated by {admin_username} for {mentorship_type} {plan}")
+        
+    except Exception as e:
+        # Send error message
+        bot.send_message(
+            user_id,
+            f"❌ Error generating serial: {str(e)}",
+            reply_markup=markup
+        )
+        logging.error(f"Error saving serial: {e}")
+    
+    # Clean up
+    PENDING_USERS.pop(user_id, None)
+    delete_pending_user(user_id)
+        
+@bot.message_handler(commands=['redeem'])
+def redeem_serial(message):
+    """Redeem a serial number for a free membership"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Only allow in private chat
+    if message.chat.type != 'private':
+        bot.reply_to(message, "🔒 Please use this command in a private message with the bot for security.")
+        return
+    
+    # Check if user is already in the middle of something
+    if user_id in PENDING_USERS:
+        current_status = PENDING_USERS[user_id].get('status', '')
+        if current_status.startswith('redeeming'):
+            bot.reply_to(message, "⏳ You already have a redemption in progress. Please complete it or send /cancel to stop.")
+            return
+        elif 'choosing' in current_status:
+            bot.reply_to(message, "⏳ You're in the middle of another process. Please finish that first or send /cancel to stop.")
+            return
+    
+    # Start the redemption process
+    PENDING_USERS[user_id] = {
+        'status': 'redeeming_serial',
+    }
+    save_pending_users()
+    
+    # Ask for serial number
+    bot.reply_to(
+        message,
+        "🎁 *SERIAL NUMBER REDEMPTION*\n\n"
+        "Please enter your serial number in the exact format it was provided (e.g., 629326d5-a191-cefb-e7e8-e18bcd774b1a).\n\n"
+        "Type /cancel to cancel the redemption process.",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'redeeming_serial')
+def handle_serial_input(message):
+    """Process the serial number input from the user"""
+    user_id = message.from_user.id
+    serial_input = message.text.strip()  # Don't convert to uppercase here
+    
+    # Check if it's a cancel command
+    if serial_input.upper() == '/cancel_redeem':
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+        bot.reply_to(message, "❌ Serial redemption cancelled.")
+        return
+    
+    # Validate serial number format (optional)
+    if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', serial_input.lower()):
+        bot.reply_to(
+            message, 
+            "❌ Invalid serial format. Please enter the serial exactly as provided (e.g., 629326d5-a191-cefb-e7e8-e18bcd774b1a).\n\n"
+            "Try again or send /cancel to stop."
+        )
+        return
+    
+    # Case-insensitive check for the serial key
+    serial = None
+    for key in SERIAL_NUMBERS:
+        if key.lower() == serial_input.lower():
+            serial = key  # Use the original key from the dictionary
+            break
+    
+    # Check if serial exists in database
+    if serial is None:
+        bot.reply_to(
+            message,
+            "❌ *Invalid Serial Number*\n\n"
+            "The serial number you entered is not recognized. Please check and try again, or contact an administrator for assistance.\n\n"
+            "Try again or send /cancel to stop.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Rest of your code remains the same...
+    # Check if serial has already been used
+    serial_data = SERIAL_NUMBERS[serial]
+    if serial_data.get('used', False):
+        used_at = serial_data.get('used_at', 'Unknown date')
+        bot.reply_to(
+            message,
+            f"❌ *Serial Already Used*\n\n"
+            f"This serial number has already been redeemed on {used_at}.\n\n"
+            f"Please contact an administrator if you believe this is an error.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Store serial and proceed with confirmation
+    PENDING_USERS[user_id]['serial'] = serial
+    PENDING_USERS[user_id]['serial_data'] = serial_data
+    PENDING_USERS[user_id]['status'] = 'confirming_redemption'
+    save_pending_users()
+    
+    # Get plan details
+    mentorship_type = serial_data.get('mentorship_type', 'regular').capitalize()
+    plan = serial_data.get('plan', 'Unknown')
+    
+    # Create confirmation keyboard
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.row("✅ Yes, Redeem Now", "❌ Cancel")
+    
+    # Send confirmation message
+    bot.reply_to(
+        message,
+        f"🔍 *SERIAL VERIFICATION SUCCESSFUL*\n\n"
+        f"You are about to redeem a serial for:\n"
+        f"• *Mentorship Type:* {mentorship_type}\n"
+        f"• *Plan:* {plan}\n\n"
+        f"Would you like to redeem this serial now?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=['debug_serial'])
+def debug_serial(message):
+    """Debug a specific serial number (admin only)"""
+    global SERIAL_NUMBERS  # Add this line to fix the error
+    
+    # Check if user is admin
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: /debug_serial [serial]")
+        return
+        
+    serial = args[1]
+    
+    # Check if serial exists in SERIAL_NUMBERS dictionary
+    if serial in SERIAL_NUMBERS:
+        serial_data = SERIAL_NUMBERS[serial]
+        bot.reply_to(message, 
+            f"✅ Serial found in memory:\n\n"
+            f"Serial: `{serial}`\n"
+            f"Type: {serial_data.get('mentorship_type', 'unknown')}\n"
+            f"Plan: {serial_data.get('plan', 'unknown')}\n"
+            f"Used: {serial_data.get('used', False)}",
+            parse_mode="Markdown"
+        )
+    else:
+        # If not in memory, check directly in database
+        db_result = serial_numbers_collection.find_one({"serial": serial})
+        if db_result:
+            bot.reply_to(message,
+                f"⚠️ Serial found in database but NOT in memory:\n\n"
+                f"Serial: `{serial}`\n"
+                f"Data: {db_result}",
+                parse_mode="Markdown"
+            )
+            
+            # Refresh SERIAL_NUMBERS to fix the issue
+            SERIAL_NUMBERS = load_serial_numbers()
+            bot.reply_to(message, "♻️ SERIAL_NUMBERS dictionary has been refreshed from database.")
+        else:
+            bot.reply_to(message,
+                f"❌ Serial not found in memory or database: `{serial}`",
+                parse_mode="Markdown"
+            )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'confirming_redemption')
+def handle_redemption_confirmation(message):
+    """Process the user's confirmation for serial redemption"""
+    user_id = message.from_user.id
+    response = message.text.strip()
+    
+    # Create a keyboard remover
+    markup = ReplyKeyboardRemove()
+    
+    if response == "✅ Yes, Redeem Now":
+        # Get serial data
+        serial = PENDING_USERS[user_id]['serial']
+        serial_data = PENDING_USERS[user_id]['serial_data']
+        
+        # Mark serial as used
+        serial_data['used'] = True
+        serial_data['used_by'] = user_id
+        serial_data['used_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Update database
+        if save_serial_number(serial, serial_data):
+            # Update global variable
+            SERIAL_NUMBERS[serial] = serial_data
+            
+            # Get user info
+            username = message.from_user.username or f"User {user_id}"
+            
+            # Set up payment data for this user
+            user_id_str = str(user_id)
+            mentorship_type = serial_data.get('mentorship_type', 'regular')
+            plan = serial_data.get('plan', 'Trial')
+            
+            # Calculate due date based on plan - UPDATED TO MATCH UI
+            due_date = None
+            if plan == "Trial":  # Regular 1 month
+                due_date = datetime.now() + timedelta(days=30)
+            elif plan == "Momentum":  # Regular 3 months
+                due_date = datetime.now() + timedelta(days=90)
+            elif plan == "Legacy" and mentorship_type == "regular":  # Regular year
+                due_date = datetime.now() + timedelta(days=365)  # Fixed: Was 180, now 365 days
+            elif plan == "Apprentice":  # Supreme 3 months
+                due_date = datetime.now() + timedelta(days=90)  # Fixed: Was 30, now 90 days
+            elif plan == "Disciple":  # Supreme 6 months
+                due_date = datetime.now() + timedelta(days=180)  # Fixed: Was 90, now 180 days
+            elif plan == "Legacy" and mentorship_type == "supreme":  # Supreme lifetime
+                due_date = datetime.now() + timedelta(days=3650)  # ~10 years (effectively permanent)
+                
+            # Create or update payment data
+            if user_id_str in PAYMENT_DATA:
+                # Update existing data
+                PAYMENT_DATA[user_id_str].update({
+                    'username': username,
+                    'payment_plan': plan,
+                    'mentorship_type': mentorship_type.capitalize(),
+                    'payment_mode': "Serial Redemption",
+                    'due_date': due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'haspayed': True,
+                    'terms_accepted': True,
+                    'privacy_accepted': True,
+                    'enrollment_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                })
+            else:
+                # Create new entry
+                PAYMENT_DATA[user_id_str] = {
+                    'username': username,
+                    'payment_plan': plan,
+                    'mentorship_type': mentorship_type.capitalize(),
+                    'payment_mode': "Serial Redemption",
+                    'due_date': due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'haspayed': True,
+                    'terms_accepted': True,
+                    'privacy_accepted': True,
+                    'enrollment_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'form_answers': {}  # Empty form answers for now
+                }
+            
+            # Save payment data
+            save_payment_data()
+            
+            # Reset PENDING_USERS status
+            PENDING_USERS[user_id] = {
+                'status': 'completed_onboarding',
+                'membership_type': mentorship_type
+            }
+            save_pending_users()
+            
+            # Send success message
+            bot.send_message(
+                user_id,
+                f"🎉 *SERIAL REDEEMED SUCCESSFULLY!*\n\n"
+                f"Congratulations! You've successfully redeemed your serial number for a free membership:\n\n"
+                f"• *Membership Type:* {mentorship_type.capitalize()}\n"
+                f"• *Plan:* {plan}\n"
+                f"• *Expiry Date:* {due_date.strftime('%Y-%m-%d')}\n\n"
+                f"Your membership is now active! You'll now need to complete the onboarding form.",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            
+            # Log the redemption
+            logging.info(f"Serial {serial} redeemed by user {username} ({user_id}) for {mentorship_type} {plan}")
+            
+            # Notify admins
+            for admin_id in ADMIN_IDS:
+                try:
+                    bot.send_message(
+                        admin_id,
+                        f"🎟️ *Serial Redeemed*\n\n"
+                        f"User @{username} has redeemed serial `{serial}`\n"
+                        f"• *Membership Type:* {mentorship_type.capitalize()}\n"
+                        f"• *Plan:* {plan}\n"
+                        f"• *Expiry Date:* {due_date.strftime('%Y-%m-%d')}\n\n"
+                        f"The user now has free access to this membership.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to notify admin {admin_id} about serial redemption: {e}")
+            
+            # Start the onboarding form process
+            send_onboarding_form(user_id)
+            
+        else:
+            bot.send_message(
+                user_id,
+                "❌ There was an error processing your serial redemption. Please contact an administrator.",
+                reply_markup=markup
+            )
+            PENDING_USERS.pop(user_id, None)
+            delete_pending_user(user_id)
+            
+    elif response == "❌ Cancel":
+        bot.send_message(
+            user_id,
+            "❌ Serial redemption cancelled.",
+            reply_markup=markup
+        )
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+        
+    else:
+        bot.send_message(user_id, "❌ Invalid response. Please select one of the provided options.")
+
+@bot.message_handler(commands=['list_serials'])
+def list_serials(message):
+    """List all serial numbers (admin only)"""
+    # Check if user is admin or creator
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    # Check if there are any serials
+    if not SERIAL_NUMBERS:
+        bot.reply_to(message, "ℹ️ No serial numbers have been generated yet.")
+        return
+    
+    # Parse command arguments
+    args = message.text.split()
+    filter_status = None
+    
+    if len(args) > 1:
+        if args[1].lower() == "used":
+            filter_status = True
+        elif args[1].lower() == "unused":
+            filter_status = False
+    
+    # Build the list
+    serial_list = "🔑 *SERIAL NUMBERS*\n\n"
+    count = 0
+    
+    for serial, data in SERIAL_NUMBERS.items():
+        # Apply filter if specified
+        if filter_status is not None and data.get('used', False) != filter_status:
+            continue
+            
+        count += 1
+        if count > 20:  # Limit to 20 serials to avoid message length issues
+            serial_list += f"\n... and {len(SERIAL_NUMBERS) - 20} more serials."
+            break
+            
+        # Format serial info
+        status = "✅ Used" if data.get('used', False) else "⏳ Available"
+        mentorship_type = data.get('mentorship_type', 'regular').capitalize()
+        plan = data.get('plan', 'Unknown')
+        
+        serial_list += f"*{serial}*\n"
+        serial_list += f"• Status: {status}\n"
+        serial_list += f"• Type: {mentorship_type}\n"
+        serial_list += f"• Plan: {plan}\n"
+        
+        if data.get('used', False):
+            used_by = data.get('used_by', 'Unknown')
+            used_at = data.get('used_at', 'Unknown date')
+            serial_list += f"• Used by: User {used_by}\n"
+            serial_list += f"• Used on: {used_at}\n"
+        
+        serial_list += "\n"
+    
+    # Add usage instructions
+    filter_note = ""
+    if filter_status is not None:
+        filter_type = "used" if filter_status else "unused"
+        filter_note = f" (filtered: {filter_type} only)"
+    
+    serial_list += f"Total: {count} serials{filter_note}\n"
+    serial_list += "Use `/list_serials used` or `/list_serials unused` to filter."
+    
+    bot.reply_to(message, serial_list, parse_mode="Markdown")
+
+# Handler for /update command
+@bot.message_handler(commands=['update'])
+def handle_update_command(message):
+    """Handle the /update command to opt in for notifications"""
+    user_id = message.from_user.id
+    
+    # Check if user is already subscribed
+    is_subscribed = user_id in UPDATE_SUBSCRIBERS
+    
+    # Create inline keyboard with Yes/No options
+    markup = InlineKeyboardMarkup(row_width=2)
+    
+    if is_subscribed:
+        markup.add(
+            InlineKeyboardButton("✅ Keep Me Updated", callback_data="update_yes"),
+            InlineKeyboardButton("❌ Unsubscribe", callback_data="update_no")
+        )
+        
+        bot.reply_to(
+            message,
+            "🔔 *Stay In The Loop!*\n\n"
+            "You're currently receiving notifications about:\n"
+            "• 🔓 Enrollment openings & closings\n"
+            "• 💰 Special discount offers\n\n"
+            "Would you like to continue receiving these updates?",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    else:
+        markup.add(
+            InlineKeyboardButton("✅ Yes, Keep Me Updated", callback_data="update_yes"),
+            InlineKeyboardButton("❌ No Thanks", callback_data="update_no")
+        )
+        
+        bot.reply_to(
+            message,
+            "🔔 *Never Miss An Opportunity!*\n\n"
+            "Would you like to receive instant notifications about:\n\n"
+            "• 🔓 When enrollment opens or closes\n"
+            "• 💰 Special discount promotions & offers\n"
+            "• 🎁 Limited-time opportunities\n\n"
+            "Stay informed about Prodigy Trading Academy opportunities!",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+
+# Callback handler for update subscription
+@bot.callback_query_handler(func=lambda call: call.data.startswith("update_"))
+def handle_update_callback(call):
+    """Handle the user's choice to receive updates"""
+    user_id = call.from_user.id
+    choice = call.data.split("_")[1]  # "yes" or "no"
+    
+    if choice == "yes":
+        # Add user to subscribers list if not already there
+        if user_id not in UPDATE_SUBSCRIBERS:
+            UPDATE_SUBSCRIBERS.add(user_id)
+            save_update_subscriber(user_id)
+        
+        bot.edit_message_text(
+            "✅ *You're All Set!*\n\n"
+            "You'll now receive important notifications about:\n"
+            "• When enrollment opens or closes\n"
+            "• Special discount offers\n\n"
+            "You can unsubscribe anytime by using the `/update` command again.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "You'll receive enrollment & discount updates! ✅")
+        logging.info(f"User {user_id} subscribed to updates")
+    else:
+        # Remove user from subscribers list if present
+        if user_id in UPDATE_SUBSCRIBERS:
+            UPDATE_SUBSCRIBERS.remove(user_id)
+            remove_update_subscriber(user_id)
+        
+        bot.edit_message_text(
+            "❌ *Notifications Disabled*\n\n"
+            "You won't receive updates about enrollment changes or discount offers.\n\n"
+            "You can subscribe anytime by using the `/update` command.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "Update notifications disabled")
+        logging.info(f"User {user_id} unsubscribed from updates")
+
+def notify_enrollment_change(is_open):
+    """Notify subscribers about enrollment status changes"""
+    status = "🟢 OPEN" if is_open else "🔴 CLOSED"
+    action = "opened" if is_open else "closed"
+    message_text = (
+        f"📣 *ENROLLMENT STATUS UPDATE*\n\n"
+        f"Prodigy Trading Academy enrollment is now {status}!\n\n"
+    )
+    
+    if is_open:
+        message_text += (
+            "🎓 New students can now join the academy!\n\n"
+            "Use the /start command to begin your enrollment process."
+        )
+    else:
+        message_text += (
+            "🔒 New enrollments are temporarily paused.\n\n"
+            "Existing members can still renew their memberships."
+        )
+    
+    # Send to all subscribers
+    success_count = 0
+    fail_count = 0
+    
+    for user_id in UPDATE_SUBSCRIBERS:
+        try:
+            bot.send_chat_action(user_id, 'typing')  # First check if user can receive messages
+            
+            # Try with Markdown first
+            try:
+                bot.send_message(
+                    user_id,
+                    message_text,
+                    parse_mode="Markdown"
+                )
+            except ApiException as e:
+                # If Markdown fails, try with plain text as fallback
+                if "can't parse entities" in str(e):
+                    bot.send_message(
+                        user_id,
+                        message_text.replace('*', ''),  # Remove markdown formatting
+                        parse_mode=None
+                    )
+                    logging.warning(f"Sent enrollment update to user {user_id} without markdown formatting")
+                else:
+                    # Re-raise if it's not a markdown parsing issue
+                    raise
+                    
+            success_count += 1
+            # Add small delay to prevent hitting rate limits
+            time.sleep(0.05)
+        except Exception as e:
+            logging.error(f"Failed to send enrollment update to user {user_id}: {e}")
+            fail_count += 1
+    
+    logging.info(f"Enrollment {action}: Notified {success_count} subscribers ({fail_count} failed)")
+
+def notify_discount_created(discount_name, reg_discount, sup_discount):
+    """Notify subscribers about new discount offers"""
+    # Format discount details
+    reg_percentage = reg_discount['percentage']
+    sup_percentage = sup_discount['percentage']
+    
+    reg_end_date = datetime.strptime(reg_discount['end_date'], '%Y-%m-%d %H:%M:%S')
+    sup_end_date = datetime.strptime(sup_discount['end_date'], '%Y-%m-%d %H:%M:%S')
+    
+    # Safely escape discount name for markdown
+    safe_discount_name = safe_markdown_escape(discount_name)
+    
+    # Build the message
+    message_text = (
+        f"🔥 *SPECIAL DISCOUNT ALERT!*\n\n"
+        f"📢 **{safe_discount_name}**\n\n"
+        f"*REGULAR MEMBERSHIP PLANS*\n"
+        f"💰 **{reg_percentage}% OFF** on all regular membership plans!\n"
+        f"⏰ Valid until: {reg_end_date.strftime('%B %d, %Y')}\n\n"
+        f"*SUPREME MEMBERSHIP PLANS*\n"
+        f"💰 **{sup_percentage}% OFF** on all supreme membership plans!\n"
+        f"⏰ Valid until: {sup_end_date.strftime('%B %d, %Y')}\n\n"
+        f"🔸 Regular plans include: Trial, Momentum & Legacy\n"
+        f"🔸 Supreme plans include: Apprentice, Disciple & Lifetime\n\n"
+        f"Act fast! Use the /start command to take advantage of this limited-time offer!"
+    )
+    
+    # Create a plain text version for fallback
+    plain_message_text = message_text.replace('*', '')
+    
+    # Send to all subscribers
+    success_count = 0
+    fail_count = 0
+    
+    for user_id in UPDATE_SUBSCRIBERS:
+        try:
+            bot.send_chat_action(user_id, 'typing')  # First check if user can receive messages
+            
+            # Try with Markdown first
+            try:
+                bot.send_message(
+                    user_id,
+                    message_text,
+                    parse_mode="Markdown"
+                )
+            except ApiException as e:
+                # If Markdown fails, try with plain text as fallback
+                if "can't parse entities" in str(e):
+                    bot.send_message(
+                        user_id,
+                        plain_message_text,
+                        parse_mode=None
+                    )
+                    logging.warning(f"Sent discount update to user {user_id} without markdown formatting")
+                else:
+                    # Re-raise if it's not a markdown parsing issue
+                    raise
+                    
+            success_count += 1
+            # Add small delay to prevent hitting rate limits
+            time.sleep(0.05)
+        except Exception as e:
+            logging.error(f"Failed to send discount update to user {user_id}: {e}")
+            fail_count += 1
+    
+    logging.info(f"Discount '{discount_name}' created: Notified {success_count} subscribers ({fail_count} failed)")
+
 keep_alive()
 
 # Start reminder thread
@@ -4304,6 +13899,19 @@ leaderboard_thread.start()
 # Add this to your bot startup code
 midnight_thread = threading.Thread(target=midnight_cleanup_thread, daemon=True)
 midnight_thread.start()
+
+# Start the discount expiry thread
+discount_thread = threading.Thread(target=discount_expiry_thread, daemon=True)
+discount_thread.start()
+
+# Start the pending users cleanup thread
+pending_cleanup_thread = threading.Thread(target=cleanup_inactive_pending_users, daemon=True)
+pending_cleanup_thread.start()
+
+# Start the birthday greeting thread
+birthday_thread = threading.Thread(target=birthday_check_thread, daemon=True)
+birthday_thread.start()
+
 # Function to start the bot with auto-restart
 def start_bot():
     while True:
