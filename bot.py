@@ -33,7 +33,7 @@ DISCOUNTS = {
     'supreme': None   # Discount for Supreme membership
 }
 
-BOT_VERSION = "v5.0.3a"  # v[Major].[Minor].[Build][Status]
+BOT_VERSION = "v5.0.4a"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -5033,6 +5033,9 @@ def show_user_dashboard(message):
         data = PAYMENT_DATA[user_id]
         username = message.from_user.username or "No Username"
         
+        # Escape special markdown characters in username to prevent parsing errors
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
         # Calculate days remaining until expiration
         try:
             due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
@@ -5110,6 +5113,10 @@ def show_user_dashboard(message):
             else:
                 time_progress = "❌ Membership expired"
             
+            # Escape any special characters in payment_plan and payment_mode
+            payment_plan = data.get('payment_plan', 'Unknown')
+            payment_mode = data.get('payment_mode', 'Unknown')
+            
             # Create and send the dashboard message with improved formatting
             dashboard_message = (
                 f"📊 *MEMBERSHIP DASHBOARD*\n\n"
@@ -5119,9 +5126,9 @@ def show_user_dashboard(message):
                 f"└────────────────────────────────┘\n\n"
                 
                 f"┌─────── 💳 *SUBSCRIPTION* ────────┐\n"
-                f"│ *Plan:* {data.get('payment_plan', 'Unknown')}\n"
+                f"│ *Plan:* {payment_plan}\n"
                 f"│ *Type:* {mentorship_type} Mentorship\n"
-                f"│ *Payment Method:* {data.get('payment_mode', 'Unknown')}\n"
+                f"│ *Payment Method:* {payment_mode}\n"
                 f"└────────────────────────────────┘\n\n"
                 
                 f"┌─────── ⏱️ *STATUS* ────────┐\n"
