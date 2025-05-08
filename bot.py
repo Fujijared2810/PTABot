@@ -3329,7 +3329,7 @@ def complete_onboarding(user_id):
         # IMPORTANT: Generate and send certificate BEFORE the welcome package
         send_completion_certificate(user_id)
 
-        time.sleep(2)
+        time.sleep(1)
             
         # Send the Welcome to Academy graphic
         try:
@@ -3350,10 +3350,56 @@ def complete_onboarding(user_id):
         # 1. Send social media connections
         send_welcome_package(user_id)
         
-        # 2. Send group invite if we have one saved
+        # 2. Send group invite - FIXED VERSION FOR SERIAL REDEMPTION
         invite_link = PENDING_USERS[user_id].get('invite_link')
         already_in_group = PENDING_USERS[user_id].get('already_in_group', False)
-        target_group_id = PENDING_USERS[user_id].get('target_group_id', PAID_GROUP_ID)
+        membership_type = PENDING_USERS[user_id].get('membership_type', 'regular')
+        
+        # Determine target group based on membership type
+        target_group_id = SUPREME_GROUP_ID if membership_type == 'supreme' else PAID_GROUP_ID
+        
+        # If we don't have an invite link yet, generate one
+        if not invite_link and not already_in_group:
+            try:
+                # Generate a new invite link
+                new_invite = bot.create_chat_invite_link(
+                    target_group_id,
+                    name=f"User {user_id} onboarding",
+                    creates_join_request=False,
+                    member_limit=1,
+                    expire_date=int((datetime.now() + timedelta(minutes=15)).timestamp())
+                )
+                invite_link = new_invite.invite_link
+                
+                # Save the new invite link
+                PENDING_USERS[user_id]['invite_link'] = invite_link
+                PENDING_USERS[user_id]['target_group_id'] = target_group_id
+                save_pending_users()
+                
+                logging.info(f"Generated new invite link for user {user_id} joining group {target_group_id}")
+            except Exception as e:
+                logging.error(f"Failed to create invite link for user {user_id}: {e}")
+                
+                # Send error notification to admins
+                for admin_id in ADMIN_IDS:
+                    bot.send_message(
+                        admin_id,
+                        f"⚠️ *Error generating invite link*\n\n"
+                        f"Could not create invite link for user {user_id} during serial redemption flow.\n"
+                        f"Error: {e}\n\n"
+                        f"Please manually send an invite to this user.",
+                        parse_mode="Markdown"
+                    )
+                
+                # Notify user about the issue
+                bot.send_message(
+                    user_id,
+                    "⚠️ *Group Invite Pending*\n\n"
+                    "We're currently having trouble generating your group invite link. "
+                    "An admin has been notified and will send you an invite shortly.\n\n"
+                    "Thank you for your patience!",
+                    parse_mode="Markdown"
+                )
         
         # Get group name based on target group ID
         group_name = "Supreme Mentorship" if target_group_id == SUPREME_GROUP_ID else "Prodigy Trading Academy"
@@ -3380,7 +3426,7 @@ def complete_onboarding(user_id):
             )
             
             # Wait 2 seconds for user to read disclaimer before sending invite
-            time.sleep(2)
+            time.sleep(1)
             
             # Add another transition message before sending group invite
             group_transition_msg = bot.send_message(user_id, "🔗 Generating your exclusive group invite link...")
@@ -3399,7 +3445,7 @@ def complete_onboarding(user_id):
             
             # Set up delayed link revocation with longer timeout (15 seconds)
             def revoke_link_later(chat_id, invite_link, admin_ids):
-                time.sleep(60)  # Wait 10 seconds before revoking (increased from 10)
+                time.sleep(60)  # Wait 60 seconds before revoking
                 try:
                     bot.revoke_chat_invite_link(chat_id, invite_link)
                     for admin_id in admin_ids:
@@ -3412,6 +3458,7 @@ def complete_onboarding(user_id):
         # 3. Record user form responses for admin reference
         try:
             form_answers = PENDING_USERS[user_id]['form_answers']
+            # Update membership_type if it wasn't already set
             membership_type = PENDING_USERS[user_id].get('membership_type', 'regular')
             
             # Check if this is a renewal - if so, skip admin notifications
