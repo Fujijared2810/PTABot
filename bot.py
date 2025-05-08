@@ -33,7 +33,7 @@ DISCOUNTS = {
     'supreme': None   # Discount for Supreme membership
 }
 
-BOT_VERSION = "v5.0.5a"  # v[Major].[Minor].[Build][Status]
+BOT_VERSION = "v5.0.6a"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -3934,8 +3934,18 @@ def send_payment_reminder():
                 for user_id_str, data in PAYMENT_DATA.items():
                     try:
                         user_id = int(user_id_str)
+
+                        # Check if due_date exists before trying to access it
+                        if 'due_date' not in data:
+                            logging.error(f"Error processing payment reminder for {user_id_str}: 'due_date' field missing")
+                            continue
+
                         # Get the naive datetime first
-                        naive_due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                        try:
+                            naive_due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                        except ValueError as e:
+                            logging.error(f"Error processing payment reminder for {user_id_str}: invalid due_date format - {e}")
+                            continue
                         
                         # Make it timezone-aware by adding Manila timezone
                         manila_tz = pytz.timezone('Asia/Manila')
