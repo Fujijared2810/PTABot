@@ -3399,7 +3399,7 @@ def complete_onboarding(user_id):
             
             # Set up delayed link revocation with longer timeout (15 seconds)
             def revoke_link_later(chat_id, invite_link, admin_ids):
-                time.sleep(10)  # Wait 10 seconds before revoking (increased from 10)
+                time.sleep(60)  # Wait 10 seconds before revoking (increased from 10)
                 try:
                     bot.revoke_chat_invite_link(chat_id, invite_link)
                     for admin_id in admin_ids:
@@ -14003,17 +14003,87 @@ birthday_thread.start()
 
 # Function to start the bot with auto-restart
 def start_bot():
+    """Start the bot with enhanced error handling and reconnection logic"""
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    backoff_time = 5  # Initial backoff time in seconds
+    max_backoff_time = 300  # Maximum backoff time (5 minutes)
+    
     while True:
         try:
             logging.info("Starting the bot...")
-            # Add these lines to help prevent the 409 conflict error
-            bot.delete_webhook()  # Ensure no webhooks are active
-            time.sleep(10)  # Wait a moment to ensure previous connections are closed
+            
+            # Ensure clean start with no active webhooks
+            try:
+                bot.delete_webhook()
+                logging.info("Webhook deleted successfully")
+            except Exception as webhook_error:
+                logging.warning(f"Error deleting webhook: {webhook_error}")
+            
+            # Add connection status tracking
+            connection_time = datetime.now()
+            logging.info(f"Bot connecting at {connection_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # Wait for any previous connections to close
+            time.sleep(10)
+            
+            # Start polling with better parameters
             bot.polling()
-            logging.info("Bot is online")
+            
+            # Reset error counter on successful connection
+            consecutive_errors = 0
+            backoff_time = 5
+            
+            logging.info("Bot is online and processing messages")
+            
+        except requests.exceptions.ReadTimeout:
+            # Handle timeout separately - this is generally not critical
+            logging.warning("Connection timeout, reconnecting...")
+            time.sleep(3)
+            
+        except requests.exceptions.ConnectionError:
+            # Network connection issues
+            consecutive_errors += 1
+            wait_time = min(backoff_time * consecutive_errors, max_backoff_time)
+            logging.error(f"Network connection error. Attempt {consecutive_errors}. Waiting {wait_time}s before retry.")
+            time.sleep(wait_time)
+            
+        except telebot.apihelper.ApiException as api_error:
+            # Handle Telegram API errors
+            consecutive_errors += 1
+            
+            if "429" in str(api_error):  # Rate limiting
+                # Extract retry_after if available
+                retry_after = 30  # Default
+                if hasattr(api_error, 'result') and 'retry_after' in api_error.result.json:
+                    retry_after = api_error.result.json['retry_after']
+                    
+                logging.warning(f"Rate limited by Telegram. Waiting {retry_after}s before retry.")
+                time.sleep(retry_after + 1)  # Add 1 second buffer
+            elif "409" in str(api_error):  # Conflict error
+                logging.error("Conflict error (409). Another instance might be running.")
+                time.sleep(15)  # Wait longer for conflict errors
+            else:
+                wait_time = min(backoff_time * consecutive_errors, max_backoff_time)
+                logging.error(f"Telegram API error: {api_error}. Waiting {wait_time}s before retry.")
+                time.sleep(wait_time)
+        
         except Exception as e:
-            logging.error(f"Error occurred: {e}")
-            time.sleep(5)  # Wait for 5 seconds before restarting
+            # General exception handling with exponential backoff
+            consecutive_errors += 1
+            wait_time = min(backoff_time * consecutive_errors, max_backoff_time)
+            
+            # Log more detailed error information
+            logging.error(f"Error occurred: {e}", exc_info=True)
+            logging.error(f"Consecutive errors: {consecutive_errors}. Waiting {wait_time}s before retry.")
+            
+            # Check if we've hit too many consecutive errors
+            if consecutive_errors >= max_consecutive_errors:
+                logging.critical(f"Hit {max_consecutive_errors} consecutive errors. Attempting bot reset.")
+                # Could add additional recovery logic here
+                consecutive_errors = 0  # Reset counter after recovery attempt
+            
+            time.sleep(wait_time)
             logging.info("Restarting the bot...")
 if __name__ == "__main__":
     start_bot()
