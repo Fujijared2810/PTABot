@@ -2840,44 +2840,44 @@ def changelogs_page():
         current_time=current_time
     )
 
-def ping_server():
-    """Send a request to keep the server alive"""
-    try:
-        # Replace with your actual Render.com URL
-        url = "https://ptabot.onrender.com/"  # Replace this with your actual URL
+# def ping_server():
+#     """Send a request to keep the server alive"""
+#     try:
+#         # Replace with your actual Render.com URL
+#         url = "https://ptabot.onrender.com/"  # Replace this with your actual URL
         
-        # Get current time in Philippines timezone for logging
-        manila_time = datetime.now(pytz.timezone('Asia/Manila')).strftime('%Y-%m-%d %I:%M:%S %p')
+#         # Get current time in Philippines timezone for logging
+#         manila_time = datetime.now(pytz.timezone('Asia/Manila')).strftime('%Y-%m-%d %I:%M:%S %p')
         
-        # Send the request
-        response = requests.get(url, timeout=30)
+#         # Send the request
+#         response = requests.get(url, timeout=30)
         
-        if response.status_code == 200:
-            logging.info(f"[{manila_time}] Keep-alive ping successful")
-        else:
-            logging.warning(f"[{manila_time}] Keep-alive ping failed with status code: {response.status_code}")
+#         if response.status_code == 200:
+#             logging.info(f"[{manila_time}] Keep-alive ping successful")
+#         else:
+#             logging.warning(f"[{manila_time}] Keep-alive ping failed with status code: {response.status_code}")
     
-    except Exception as e:
-        logging.error(f"Error sending keep-alive ping: {e}")
+#     except Exception as e:
+#         logging.error(f"Error sending keep-alive ping: {e}")
 
-def setup_keep_alive_scheduler():
-    """Set up a scheduler to keep the server alive"""
-    scheduler = BackgroundScheduler()
+# def setup_keep_alive_scheduler():
+#     """Set up a scheduler to keep the server alive"""
+#     scheduler = BackgroundScheduler()
     
-    # Add job to run every 14 minutes (just like the JS version)
-    scheduler.add_job(
-        ping_server,
-        IntervalTrigger(minutes=14),
-        id='keep_alive_job',
-        name='Keep server alive',
-        replace_existing=True
-    )
+#     # Add job to run every 14 minutes (just like the JS version)
+#     scheduler.add_job(
+#         ping_server,
+#         IntervalTrigger(minutes=14),
+#         id='keep_alive_job',
+#         name='Keep server alive',
+#         replace_existing=True
+#     )
     
-    # Start the scheduler
-    scheduler.start()
-    logging.info("Keep-alive scheduler started - pinging every 14 minutes")
+#     # Start the scheduler
+#     scheduler.start()
+#     logging.info("Keep-alive scheduler started - pinging every 14 minutes")
     
-    return scheduler
+#     return scheduler
 
 def run():
     app.run(host='0.0.0.0', port=8080)
@@ -2888,9 +2888,6 @@ def keep_alive():
     t.daemon = True
     t.start()
     logging.info("Web interface started at http://0.0.0.0:8080")
-    
-    # Set up the ping scheduler
-    scheduler = setup_keep_alive_scheduler()
     
     # Log that both systems are running
     logging.info("PTABot server and keep-alive system are now running")

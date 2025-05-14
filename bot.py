@@ -26,14 +26,14 @@ import io
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
-
+import json
 
 DISCOUNTS = {
     'regular': None,  # Discount for Regular membership
     'supreme': None   # Discount for Supreme membership
 }
 
-BOT_VERSION = "v5.0.6a"  # v[Major].[Minor].[Build][Status]
+BOT_VERSION = "v5.1.10a"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -44,6 +44,8 @@ ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
 PAID_GROUP_ID = int(os.getenv('PAID_GROUP_ID'))
 CREATOR_ID = int(os.getenv('CREATOR_ID', '0'))
 SUPREME_GROUP_ID = int(os.getenv('SUPREME_GROUP_ID'))
+QWEN_API_KEY = os.getenv('QWEN_API_KEY')
+QWEN_API_URL = os.getenv('QWEN_API_URL', 'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/text-generation/generation')
 
 # Initialize MongoDB connection
 client = MongoClient(MONGO_URI)
@@ -65,6 +67,51 @@ mentors_collection = db['mentors']
 serial_numbers_collection = db["serial_numbers"]
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# Rich context template for more accurate responses
+QWEN_PROMPT_TEMPLATE = """You are the AI assistant for Prodigy Trading Academy (PTA), a top-tier trading education platform.
+
+### IDENTITY
+- Friendly, professional, and passionate about trading education
+- Educator first — never give signals or financial advice
+- Conversational tone with clear, concise responses
+- Use emojis sparingly to keep interactions engaging
+
+### RESPONSIBILITIES
+1. Teach trading concepts clearly (e.g., market structure, price action, risk management).
+2. Explain terms simply, especially for beginners.
+3. Help users manage memberships and access content.
+4. Provide daily challenge support and progress tracking.
+5. Encourage journaling, discipline, and long-term growth.
+
+### MEMBERSHIP INFO
+- Regular Membership:
+  - Trial: $7.99/month
+  - Momentum: $20.99/3 months
+  - Legacy: $89.99/year
+- Supreme Membership:
+  - Apprentice: $309.99/3 months
+  - Disciple: $524.99/6 months
+  - Legacy: $899.99/lifetime
+- Payment options: PayPal, GCash, Bank Transfer, Exness Direct
+- Renewals allowed only within 3 days of expiration
+
+Always provide exact dates and numbers from user data — never say “check your dashboard.”
+
+### FORMATTING RULES
+- Speak naturally like a friend chatting
+- Avoid markdown (no ###)
+- Keep paragraphs short for mobile readability
+- Never mention you're an AI unless asked directly
+
+### BEST PRACTICES
+- Guide users to start with `/start`
+- Use numbered steps when explaining processes
+- Mention commands like `/dashboard`, `/verify`, and `/ai` where relevant
+- Be helpful, not verbose
+- Stay educational, never prescriptive
+
+You exist to help people become better traders — always stay focused on that goal."""
 
 def get_exchange_rates():
     """Fetch real-time exchange rates for multiple currencies against USD"""
@@ -717,6 +764,23 @@ def save_confession_counter(value):
     except Exception as e:
         logging.error(f"Error saving confession counter: {e}")
 
+def load_qwen_usage():
+    """Load AI usage data from MongoDB"""
+    try:
+        usage_data = {}
+        for doc in jarvis_usage_collection.find():
+            user_id = doc.get('user_id')
+            if user_id:
+                usage_data[user_id] = {
+                    'count': doc.get('count', 0),
+                    'last_used': doc.get('last_used', 0)
+                }
+        logging.info(f"Loaded AI usage data for {len(usage_data)} users from MongoDB")
+        return usage_data
+    except Exception as e:
+        logging.error(f"Error loading AI usage data: {e}")
+        return {}
+
 # Dictionaries to store user payment data
 UPDATE_SUBSCRIBERS = set()
 MENTORS = {}
@@ -725,6 +789,7 @@ USER_PAYMENT_DUE = {}
 CONFESSION_COUNTER = 0
 USERS_CONFESSING = {}
 PDF_MESSAGE_IDS = {}
+QWEN_USAGE = load_qwen_usage()
 PAYMENT_DATA = load_payment_data()
 PENDING_USERS = load_pending_users() 
 CHANGELOGS = load_changelogs()
@@ -746,38 +811,6 @@ SERIAL_NUMBERS = load_serial_numbers()
 
 
 ### Different types of messages for the bot ###
-
-already_confirmed_messages = [
-    "❗ You are already confirmed as an old member of PTA.",
-    "✅ Your status as an old PTA member is already verified in our system!",
-    "ℹ️ No need to verify again - you're already confirmed as an original PTA member.",
-    "👍 Great news! You're already verified as a legacy PTA member in our database.",
-    "🔄 Your old member status is already active in our system - no further verification needed."
-]
-
-confirmation_success_messages = [
-    "✅ You have been confirmed as an old member of PTA!",
-    "🎉 Great news! Your old member status has been verified successfully.",
-    "✅ Verification complete! You've been confirmed as an original PTA member.",
-    "🌟 Success! Your long-term membership has been recognized in our system.",
-    "✅ Congratulations! Your status as an original PTA member has been verified."
-]
-
-admin_confirm_messages = [
-    "✅ User confirmed successfully.",
-    "✅ Old member status verified!",
-    "✅ User has been granted legacy member status.",
-    "✅ Member verification completed successfully.",
-    "✅ Confirmation process completed - user verified as old member."
-]
-
-rejection_messages = [
-    "❌ Your request to be an old member has been rejected. Please reach out to the admins for more details or use /start to try again.",
-    "❌ Unfortunately, we couldn't verify your old member status at this time. Please contact an admin for clarification or use /start to continue.",
-    "❌ Your old member verification was not approved. For more information, please contact the admin team or use /start to explore other options.",
-    "❌ We were unable to confirm your previous membership status. Please reach out to our team for assistance or use /start to begin again.",
-    "❌ Your legacy membership verification was unsuccessful. Please contact an admin for more details or use /start to see available options."
-]
 
 payment_review_messages = [
     "✅ *Verification in progress*\n\nYour payment confirmation is under review. Our admin team will verify it shortly and notify you once complete.",
@@ -815,14 +848,6 @@ payment_rejection_messages = [
     "❌ *Payment Rejected*\n\nWe couldn't process your payment verification. Please ensure you've completed the payment correctly and submit a new verification request."
 ]
 
-pending_verification_messages = [
-    "⚠️ You have a pending membership verification request. Admins are reviewing your request. Please wait for their response.",
-    "⏳ Your membership verification is still being reviewed by our admin team. We'll notify you as soon as they've made a decision.",
-    "📝 We've received your membership verification request and it's currently under review. Our team will get back to you shortly.",
-    "⌛ Your verification request is in our admin queue. Thanks for your patience while they review your details.",
-    "🔍 Our admin team is still reviewing your membership verification. We'll notify you as soon as there's an update."
-]
-
 pending_payment_messages = [
     "⚠️ You have a pending payment verification. Admins are reviewing your payment proof. Please wait for their response.",
     "💼 Your payment is currently being verified by our admin team. We'll notify you once the process is complete.",
@@ -832,6 +857,442 @@ pending_payment_messages = [
 ]
 
 ### COMMAND HANDLERS ###
+
+@bot.message_handler(commands=['chat', 'ask', 'ai'])
+def handle_ai_chat(message):
+    """Handle AI chat requests using QWEN model"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Check if in private chat
+    if message.chat.type != 'private':
+        bot.reply_to(message, "📝 Please use this command in a private chat with the bot for better assistance.")
+        return
+    
+    # Initialize conversation history with system message
+    if user_id not in QWEN_USAGE:
+        QWEN_USAGE[user_id] = {'last_used': time.time(), 'count': 0}
+    
+    # Reset messages to only include the system message at the start of a new conversation
+    QWEN_USAGE[user_id]['messages'] = [{
+        "role": "system",
+        "content": QWEN_PROMPT_TEMPLATE
+    }]
+    
+    # Extract query from message
+    query_text = message.text.split(' ', 1)
+    if len(query_text) > 1:
+        # Query included in command
+        query_text = query_text[1].strip()
+        process_ai_query(chat_id, user_id, query_text)
+    else:
+        # No query provided, welcome them to chat mode
+        bot.send_message(
+            chat_id, 
+            "🤖 *AI Assistant Mode Activated*\n\n"
+            "I'm here to help with your trading questions! Just type your question and I'll respond.\n\n"
+            "When you're done, simply type `/exit` to end our conversation.",
+            parse_mode="Markdown"
+        )
+        # Set user status to conversation_active (new status)
+        PENDING_USERS[user_id] = {'status': 'conversation_active'}
+        save_pending_users()
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'awaiting_ai_query')
+def handle_ai_query_input(message):
+    """Handle follow-up input for AI queries - this will be used less with the new conversational flow"""
+    # Check if in private chat
+    if message.chat.type != 'private':
+        return
+    
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    query_text = message.text
+    
+    # Clear the awaiting status and set to conversation mode
+    PENDING_USERS[user_id]['status'] = 'conversation_active'
+    save_pending_users()
+    
+    # Process the query
+    process_ai_query(chat_id, user_id, query_text)
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'conversation_active')
+def handle_conversation(message):
+    """Handle ongoing conversation with the AI"""
+    # Check if in private chat
+    if message.chat.type != 'private':
+        return
+    
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Check for exit command
+    if message.text.lower().strip() == "/exit":
+        PENDING_USERS[user_id]['status'] = 'at_main_menu'  # Reset to main menu
+        save_pending_users()
+        
+        # Clear conversation history
+        if user_id in QWEN_USAGE and 'messages' in QWEN_USAGE[user_id]:
+            # Keep only the system message
+            if QWEN_USAGE[user_id]['messages'] and QWEN_USAGE[user_id]['messages'][0]['role'] == 'system':
+                QWEN_USAGE[user_id]['messages'] = [QWEN_USAGE[user_id]['messages'][0]]
+            else:
+                QWEN_USAGE[user_id]['messages'] = []
+            logging.info(f"Cleared conversation history for user {user_id}")
+        
+        bot.send_message(
+            chat_id,
+            "👋 *AI Assistant Mode Deactivated*\n\nThank you for chatting! If you need my help again, just use `/ask`, `/chat`, or `/ai`.",
+            parse_mode="Markdown"
+        )
+        # Add this line to show the main menu after exiting AI chat
+        show_main_menu(chat_id, user_id)
+        return
+    
+    # Otherwise, process as a query
+    query_text = message.text
+    process_ai_query(chat_id, user_id, query_text)
+
+def process_ai_query(chat_id, user_id, query_text):
+    """Process an AI query through the QWEN model"""
+    # Check rate limiting
+    now = time.time()  # Use time.time() instead of just time()
+    
+    # First check MongoDB for the most up-to-date usage data
+    try:
+        db_usage = jarvis_usage_collection.find_one({"user_id": user_id})
+        if db_usage:
+            # Ensure QWEN_USAGE has this user with the latest data
+            if user_id not in QWEN_USAGE:
+                QWEN_USAGE[user_id] = {
+                    'last_used': db_usage.get('last_used', now),
+                    'count': db_usage.get('count', 0),
+                    'messages': QWEN_USAGE.get(user_id, {}).get('messages', [])
+                }
+            else:
+                # Update count from DB if it's different (might have been reset by thread)
+                QWEN_USAGE[user_id]['count'] = db_usage.get('count', QWEN_USAGE[user_id].get('count', 0))
+    except Exception as e:
+        logging.error(f"Error syncing rate limit data from MongoDB: {e}")
+    
+    # Now check local rate limiting data
+    if user_id in QWEN_USAGE:
+        last_used = QWEN_USAGE[user_id]['last_used']
+        count = QWEN_USAGE[user_id]['count']
+        
+        # Check if an hour has passed since last use
+        if now - last_used >= 3600:
+            # Reset count to 0 if an hour or more has passed
+            QWEN_USAGE[user_id] = {
+                'last_used': now, 
+                'count': 0,
+                'messages': QWEN_USAGE[user_id].get('messages', [])
+            }
+            count = 0
+        # Then implement rate limiting (5 queries per hour)
+        elif count >= 5:  # Only block if within the same hour AND count exceeded
+            # Calculate time remaining until reset
+            time_remaining = 3600 - (now - last_used)
+            minutes = int(time_remaining // 60)
+            seconds = int(time_remaining % 60)
+            
+            bot.send_message(chat_id, 
+                f"⏱️ *AI Query Limit Reached*\n\n"
+                f"You've used all 5 of your AI queries for this hour.\n\n"
+                f"⏰ Limit resets in: {minutes} min {seconds} sec\n"
+                f"🔄 Please try again after the cooldown period.",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        QWEN_USAGE[user_id] = {'last_used': now, 'count': 0}
+    
+    # Update usage tracking
+    QWEN_USAGE[user_id]['last_used'] = now
+    QWEN_USAGE[user_id]['count'] += 1
+    
+    # Log usage to MongoDB
+    try:
+        jarvis_usage_collection.update_one(
+            {"user_id": user_id},
+            {"$inc": {"count": 1}, "$set": {"last_used": now}},
+            upsert=True
+        )
+    except Exception as e:
+        logging.error(f"Error updating AI usage stats: {e}")
+    
+    # Show typing indicator
+    bot.send_chat_action(chat_id, "typing")
+    
+    try:
+        # Just pass the raw query text directly to call_qwen_api
+        response = call_qwen_api(query_text, user_id=user_id)
+        
+        # Send the response - HANDLE MARKDOWN SAFELY
+        try:
+            bot.send_message(chat_id, response, parse_mode="Markdown")
+        except ApiException as api_e:
+            # If Markdown parsing fails, try sending without parse mode
+            logging.warning(f"Markdown parsing failed, sending without formatting: {api_e}")
+            bot.send_message(chat_id, response)
+        
+    except Exception as e:
+        logging.error(f"Error in AI query: {e}")
+        bot.send_message(chat_id, "I'm sorry, I couldn't process that request right now. Please try again later.")
+
+def call_qwen_api(prompt, user_id=None):
+    """Make an API call to the QWEN model with conversation memory"""
+    if not QWEN_API_KEY:
+        return "Sorry, AI chat is currently unavailable. Please contact an admin."
+    
+    try:
+        # Initialize conversation history for this user if it doesn't exist
+        if user_id not in QWEN_USAGE:
+            QWEN_USAGE[user_id] = {'last_used': time.time(), 'count': 0, 'messages': []}
+        
+        # Add database context to system prompt if needed for specific queries
+        system_prompt = QWEN_PROMPT_TEMPLATE
+        
+        if user_id is not None and any(keyword in prompt.lower() for keyword in 
+                                   ['membership', 'payment', 'status', 'expire', 'due date', 
+                                    'my account', 'subscription', 'points', 'leaderboard',
+                                    'supreme', 'regular', 'days', 'remaining', 'left', 
+                                    'time left', 'how long', 'when does', 'expiration',
+                                    'expiry', 'expire', 'renew', 'renewal', 'access']):
+            user_data = get_user_database_context(user_id)
+            if user_data:
+                # Append user database context to system prompt instead of user message
+                system_prompt = f"""{QWEN_PROMPT_TEMPLATE}
+
+USER DATABASE CONTEXT:
+{user_data}
+
+Important: When answering about membership time remaining, due dates, or status, ALWAYS provide the SPECIFIC numerical days and dates from this data rather than giving general instructions. Give direct answers with the exact numbers.
+
+Please use this information to provide a personalized response, but don't explicitly mention that you looked up their database record unless they specifically asked about their account.
+
+"""
+                logging.info(f"Added database context to system prompt for user {user_id}")
+        
+        # Start with the system message containing our prompt template
+        if 'messages' not in QWEN_USAGE[user_id] or not QWEN_USAGE[user_id]['messages']:
+            QWEN_USAGE[user_id]['messages'] = [
+                {
+                    "role": "system", 
+                    "content": system_prompt
+                }
+            ]
+        else:
+            # Update the system prompt with potential user context
+            QWEN_USAGE[user_id]['messages'][0]['content'] = system_prompt
+        
+        # Add the current user query to the messages (clean, without additional context)
+        QWEN_USAGE[user_id]['messages'].append({"role": "user", "content": prompt})
+        
+        # Keep only the last 10 messages to avoid hitting token limits
+        if len(QWEN_USAGE[user_id]['messages']) > 15:
+            # Always keep the system message (first one) and trim the middle
+            system_message = QWEN_USAGE[user_id]['messages'][0]
+            recent_messages = QWEN_USAGE[user_id]['messages'][-14:]
+            QWEN_USAGE[user_id]['messages'] = [system_message] + recent_messages
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {QWEN_API_KEY}"
+        }
+        
+        payload = {
+            "model": "qwen-max",
+            "input": {
+                "messages": QWEN_USAGE[user_id]['messages']
+            },
+            "parameters": {
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "max_tokens": 512,
+                "result_format": "message"
+            }
+        }
+
+        # 🔍 Logging before request
+        logging.info("Calling Qwen API...")
+        logging.info(f"Payload: {json.dumps(payload, indent=2)}")
+        
+        response = requests.post(QWEN_API_URL, headers=headers, data=json.dumps(payload), timeout=30)
+
+        logging.info(f"Qwen API responded with status code: {response.status_code}")
+        response.raise_for_status()
+        
+        response_json = response.json()
+        # Fix: Using the correct path to get the response content
+        ai_response = response_json['output']['choices'][0]['message']['content']
+        
+        # Save the assistant's response to the conversation history
+        QWEN_USAGE[user_id]['messages'].append({"role": "assistant", "content": ai_response})
+        
+        return ai_response
+        
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed: {e}")
+        raise Exception(f"API request failed: {e}")
+    except (KeyError, IndexError) as e:
+        logging.error(f"Error parsing API response: {e}")
+        raise Exception(f"Error parsing API response: {e}")
+    except Exception as e:
+        logging.error(f"Unknown error in QWEN API call: {e}")
+        raise Exception(f"Unknown error in QWEN API call: {e}")
+    
+def get_user_database_context(user_id):
+    """Get relevant user data from database to provide context for AI responses"""
+    user_id_str = str(user_id)
+    context = []
+    
+    try:
+        # Get membership information
+        if user_id_str in PAYMENT_DATA:
+            data = PAYMENT_DATA[user_id_str]
+            
+            # Basic membership info
+            status = "Active" if data.get('haspayed', False) else "Inactive"
+            membership_type = data.get('mentorship_type', 'Unknown')
+            plan = data.get('payment_plan', 'Unknown')
+            
+            # Calculate time remaining if applicable
+            time_remaining = ""
+            if 'due_date' in data:
+                try:
+                    due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
+                    current_date = datetime.now()
+                    days_remaining = (due_date - current_date).days
+                    
+                    if days_remaining > 0:
+                        time_remaining = f"{days_remaining} days remaining"
+                    else:
+                        time_remaining = "Expired"
+                except Exception as e:
+                    time_remaining = "Error calculating time remaining"
+            
+            # Add cancellation info if applicable
+            cancelled = "Yes" if data.get('cancelled', False) else "No"
+            
+            context.append(f"Membership Status: {status}")
+            context.append(f"Membership Type: {membership_type}")
+            context.append(f"Plan: {plan}")
+            context.append(f"Time Remaining: {time_remaining}")
+            context.append(f"Cancelled: {cancelled}")
+            
+            # Get points/leaderboard data if available
+            try:
+                # Current month points
+                current_month = datetime.now().strftime('%Y-%m')
+                monthly_scores = get_monthly_leaderboard(current_month)
+                user_points = 0
+                user_rank = "N/A"
+                
+                for i, entry in enumerate(monthly_scores):
+                    if entry.get('user_id') == int(user_id):
+                        user_points = entry.get('total_points', 0)
+                        user_rank = i + 1
+                        break
+                        
+                context.append(f"Current Month Points: {user_points}")
+                context.append(f"Current Leaderboard Rank: {user_rank}")
+            except Exception:
+                # If points retrieval fails, just continue
+                pass
+                
+            # Get form answers if available
+            if 'form_answers' in data:
+                form_data = data['form_answers']
+                if form_data:
+                    context.append("\nUser Profile Information:")
+                    if 'full_name' in form_data:
+                        context.append(f"Full Name: {form_data['full_name']}")
+                    if 'expertise_level' in form_data:
+                        context.append(f"Trading Expertise: {form_data['expertise_level']}")
+                    if 'learning_goals' in form_data:
+                        context.append(f"Learning Goals: {form_data['learning_goals']}")
+            
+            return "\n".join(context)
+        else:
+            return "No membership data found for this user."
+            
+    except Exception as e:
+        logging.error(f"Error getting user database context: {e}")
+        return f"Error retrieving user data: {str(e)}"
+
+@bot.message_handler(commands=['resetaiusage'])
+def reset_ai_usage(message):
+    """Reset a user's AI usage limits - admin only"""
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Usage: `/resetaiusage [user_id]`", parse_mode="Markdown")
+        return
+    
+    try:
+        target_user_id = int(args[1])
+        
+        # Reset in memory
+        if target_user_id in QWEN_USAGE:
+            QWEN_USAGE[target_user_id]['count'] = 0
+        
+        # Reset in MongoDB
+        jarvis_usage_collection.update_one(
+            {"user_id": target_user_id},
+            {"$set": {"count": 0}},
+            upsert=True
+        )
+        
+        bot.reply_to(message, f"✅ AI usage limit reset for user {target_user_id}")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid user ID. Please provide a numeric user ID.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
+        logging.error(f"Error resetting AI usage: {e}")
+
+@bot.message_handler(commands=['aiusagestats'])
+def ai_usage_stats(message):
+    """Get AI usage statistics - admin only"""
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
+        bot.reply_to(message, "❌ This command is only available to administrators.")
+        return
+    
+    try:
+        stats = list(jarvis_usage_collection.find().sort("count", -1).limit(10))
+        if not stats:
+            bot.reply_to(message, "No AI usage data available.")
+            return
+            
+        response = "🤖 *AI Usage Statistics*\n\n*Top 10 Users:*\n\n"
+        
+        for i, user_stat in enumerate(stats, 1):
+            user_id = user_stat.get("user_id", "Unknown")
+            count = user_stat.get("count", 0)
+            last_used = user_stat.get("last_used", 0)
+            
+            try:
+                # Try to get username
+                user_info = bot.get_chat(user_id)
+                username = user_info.username or f"User {user_id}"
+            except:
+                username = f"User {user_id}"
+                
+            # Format last used time
+            if last_used:
+                last_used_str = datetime.fromtimestamp(last_used).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                last_used_str = "Never"
+                
+            response += f"{i}. @{username}: {count} queries (Last: {last_used_str})\n"
+            
+        bot.reply_to(message, response, parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error getting usage stats: {str(e)}")
+        logging.error(f"Error getting AI usage stats: {e}")
 
 @bot.message_handler(commands=['dm'])
 def handle_dm_command(message):
@@ -893,10 +1354,7 @@ def send_welcome(message):
             logging.info(f"User {user_id} with rejected status has been removed from pending users")
     
     # Handle pending requests first - don't show intro message again
-    if pending_verification:
-        bot.send_message(chat_id, random.choice(pending_verification_messages))
-        return  # Exit the function here - don't show the intro message again
-    elif pending_payment:
+    if pending_payment:
         bot.send_message(chat_id, random.choice(pending_payment_messages))
         return  # Exit the function here - don't show the intro message again
     
@@ -926,7 +1384,8 @@ def send_welcome_message(chat_id):
                 welcome_img,
                 caption=f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
                 "🎉 Welcome to Prodigy Trading Academy!\n\n"
-                "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀",
+                "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀\n\n"
+                "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.",
                 parse_mode="Markdown"
             )
     except FileNotFoundError:
@@ -935,7 +1394,8 @@ def send_welcome_message(chat_id):
         bot.send_message(chat_id, 
             f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
             "🎉 Welcome to Prodigy Trading Academy!\n\n"
-            "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀",
+            "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀\n\n"
+            "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -944,7 +1404,8 @@ def send_welcome_message(chat_id):
         bot.send_message(chat_id, 
             f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
             "🎉 Welcome to Prodigy Trading Academy!\n\n"
-            "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀",
+            "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀\n\n"
+            "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.",
             parse_mode="Markdown"
         )
 
@@ -1034,22 +1495,68 @@ def handle_legal_notice_response(call):
             PENDING_USERS.pop(user_id, None)
             delete_pending_user(user_id)
 
-def show_main_menu(chat_id, user_id):
-    """Show the main menu with enrollment options"""
-    bot.send_message(chat_id, 
-        "Need help? We're here to guide you every step of the way. 💬\n\n"
-        "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.\n\n"
-        "Please select an option below to proceed:",
-        parse_mode="Markdown"
+def show_main_menu(chat_id, user_id, message_id=None):
+    """Show the main menu with inline keyboard options based on user status"""
+    # Prepare welcome message
+    welcome_message = (
+        "Need help? We're here to guide you every step of the way. 💬\n"
+        "Please select an option below to proceed:"
     )
     
-    # Ask for a payment plan
-    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add(KeyboardButton("📅 Purchase Membership"), KeyboardButton("❓ FAQ"))
-    markup.add(KeyboardButton("🔄 Renew Membership"), KeyboardButton("❌ Cancel Membership"))
-    bot.send_message(chat_id, "Which service would you like to access?", reply_markup=markup)
+    # Check if the user is an existing member with active membership
+    is_existing_member = False
+    if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)].get('haspayed', False):
+        is_existing_member = True
     
-    PENDING_USERS[user_id] = {'status': 'choosing_option'}
+    # Create appropriate inline keyboard based on user status
+    markup = InlineKeyboardMarkup(row_width=2)
+    
+    if is_existing_member:
+        # Options for existing members
+        markup.add(
+            InlineKeyboardButton("🔄 Renew Membership", callback_data="menu_renew"),
+            InlineKeyboardButton("❌ Cancel Membership", callback_data="menu_cancel")
+        )
+        markup.add(
+            InlineKeyboardButton("📊 My Dashboard", callback_data="menu_dashboard"),
+            InlineKeyboardButton("❓ FAQ", callback_data="menu_faq")
+        )
+        # Add AI Chat option
+        markup.add(
+            InlineKeyboardButton("🤖 AI Chat", callback_data="menu_aichat")
+        )
+    else:
+        # Options for new users
+        markup.add(
+            InlineKeyboardButton("📅 Buy Membership", callback_data="menu_buy"),
+            InlineKeyboardButton("🔑 Redeem Serial", callback_data="menu_redeem")
+        )
+        markup.add(
+            InlineKeyboardButton("📖 How to Use", callback_data="menu_howto"),
+            InlineKeyboardButton("❓ FAQ", callback_data="menu_faq")
+        )
+        # Add AI Chat option
+        markup.add(
+            InlineKeyboardButton("🤖 AI Chat", callback_data="menu_aichat")
+        )
+    
+    # Send menu with inline buttons or edit existing message
+    if message_id:
+        # Edit the existing message
+        bot.edit_message_text(
+            welcome_message,
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        sent_message = None
+    else:
+        # Send a new message with welcome message and markup combined
+        sent_message = bot.send_message(chat_id, welcome_message, parse_mode="Markdown", reply_markup=markup)
+    
+    # Store user state
+    PENDING_USERS[user_id] = {'status': 'at_main_menu'}
     save_pending_users()
 
     # Check if the user has unseen changelogs - ONLY SHOW THE MOST RECENT ONE
@@ -1077,6 +1584,1353 @@ def show_main_menu(chat_id, user_id):
                 update_shown = True
                 logging.info(f"Showed unread changelog to user {user_id}")
                 break
+    
+    # Return the sent message object if we sent a new message
+    return sent_message
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_aichat")
+def handle_menu_aichat(call):
+    """Start AI chat from the main menu"""
+    bot.answer_callback_query(call.id, "Starting AI chat...")
+    
+    # Remove the inline keyboard
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=None
+    )
+    
+    # Start AI chat flow
+    bot.send_message(
+        call.message.chat.id,
+        "🤖 *AI Assistant Mode Activated*\n\n"
+        "✨ I'm here to help with your trading questions! Just type your question and I'll respond.\n\n"
+        "💬 You can ask about:\n"
+        "• 📊 Trading strategies and analysis\n"
+        "• 🧠 Trading psychology\n"
+        "• 🛠️ How to use this bot\n"
+        "• 📚 PTA resources and membership\n\n"
+        "When you're done, simply type `/exit` to end our conversation.",
+        parse_mode="Markdown"
+    )
+    
+    # Set user state to conversation_active (directly going to conversation mode)
+    PENDING_USERS[call.from_user.id] = {'status': 'conversation_active'}
+    save_pending_users()
+
+def remove_inline_keyboard(chat_id, message_id):
+    """Remove the inline keyboard from a message to prevent further clicks"""
+    try:
+        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+        return True
+    except Exception as e:
+        logging.error(f"Error removing inline keyboard: {e}")
+        return False
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("menu_"))
+def handle_main_menu_selection(call):
+    """Handle main menu inline button selections"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    option = call.data.split("_")[1]
+    
+    # First, remove the keyboard from the existing message to prevent multiple clicks
+    remove_inline_keyboard(chat_id, message_id)
+    
+    # Set a default pending status
+    PENDING_USERS[user_id] = {'status': 'choosing_option'}
+    save_pending_users()
+    
+    # Handle different menu options
+    if option == "buy":
+        # Start the purchase membership flow
+        bot.answer_callback_query(call.id, "Starting membership purchase...")
+        
+        # Check enrollment status for new purchases
+        regular_enrollment_open = BOT_SETTINGS.get('regular_enrollment_open', True)
+        supreme_enrollment_open = BOT_SETTINGS.get('supreme_enrollment_open', True)
+        
+        # If both enrollment types are closed, show message
+        if not regular_enrollment_open and not supreme_enrollment_open:
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+            )
+            markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+            
+            bot.send_message(
+                chat_id,
+                "⚠️ *Enrollment is currently closed*\n\n"
+                "New memberships are not available at this time. Please wait for the next "
+                "announcement from the admins about when enrollment will open again.\n\n"
+                "• Click *Get Notified* to receive updates when enrollment opens\n"
+                "• Check our *FAQ* section for more information\n\n"
+                "Thank you for your interest in Prodigy Trading Academy!",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            return
+        
+        # Continue with normal flow - show enrollment benefits image
+        try:
+            with open('graphics/benefits.jpeg', 'rb') as benefits_img:
+                bot.send_photo(
+                    chat_id,
+                    benefits_img,
+                    caption="Explore our membership benefits and choose the plan that's right for you!"
+                )
+        except FileNotFoundError:
+            logging.error("Enrollment benefits image not found at graphics/benefits.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending enrollment benefits image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Update status and show mentorship options
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
+        PENDING_USERS[chat_id]['is_renewal'] = False
+        save_pending_users()
+        
+        # Show mentorship type options with inline keyboard
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("Regular Mentorship", callback_data="mentorship_regular"),
+            InlineKeyboardButton("Supreme Mentorship", callback_data="mentorship_supreme")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        # Send new message instead of editing
+        bot.send_message(
+            chat_id,
+            "Please select your preferred mentorship level:",
+            reply_markup=markup
+        )
+        
+    elif option == "renew":
+        # Similar pattern for other options...
+        bot.answer_callback_query(call.id, "Starting membership renewal...")
+        
+        # Check if they can renew
+        can_renew, message_text = can_renew_membership(user_id)
+        if not can_renew:
+            # Create back button
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+            
+            # Edit message to show error with back button
+            bot.edit_message_text(
+                message_text,
+                chat_id,
+                message_id,
+                reply_markup=markup
+            )
+            return
+        
+        # If they can renew, continue with the flow...
+        try:
+            with open('graphics/benefits.jpeg', 'rb') as benefits_img:
+                bot.send_photo(
+                    chat_id,
+                    benefits_img,
+                    caption="Explore our membership benefits and choose the plan that's right for you!"
+                )
+        except FileNotFoundError:
+            logging.error("Enrollment benefits image not found at graphics/benefits.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending enrollment benefits image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Update status and show mentorship options
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
+        PENDING_USERS[chat_id]['is_renewal'] = True
+        save_pending_users()
+        
+        # Show mentorship type options with inline keyboard
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("Regular Mentorship", callback_data="mentorship_regular"),
+            InlineKeyboardButton("Supreme Mentorship", callback_data="mentorship_supreme")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        bot.edit_message_text(
+            "Please select your preferred mentorship level to renew:",
+            chat_id,
+            message_id,
+            reply_markup=markup
+        )
+        
+    # Continue with other options following the same pattern...
+    elif option == "cancel":
+        # Start the cancel membership flow
+        bot.answer_callback_query(call.id, "Starting membership cancellation...")
+        
+        # Check if user has an active membership
+        if str(user_id) not in PAYMENT_DATA:
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+            
+            bot.edit_message_text(
+                "❌ You don't have an active membership to cancel.",
+                chat_id,
+                message_id,
+                reply_markup=markup
+            )
+            return
+            
+        # Check if already cancelled
+        if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)].get('cancelled', False):
+            due_date = PAYMENT_DATA[str(user_id)].get('due_date', 'Unknown')
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+            
+            try:
+                due_date_obj = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
+                days_remaining = (due_date_obj - datetime.now()).days
+                
+                bot.edit_message_text(
+                    f"ℹ️ Your membership is already cancelled.\n\n"
+                    f"You will still have access until {due_date_obj.strftime('%Y-%m-%d')} "
+                    f"({days_remaining} days remaining).\n\n"
+                    f"If you wish to reactivate your membership, please use /start and select 'Renew Membership'.",
+                    chat_id,
+                    message_id,
+                    reply_markup=markup
+                )
+            except Exception as e:
+                # Fallback if date parsing fails
+                bot.edit_message_text(
+                    "ℹ️ Your membership is already cancelled. You will still have access until the next payment cycle.",
+                    chat_id,
+                    message_id,
+                    reply_markup=markup
+                )
+            return
+            
+        # Send cancellation confirmation graphic
+        try:
+            with open('graphics/cancel_membership.jpeg', 'rb') as cancel_img:
+                bot.send_photo(
+                    chat_id,
+                    cancel_img,
+                    caption="⚠️ Please confirm if you wish to cancel your membership"
+                )
+        except FileNotFoundError:
+            logging.error("Cancellation confirmation image not found at graphics/cancel_membership.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending cancellation confirmation image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+
+        # Update user status and show confirmation buttons
+        PENDING_USERS[chat_id]['status'] = 'cancel_membership'
+        save_pending_users()
+        
+        # Use InlineKeyboardMarkup for Yes/No confirmation
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("Yes", callback_data="cancel_confirm_yes"),
+            InlineKeyboardButton("No", callback_data="cancel_confirm_no")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        bot.edit_message_text(
+            "Are you sure you want to cancel your membership? You will still have access until next month/year, but you will not be charged. Please confirm.", 
+            chat_id,
+            message_id,
+            reply_markup=markup
+        )
+        
+    elif option == "dashboard":
+            # Show user dashboard
+            bot.answer_callback_query(call.id, "Loading your dashboard...")
+            
+            # Create a modified version of the message with the correct user info
+            modified_message = call.message
+            # Important: Set the correct user info from the callback
+            modified_message.from_user = call.from_user
+            
+            # Now call the dashboard function with the corrected message object
+            show_user_dashboard(modified_message)
+        
+    elif option == "faq":
+        # Show FAQ options
+        bot.answer_callback_query(call.id, "Loading FAQ...")
+        
+        # First send the FAQ image
+        try:
+            with open('graphics/faq_main.jpeg', 'rb') as faq_img:
+                bot.send_photo(
+                    chat_id,
+                    faq_img,
+                )
+        except FileNotFoundError:
+            logging.error("FAQ image not found at graphics/faq_main.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending FAQ image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1)
+        
+        # Then show the FAQ categories with inline buttons
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🎓 Join Academy", callback_data="faq_join_academy"),
+            InlineKeyboardButton("📅 Opening of Admissions", callback_data="faq_admissions"),
+            InlineKeyboardButton("💲 Mentorship Plans & Pricings", callback_data="faq_plans_pricing"),
+            InlineKeyboardButton("📦 Products & Services", callback_data="faq_products_services"),
+            InlineKeyboardButton("🌟 Benefits in Enrollment", callback_data="faq_enrollment_benefits"),
+            InlineKeyboardButton("📝 Terms & Conditions", callback_data="faq_terms"),
+            InlineKeyboardButton("🔒 Privacy Policy", callback_data="faq_privacy")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        bot.edit_message_text(
+            "🔍 *Frequently Asked Questions*\n\n"
+            "Select a category to view related questions:",
+            chat_id,
+            message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    elif option == "redeem":
+        # Start the serial redemption flow
+        bot.answer_callback_query(call.id, "Starting serial redemption...")
+        
+        # Create a fake message object that simulates the user sending /redeem
+        fake_message = types.Message(
+            message_id=9999,  # Arbitrary message ID
+            from_user=call.from_user,  # Use the same user info
+            date=int(time.time()),  # Current time
+            chat=call.message.chat,  # Same chat
+            content_type='text',
+            options={},
+            json_string="{}"  # Empty JSON string
+        )
+        
+        # Set the text attribute to /redeem command
+        fake_message.text = "/redeem"
+        
+        # Call the redeem_serial function directly with our fake message
+        redeem_serial(fake_message)
+        
+    elif option == "howto":
+        # Show "How to Use" information
+        bot.answer_callback_query(call.id, "Loading usage guide...")
+        
+        # Create buttons with AI help option
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🤖 Ask AI Assistant for Help", callback_data="menu_aichat"),
+            InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu")
+        )
+        
+        bot.edit_message_text(
+            "📖 *How to Use Prodigy Trading Academy Bot*\n\n"
+            "Welcome to our academy bot! Here's a quick guide to get you started:\n\n"
+            "1️⃣ *Buy Membership*: Follow these steps to join our community:\n"
+            "   • Select 'Buy Membership' from main menu\n"
+            "   • Choose Regular or Supreme membership\n"
+            "   • Select your preferred plan\n"
+            "   • Complete payment using your preferred method\n"
+            "   • Submit verification proof\n\n"
+            "2️⃣ *Redeem Serial*: Have a serial number?\n"
+            "   • Select 'Redeem Serial' from main menu\n"
+            "   • Enter your serial number when prompted\n"
+            "   • Get instant access to your membership\n\n"
+            "3️⃣ *Using AI Assistant*: Need help or have questions?\n"
+            "   • Press the 'Ask AI Assistant' button below\n"
+            "   • Ask any question about trading or our academy\n"
+            "   • Type /exit when done to return to main menu\n\n"
+            "4️⃣ *Common Commands*:\n"
+            "   • /start - Return to the main menu\n"
+            "   • /dashboard - View your membership status\n"
+            "   • /chat - Start a conversation with AI\n\n"
+            "Still need help? Click '🤖 Ask AI Assistant' below or contact our admin team at @PTASupportTeam",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main_menu")
+def back_to_main_menu(call):
+    """Return to the main menu from anywhere"""
+    bot.answer_callback_query(call.id, "Returning to main menu...")
+    
+    # Remove the keyboard from the original message
+    remove_inline_keyboard(call.message.chat.id, call.message.message_id)
+    
+    # Show main menu by sending a new message
+    show_main_menu(call.message.chat.id, call.from_user.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_confirm_"))
+def handle_cancel_confirmation_callback(call):
+    """Handle confirmation for membership cancellation"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    response = call.data.split("_")[2]  # Either "yes" or "no"
+    
+    # Check if user has an active membership
+    if str(user_id) not in PAYMENT_DATA or not PAYMENT_DATA[str(user_id)].get('haspayed', False):
+        bot.answer_callback_query(call.id, "❌ No active membership found")
+        bot.send_message(chat_id, "❌ You don't have an active membership to cancel.")
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+        return
+
+    # Get membership details for better context
+    plan = PAYMENT_DATA[str(user_id)].get('payment_plan', 'Unknown')
+    due_date = PAYMENT_DATA[str(user_id)].get('due_date', 'Unknown')
+    
+    if response == "yes":
+        # User confirmed cancellation
+        bot.answer_callback_query(call.id, "Processing cancellation...")
+        PENDING_USERS[user_id]['status'] = 'membership_cancelled'
+        save_pending_users()
+
+        # Set cancellation flags in payment data
+        PAYMENT_DATA[str(user_id)]['cancelled'] = True
+        PAYMENT_DATA[str(user_id)]['reminder_sent'] = True  # Prevent future reminders
+        PAYMENT_DATA[str(user_id)]['cancellation_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        save_payment_data()
+
+        # Get user's information
+        try:
+            username = call.from_user.username or f"User {user_id}"
+            username = safe_markdown_escape(username)
+        except Exception:
+            username = f"User {user_id}"  # Fallback if can't get username
+            
+        # Send cancellation graphic
+        try:
+            with open('graphics/confirm_cancel.jpeg', 'rb') as cancellation_img:
+                bot.send_photo(
+                    chat_id,
+                    cancellation_img,
+                )
+        except FileNotFoundError:
+            logging.error("Cancellation image not found at graphics/confirm_cancel.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending cancellation image: {e}")
+            
+        time.sleep(1)  # Small delay for better UX
+
+        # Forward the cancellation request to admins with additional context
+        for admin in ADMIN_IDS:
+            bot.send_message(
+                admin, 
+                f"🚫 *MEMBERSHIP CANCELLATION*\n\n"
+                f"👤 Username: @{username}\n"
+                f"🆔 User ID: `{user_id}`\n"
+                f"📅 Plan: {plan}\n"
+                f"⏰ Due date: {due_date}\n"
+                f"📝 Cancelled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                parse_mode="Markdown"
+            )
+
+        # Provide better information to the user
+        try:
+            due_date_obj = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
+            days_remaining = (due_date_obj - datetime.now()).days
+            
+            bot.send_message(
+                chat_id, 
+                f"✅ Your membership is cancelled. You will still have access until {due_date_obj.strftime('%Y-%m-%d')} "
+                f"({days_remaining} days remaining), but will not be renewed.\n\n"
+                f"Thank you for being with us! If you change your mind before expiration, use /start to reactivate.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            # Fallback if date parsing fails
+            bot.send_message(chat_id, "✅ Your membership is cancelled. You will still have access until the next payment cycle, but will not be charged anymore. Thank you for being with us!")
+            logging.error(f"Error parsing due date during cancellation: {e}")
+    
+    elif response == "no":
+        # User did not confirm cancellation
+        bot.answer_callback_query(call.id, "Cancellation aborted")
+        bot.send_message(chat_id, "❌ No changes have been made to your membership. You will continue with the current payment plan.")
+    
+    # Clean up pending user data
+    PENDING_USERS.pop(user_id, None)  # Remove from dictionary
+    delete_pending_user(user_id)  # Remove from MongoDB
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("mentorship_"))
+def handle_mentorship_selection(call):
+    """Handle mentorship type selection from inline buttons"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    mentorship_type = call.data.split("_")[1]
+    
+    # First remove the keyboard from the existing message
+    remove_inline_keyboard(chat_id, call.message.message_id)
+    
+    # Get renewal status from pending users
+    is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
+    
+    if mentorship_type == "regular":
+        # Process Regular Mentorship selection
+        bot.answer_callback_query(call.id, "Selected Regular Mentorship")
+        
+        # Check enrollment status for Regular membership if this is a new purchase
+        if not is_renewal and not BOT_SETTINGS.get('regular_enrollment_open', True):
+            # Create inline keyboard with Get Notified and FAQ buttons
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+            )
+            
+            bot.send_message(
+                chat_id,
+                "⚠️ *Regular Membership enrollment is currently CLOSED*\n\n"
+                "New Regular Membership purchases are temporarily unavailable.\n"
+                "Please wait for the next announcement about when enrollment will open again.\n\n"
+                "• Click *Get Notified* to receive updates when enrollment opens\n"
+                "• Check our *FAQ* section for more information\n\n"
+                "Existing members can still renew their memberships.",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            return
+            
+        # First send the Regular Mentorship pricing image
+        try:
+            with open('graphics/regular.jpeg', 'rb') as pricing_img:
+                bot.send_photo(
+                    chat_id,
+                    pricing_img,
+                    caption="Regular Mentorship Pricing Options"
+                )
+        except FileNotFoundError:
+            logging.error("Regular pricing image not found at graphics/regular.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending Regular pricing image: {e}")
+            
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Get regular discount specifically
+        applicable_discount = DISCOUNTS.get('regular')
+        discount_active = applicable_discount and applicable_discount.get('active', False)
+        
+        # Check if discount applies to this transaction type (new or renewal)
+        if discount_active:
+            transaction_type = "renewal" if is_renewal else "new"
+            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+            
+            # Determine if discount applies to this transaction type
+            applies_to_transaction = (
+                discount_transaction_type == 'both' or 
+                discount_transaction_type == transaction_type
+            )
+            
+            # Only consider discount active if it applies to this transaction type
+            if not applies_to_transaction:
+                discount_active = False
+                
+        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+        discount_name = applicable_discount.get('name', '') if discount_active else ''
+        
+        PENDING_USERS[chat_id]['mentorship_type'] = 'regular'
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
+        save_pending_users()
+        
+        # Original prices
+        trial_price = 7.99
+        momentum_price = 20.99
+        legacy_price = 89.99
+        
+        # Create markup for plan selection
+        markup = InlineKeyboardMarkup(row_width=1)
+        
+        if discount_active:
+            # Calculate discounted prices
+            trial_discounted = round(trial_price * (1 - discount_percentage / 100), 2)
+            momentum_discounted = round(momentum_price * (1 - discount_percentage / 100), 2)
+            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+            
+            # Add buttons with discounted prices
+            markup.add(
+                InlineKeyboardButton(f"Trial (${trial_discounted:.2f}) / Monthly", callback_data="plan_trial"),
+                InlineKeyboardButton(f"Momentum (${momentum_discounted:.2f}) / 3 Months", callback_data="plan_momentum"),
+                InlineKeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Yearly", callback_data="plan_regular_legacy")
+            )
+            
+            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
+            
+            # Use HTML formatting for both bold and strikethrough
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                          f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
+                          f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
+                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        else:
+            # No discount - show regular prices without strikethrough
+            markup.add(
+                InlineKeyboardButton(f"Trial (${trial_price:.2f}) / Monthly", callback_data="plan_trial"),
+                InlineKeyboardButton(f"Momentum (${momentum_price:.2f}) / 3 Months", callback_data="plan_momentum"),
+                InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly", callback_data="plan_regular_legacy")
+            )
+            
+            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
+            
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
+                          f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
+                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        
+    elif mentorship_type == "supreme":
+        # Process Supreme Mentorship selection
+        bot.answer_callback_query(call.id, "Selected Supreme Mentorship")
+        
+        # Check enrollment status for Supreme membership if this is a new purchase
+        if not is_renewal and not BOT_SETTINGS.get('supreme_enrollment_open', True):
+            # Create inline keyboard with Get Notified and FAQ buttons
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+            )
+            
+            bot.send_message(
+                chat_id,
+                "⚠️ *Supreme Membership enrollment is currently CLOSED*\n\n"
+                "New Supreme Membership purchases are temporarily unavailable.\n"
+                "Please wait for the next announcement about when enrollment will open again.\n\n"
+                "• Click *Get Notified* to receive updates when enrollment opens\n"
+                "• Check our *FAQ* section for more information\n\n"
+                "Existing members can still renew their memberships.",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            return
+            
+        # First send the Supreme Mentorship pricing image
+        try:
+            with open('graphics/supreme.jpeg', 'rb') as pricing_img:
+                bot.send_photo(
+                    chat_id,
+                    pricing_img,
+                    caption="Supreme Mentorship Pricing Options"
+                )
+        except FileNotFoundError:
+            logging.error("Supreme pricing image not found at graphics/supreme.jpeg")
+        except Exception as e:
+            logging.error(f"Error sending Supreme pricing image: {e}")
+            
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Get supreme discount specifically
+        applicable_discount = DISCOUNTS.get('supreme')
+        discount_active = applicable_discount and applicable_discount.get('active', False)
+        
+        # Check if discount applies to this transaction type (new or renewal)
+        if discount_active:
+            transaction_type = "renewal" if is_renewal else "new"
+            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+            
+            # Determine if discount applies to this transaction type
+            applies_to_transaction = (
+                discount_transaction_type == 'both' or 
+                discount_transaction_type == transaction_type
+            )
+            
+            # Only consider discount active if it applies to this transaction type
+            if not applies_to_transaction:
+                discount_active = False
+                
+        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+        discount_name = applicable_discount.get('name', '') if discount_active else ''
+        
+        PENDING_USERS[chat_id]['mentorship_type'] = 'supreme'
+        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
+        save_pending_users()
+        
+        # Original prices
+        apprentice_price = 309.99
+        disciple_price = 524.99
+        legacy_price = 899.99
+        
+        # Create markup for plan selection
+        markup = InlineKeyboardMarkup(row_width=1)
+        
+        if discount_active:
+            # Calculate discounted prices
+            apprentice_discounted = round(apprentice_price * (1 - discount_percentage / 100), 2)
+            disciple_discounted = round(disciple_price * (1 - discount_percentage / 100), 2)
+            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+            
+            # Add buttons with discounted prices
+            markup.add(
+                InlineKeyboardButton(f"Apprentice (${apprentice_discounted:.2f}) / 3 Months", callback_data="plan_apprentice"),
+                InlineKeyboardButton(f"Disciple (${disciple_discounted:.2f}) / 6 Months", callback_data="plan_disciple"),
+                InlineKeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
+            )
+            
+            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
+            
+            # Use HTML formatting for both bold and strikethrough
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                          f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
+                          f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
+                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        else:
+            # No discount - show regular prices without strikethrough
+            markup.add(
+                InlineKeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months", callback_data="plan_apprentice"),
+                InlineKeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months", callback_data="plan_disciple"),
+                InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
+            )
+            
+            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
+            
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
+                          f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
+                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("plan_"))
+def handle_plan_selection(call):
+    """Handle plan selection from inline buttons"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    selected_plan = call.data.split("_")[1]
+    
+    # First, remove the keyboard from the existing message to prevent multiple clicks
+    remove_inline_keyboard(chat_id, call.message.message_id)
+    
+    # Extract plan data based on selection
+    if selected_plan == "trial":
+        plan = "Trial"
+        price_usd = 7.99  # Store numeric USD price for currency conversion
+        duration = "Monthly"
+        mentorship_type = "regular"
+        plan_image = "graphics/trial.jpeg"
+    elif selected_plan == "momentum":
+        plan = "Momentum"
+        price_usd = 20.99
+        duration = "3 Months"
+        mentorship_type = "regular"
+        plan_image = "graphics/momentum.jpeg"
+    elif selected_plan == "apprentice":
+        plan = "Apprentice"
+        price_usd = 309.99
+        duration = "3 Months"
+        mentorship_type = "supreme"
+        plan_image = "graphics/apprentice.jpeg"
+    elif selected_plan == "disciple":
+        plan = "Disciple"
+        price_usd = 524.99
+        duration = "6 Months" 
+        mentorship_type = "supreme"
+        plan_image = "graphics/disciple.jpeg"
+    elif selected_plan == "regular_legacy":
+        plan = "Legacy"
+        price_usd = 89.99
+        duration = "Yearly"
+        mentorship_type = "regular"
+        plan_image = "graphics/regular_legacy.jpeg"
+    elif selected_plan == "supreme_legacy":
+        plan = "Legacy"
+        price_usd = 899.99
+        duration = "Lifetime"
+        mentorship_type = "supreme"
+        plan_image = "graphics/master.jpeg"
+    else:
+        # If we get an unknown plan, respond with an error and return
+        bot.answer_callback_query(call.id, "❌ Invalid plan selection.")
+        return
+
+    # Acknowledge the selection
+    bot.answer_callback_query(call.id, f"Selected {plan} plan")
+
+    # Send the plan-specific graphic
+    try:
+        with open(plan_image, 'rb') as img:
+            bot.send_photo(
+                chat_id,
+                img,
+            )
+    except FileNotFoundError:
+        logging.error(f"Plan image not found at {plan_image}")
+    except Exception as e:
+        logging.error(f"Error sending plan image: {e}")
+    
+    # Add a small delay for better UX
+    time.sleep(1.5)
+
+    # Store original price before any discounts
+    original_price_usd = price_usd
+    original_price = f"${original_price_usd:.2f}"
+    
+    # Apply appropriate discount based on mentorship type
+    discount_applied = False
+    applicable_discount = DISCOUNTS.get(mentorship_type)
+    
+    if applicable_discount and applicable_discount.get('active', False):
+        # Get transaction type - renewal or new purchase
+        is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
+        transaction_type = "renewal" if is_renewal else "new"
+        
+        # Debug log to identify the issue
+        logging.info(f"Discount check for {mentorship_type}: is_renewal={is_renewal}, user_transaction={transaction_type}, discount_type={applicable_discount.get('transaction_type', 'both')}")
+        
+        # Check if discount applies to this transaction type
+        applies_to_transaction = (
+            applicable_discount.get('transaction_type', 'both') == 'both' or 
+            applicable_discount.get('transaction_type', 'both') == transaction_type
+        )
+        
+        # Only apply if the discount is valid for this transaction type
+        if applies_to_transaction:
+            # Get discount percentage and user limit
+            discount_percentage = applicable_discount.get('percentage', 0)
+            user_limit = applicable_discount.get('user_limit')
+            users_used = applicable_discount.get('users_used', [])
+            discount_name = applicable_discount.get('name', f'Special {mentorship_type.capitalize()} Discount')
+            
+            # Check if user limit is reached and if this user already used the discount
+            if (user_limit is None or len(users_used) < user_limit) and str(user_id) not in users_used:
+                # Apply the discount
+                price_usd = original_price_usd * (1 - discount_percentage / 100)
+                
+                # Store discount info for later use
+                PENDING_USERS[chat_id]['discount_percentage'] = discount_percentage
+                PENDING_USERS[chat_id]['discount_name'] = discount_name
+                PENDING_USERS[chat_id]['original_price_usd'] = original_price_usd
+                
+                # Mark discount as applied
+                discount_applied = True
+                
+                # Add user to the list of users who used this discount
+                DISCOUNTS[mentorship_type]['users_used'].append(str(user_id))
+                save_discount(DISCOUNTS[mentorship_type], mentorship_type)
+                
+                # Log the discount application
+                logging.info(f"Applied {discount_percentage}% {mentorship_type} discount to user {user_id}, price reduced from ${original_price_usd} to ${price_usd}")
+            elif user_limit is not None and len(users_used) >= user_limit and str(user_id) not in users_used:
+                # User limit reached
+                bot.send_message(chat_id, f"❌ The {discount_name} discount has reached its user limit. Your purchase will continue at the regular price.")
+            elif str(user_id) in users_used:
+                # User already used the discount
+                bot.send_message(chat_id, f"ℹ️ You've already used the {discount_name} discount. This purchase will be at the regular price.")
+        else:
+            # Not applicable - inform user if this is a specific discount type
+            if applicable_discount.get('transaction_type') == "renewal" and not is_renewal:
+                bot.send_message(chat_id, f"ℹ️ The current {mentorship_type.capitalize()} discount is only available for renewals, not new purchases.")
+            elif applicable_discount.get('transaction_type') == "new" and is_renewal:
+                bot.send_message(chat_id, f"ℹ️ The current {mentorship_type.capitalize()} discount is only available for new purchases, not renewals.")
+    
+    # Format the price for display (always .99)
+    price = f"${price_usd:.2f}"
+
+    # Store the plan details including the numeric USD price
+    PENDING_USERS[chat_id]['plan'] = plan
+    PENDING_USERS[chat_id]['price'] = price
+    PENDING_USERS[chat_id]['price_usd'] = price_usd  # Store numeric price for conversion
+    PENDING_USERS[chat_id]['mentorship_type'] = mentorship_type  # Store for later use
+    PENDING_USERS[chat_id]['duration'] = duration
+    PENDING_USERS[chat_id]['status'] = 'choosing_payment_method'
+    save_pending_users()
+
+    # Customize message based on discount
+    if discount_applied:
+        plan_message = (
+            f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
+            f"• Original price: {original_price}\n"
+            f"🔖 Discount: {PENDING_USERS[chat_id]['discount_percentage']}% OFF ({PENDING_USERS[chat_id]['discount_name']})\n\n"
+            f"• You pay: {price}\n"
+            f"• Duration: {duration}\n\n"
+            f"Please be prepared for the following steps:\n"
+            f"• Payment\n"
+            f"• Registration Forms\n\n"
+        )
+    else:
+        plan_message = (
+            f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
+            f"• Price: {price}\n"
+            f"• Duration: {duration}\n\n"
+            f"Please be prepared for the following steps:\n"
+            f"• Payment\n"
+            f"• Registration Forms\n\n"
+        )
+    
+    # Show plan confirmation message
+    bot.send_message(chat_id, plan_message)
+    
+    # Add a transition message with typing indicator
+    bot.send_chat_action(chat_id, 'typing')
+    transition_msg = bot.send_message(chat_id, "⏳ Moving on to payment options...")
+    
+    # Add a small delay for better UX
+    time.sleep(1.5)
+    
+    # Delete the transition message
+    try:
+        bot.delete_message(chat_id, transition_msg.message_id)
+    except Exception as e:
+        logging.error(f"Error deleting transition message: {e}")
+    
+    # Create payment method markup using inline buttons
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("💳 Paypal", callback_data="payment_paypal"),
+        InlineKeyboardButton("📱 GCash", callback_data="payment_gcash")
+    )
+    markup.add(
+        InlineKeyboardButton("💸 Exness Direct", callback_data="payment_exness"),
+        InlineKeyboardButton("🏦 Bank Transfer", callback_data="payment_bank")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_plan_selection"))
+        
+    # Ask for payment method after transition
+    bot.send_message(chat_id, "Please select your payment method:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("payment_"))
+def handle_payment_method(call):
+    """Handle payment method selection from inline buttons"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    method_code = call.data.split("_")[1]
+    
+    # First, remove the keyboard from the existing message to prevent multiple clicks
+    remove_inline_keyboard(chat_id, call.message.message_id)
+    
+    # Map method codes to full method names with emoji
+    method_map = {
+        "paypal": "💳 Paypal",
+        "gcash": "📱 GCash",
+        "exness": "💸 Exness Direct",
+        "bank": "🏦 Bank Transfer"
+    }
+    
+    method = method_map.get(method_code, "Unknown")
+    
+    # Acknowledge selection
+    bot.answer_callback_query(call.id, f"Selected {method}")
+
+    # Store the user's payment method choice
+    PENDING_USERS[chat_id]['method'] = method
+    PENDING_USERS[chat_id]['status'] = 'awaiting_payment'
+    save_pending_users()
+    
+    # Determine which payment graphic to show based on the selected method
+    payment_image = None
+    if "Paypal" in method:
+        payment_image = "graphics/paypal.jpeg"
+    elif "Bank Transfer" in method:
+        payment_image = "graphics/bank.jpeg"
+    elif "GCash" in method:
+        payment_image = "graphics/gcash.jpeg"
+    elif "Exness Direct" in method:
+        payment_image = "graphics/exness.jpeg"
+    
+    # Send the payment method-specific graphic if available
+    if payment_image:
+        try:
+            with open(payment_image, 'rb') as img:
+                bot.send_photo(
+                    chat_id,
+                    img,
+                    caption=f"You've selected {method.strip('💳📱🏦🌐💸 ')} as your payment method"
+                )
+        except FileNotFoundError:
+            logging.error(f"Payment method image not found at {payment_image}")
+        except Exception as e:
+            logging.error(f"Error sending payment method image: {e}")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+    
+    # Get plan details for the message
+    mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', '')
+    plan = PENDING_USERS[chat_id].get('plan', '')
+    price = PENDING_USERS[chat_id].get('price', '')
+    price_usd = PENDING_USERS[chat_id].get('price_usd', 0)  # Get numeric discounted price
+    original_price_usd = PENDING_USERS[chat_id].get('original_price_usd')  # Original price before discount
+    duration = PENDING_USERS[chat_id].get('duration', '')
+    
+    # Calculate payment method fee based on the ALREADY DISCOUNTED price
+    fee_percentage = PAYMENT_FEES.get(method, 0.0)
+    if fee_percentage > 0:
+        fee_adjusted_price = price_usd * (1 + fee_percentage/100)
+        fee_adjusted_price_str = f"${fee_adjusted_price:.2f}"
+    else:
+        fee_adjusted_price = price_usd  # No fee adjustment
+        fee_adjusted_price_str = price
+    
+    # Fetch real-time exchange rates - use fee_adjusted_price for conversions
+    exchange_rates = get_exchange_rates()
+    
+    # Prepare currency conversion information based on the FINAL price
+    currency_info = ""
+    if exchange_rates:
+        currency_info = "\n\n💱 *Equivalent Prices*:\n"
+        
+        # Define currency symbols for better display
+        currency_symbols = {
+            'USD': '$', 'GBP': '£', 'EUR': '€', 'IDR': 'Rp', 'PHP': '₱'
+        }
+        
+        for currency, rate in exchange_rates.items():
+            if currency == 'USD':
+                continue  # Skip USD as it's already shown
+            
+            # Use the final fee-adjusted price for all currency conversions
+            equivalent_price = fee_adjusted_price * rate
+            
+            symbol = currency_symbols.get(currency, '')
+            
+            # Format based on currency
+            if currency in ['IDR', 'PHP']:
+                formatted_price = f"{symbol}{equivalent_price:,.0f}"
+            else:
+                whole_price = int(equivalent_price)
+                formatted_price = f"{symbol}{whole_price:,}.99"
+            
+            currency_info += f"• *{currency}*: {formatted_price}\n"
+    
+    # Format plan details based on discount and payment fee combinations
+    discount_percentage = PENDING_USERS[chat_id].get('discount_percentage')
+    discount_name = PENDING_USERS[chat_id].get('discount_name')
+
+    # Create a comprehensive message showing all calculations clearly
+    if original_price_usd and discount_percentage:
+        # Case: Has discount
+        if fee_percentage > 0:
+            # Has both discount AND payment fee - show complete calculation
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- Original Price: ${original_price_usd:.2f} USD\n"
+                f"- *{discount_name}: {discount_percentage}% OFF* (-${(original_price_usd - price_usd):.2f})\n"
+                f"- Discounted Price: ${price_usd:.2f} USD\n"
+                f"- *{method.strip('💳📱🏦🌐💸 ')} Fee: {fee_percentage}%* (+${(fee_adjusted_price - price_usd):.2f})\n"
+                f"- **Final Price: {fee_adjusted_price_str} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+                f"*Note: A {fee_percentage}% fee applies to cover {method.strip('💳📱🏦🌐💸 ')} transaction costs.*\n\n"
+            )
+        else:
+            # Has discount but NO payment fee
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- Original Price: ${original_price_usd:.2f} USD\n"
+                f"- *{discount_name}: {discount_percentage}% OFF* (-${(original_price_usd - price_usd):.2f})\n"
+                f"- **Final Price: ${price_usd:.2f} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+            )
+    else:
+        # Case: No discount applied
+        if fee_percentage > 0:
+            # No discount, but has payment fee
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- Base Price: ${price_usd:.2f} USD\n"
+                f"- *{method.strip('💳📱🏦🌐💸 ')} Fee: {fee_percentage}%* (+${(fee_adjusted_price - price_usd):.2f})\n"
+                f"- **Final Price: {fee_adjusted_price_str} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+                f"*Note: A {fee_percentage}% fee applies to cover {method.strip('💳📱🏦🌐💸 ')} transaction costs.*\n\n"
+            )
+        else:
+            # No discount, no payment fee - simplest case
+            plan_details = (
+                f"*Plan Details*:\n"
+                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
+                f"- Plan: {plan}\n"
+                f"- **Price: ${price_usd:.2f} USD**\n"
+                f"- Duration: {duration}{currency_info}\n\n"
+            )
+
+    # Also update the payment information in PENDING_USERS to track the final price
+    PENDING_USERS[chat_id]['final_price_usd'] = fee_adjusted_price
+    save_pending_users()
+
+    # Send payment credentials based on the selected method
+    payment_details = {
+        "💳 Paypal": "PayPal:\nOption 1: https://paypal.me/daintyrich\n\nOption 2: \nName: R Mina\nEmail: romeomina061109@gmail.com",
+        "🏦 Bank Transfer": "🏦 **Bank Details:**\nBank: BDO\nDebit Number: 5210 6912 0103 9329\nAccount Name: Romeo B. Mina III",
+        "📱 GCash": "📱 **GCash Number:** 09274478330 (R. U.)",
+        "💸 Exness Direct": {
+            "account_id_1": "108377569",
+            "email_1": "diamondchay626@gmail.com",
+            "account_id_2": "217136604",
+            "email_2": "romeomina061109@gmail.com"
+        }
+    }
+
+    # Format the message properly with plan details
+    if method == "💸 Exness Direct":
+        message = (
+            "💰 **Payment Instructions:**\n\n"
+            f"{plan_details}"
+            "For Exness Direct:\n"
+            f"📌 **Exness Account ID 1:** {payment_details['💸 Exness Direct']['account_id_1']}\n"
+            f"📧 **Email 1:** {payment_details['💸 Exness Direct']['email_1']}\n\n"
+            f"📌 **Exness Account ID 2:** {payment_details['💸 Exness Direct']['account_id_2']}\n"
+            f"📧 **Email 2:** {payment_details['💸 Exness Direct']['email_2']}\n\n"
+            "After completing your transaction, please use /verify to confirm your payment.\n\n"
+            "Note: Your Telegram ID and name will be securely recorded."
+        )
+    else:
+        message = (
+            "💰 **Payment Instructions:**\n\n"
+            f"{plan_details}"
+            f"{payment_details[method]}\n\n"
+            "After completing your transaction, please use /verify to confirm your payment.\n\n"
+            "Note: Your Telegram ID and name will be securely recorded."
+        )
+
+    # Send the message
+    bot.send_message(chat_id, message, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_plan_selection")
+def back_to_plan_selection(call):
+    """Handle going back to plan selection"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    
+    # First, remove the keyboard from the existing message to prevent multiple clicks
+    remove_inline_keyboard(chat_id, call.message.message_id)
+    
+    bot.answer_callback_query(call.id, "Returning to plan selection...")
+    
+    # Get mentorship type from the stored data
+    mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', 'regular')
+    is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
+    
+    # Update the status
+    PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
+    save_pending_users()
+    
+    # Create new markup based on the mentorship type
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    if mentorship_type == 'regular':
+        # Get regular discount if applicable
+        applicable_discount = DISCOUNTS.get('regular')
+        discount_active = applicable_discount and applicable_discount.get('active', False)
+        
+        # Check if discount applies to this transaction type
+        if discount_active:
+            transaction_type = "renewal" if is_renewal else "new"
+            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+            
+            # Determine if discount applies to this transaction type
+            applies_to_transaction = (
+                discount_transaction_type == 'both' or 
+                discount_transaction_type == transaction_type
+            )
+            
+            # Only consider discount active if it applies to this transaction type
+            if not applies_to_transaction:
+                discount_active = False
+                
+        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+        discount_name = applicable_discount.get('name', '') if discount_active else ''
+        
+        # Original prices
+        trial_price = 7.99
+        momentum_price = 20.99
+        legacy_price = 89.99
+        
+        if discount_active:
+            # Calculate discounted prices
+            trial_discounted = round(trial_price * (1 - discount_percentage / 100), 2)
+            momentum_discounted = round(momentum_price * (1 - discount_percentage / 100), 2)
+            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+            
+            # Add buttons with discounted prices
+            markup.add(
+                InlineKeyboardButton(f"Trial (${trial_discounted:.2f}) / Monthly", callback_data="plan_trial"),
+                InlineKeyboardButton(f"Momentum (${momentum_discounted:.2f}) / 3 Months", callback_data="plan_momentum"),
+                InlineKeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Yearly", callback_data="plan_regular_legacy")
+            )
+            
+            # Add back button
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
+            
+            # Use HTML formatting for both bold and strikethrough
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                          f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
+                          f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
+                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        else:
+            # No discount - show regular prices without strikethrough
+            markup.add(
+                InlineKeyboardButton(f"Trial (${trial_price:.2f}) / Monthly", callback_data="plan_trial"),
+                InlineKeyboardButton(f"Momentum (${momentum_price:.2f}) / 3 Months", callback_data="plan_momentum"),
+                InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly", callback_data="plan_regular_legacy")
+            )
+            
+            # Add back button
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
+            
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
+                          f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
+                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+    else:
+        # Supreme membership
+        # Get supreme discount if applicable
+        applicable_discount = DISCOUNTS.get('supreme')
+        discount_active = applicable_discount and applicable_discount.get('active', False)
+        
+        # Check if discount applies to this transaction type
+        if discount_active:
+            transaction_type = "renewal" if is_renewal else "new"
+            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+            
+            # Determine if discount applies to this transaction type
+            applies_to_transaction = (
+                discount_transaction_type == 'both' or 
+                discount_transaction_type == transaction_type
+            )
+            
+            # Only consider discount active if it applies to this transaction type
+            if not applies_to_transaction:
+                discount_active = False
+                
+        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+        discount_name = applicable_discount.get('name', '') if discount_active else ''
+        
+        # Original prices
+        apprentice_price = 309.99
+        disciple_price = 524.99
+        legacy_price = 899.99
+        
+        if discount_active:
+            # Calculate discounted prices
+            apprentice_discounted = round(apprentice_price * (1 - discount_percentage / 100), 2)
+            disciple_discounted = round(disciple_price * (1 - discount_percentage / 100), 2)
+            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+            
+            # Add buttons with discounted prices
+            markup.add(
+                InlineKeyboardButton(f"Apprentice (${apprentice_discounted:.2f}) / 3 Months", callback_data="plan_apprentice"),
+                InlineKeyboardButton(f"Disciple (${disciple_discounted:.2f}) / 6 Months", callback_data="plan_disciple"),
+                InlineKeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
+            )
+            
+            # Add back button
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
+            
+            # Use HTML formatting for both bold and strikethrough
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                          f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
+                          f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
+                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+        else:
+            # No discount - show regular prices without strikethrough
+            markup.add(
+                InlineKeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months", callback_data="plan_apprentice"),
+                InlineKeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months", callback_data="plan_disciple"),
+                InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
+            )
+            
+            # Add back button
+            markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
+            
+            # Customize message based on whether this is a renewal
+            intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
+            
+            bot.send_message(chat_id, 
+                          f"{intro_text}:\n\n"
+                          f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
+                          f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
+                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
+                          reply_markup=markup, 
+                          parse_mode="HTML")
+
+# Add handler for back button if needed
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_mentorship_type")
+def back_to_mentorship_type(call):
+    """Handle back button to return to mentorship type selection"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    
+    # Update status to go back to mentorship type selection
+    PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
+    save_pending_users()
+    
+    # Show mentorship type options with inline keyboard
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("Regular Mentorship", callback_data="mentorship_regular"),
+        InlineKeyboardButton("Supreme Mentorship", callback_data="mentorship_supreme")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_main_menu"))
+    
+    bot.edit_message_text(
+        "Please select your preferred mentorship level:",
+        chat_id,
+        call.message.message_id,
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id, "Returning to mentorship selection")
 
 def has_user_paid(user_id):
     return str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)]['haspayed']
@@ -1119,181 +2973,172 @@ def can_renew_membership(user_id):
         # If there's an error, default to no
         return False, "❌ Error checking renewal eligibility. Please try again later or contact an admin."
 
-# Handle Option Selection
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_option')
-def choose_option(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
+@bot.callback_query_handler(func=lambda call: call.data == "_redeem")
+def handle_redeem_serial_callback(call):
+    """Handle redeem serial button click from main menu"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    
+    # First, remove the keyboard from the existing message
+    remove_inline_keyboard(chat_id, call.message.message_id)
+    
+    # Update user status - CHANGED to match the process_serial_number handler
+    PENDING_USERS[user_id] = {'status': 'awaiting_serial'}
+    save_pending_users()
+    
+    # Create back button
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Send message prompting for serial number
+    bot.send_message(
+        chat_id,
+        "🔑 *Serial Redemption*\n\n"
+        "Please enter the serial number you received for your membership.\n\n"
+        "Note: Serial numbers are case-sensitive.",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Answer the callback query
+    bot.answer_callback_query(call.id, "Please enter your serial number")
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'awaiting_serial')
+def process_serial_number(message):
+    """Process the serial number entered by the user"""
     chat_id = message.chat.id
     user_id = message.from_user.id
-    option = message.text
-
-    if option in ["📅 Purchase Membership", "🔄 Renew Membership"]:
-        # Check if this is a new purchase or a renewal
-        is_renewal = option == "🔄 Renew Membership"
-        
-        # If it's a new purchase, check enrollment status
-        if option == "📅 Purchase Membership":
-            # Check if user already has paid membership first
-            if has_user_paid(user_id):
-                bot.send_message(chat_id, "✅ You have already paid for your membership. No further action is required.")
-                return
-                
-            # Check regular and supreme enrollment status for new purchases (not renewals)
-            regular_enrollment_open = BOT_SETTINGS.get('regular_enrollment_open', True)  # Default to open if not set
-            supreme_enrollment_open = BOT_SETTINGS.get('supreme_enrollment_open', True)  # Default to open if not set
-                        
-            # If both enrollment types are closed, show a message
-            if not regular_enrollment_open and not supreme_enrollment_open and not is_renewal:
-                # Enrollment is closed - show message to ALL users trying to purchase (not renew)
-                
-                # Create inline keyboard with Update and FAQ buttons
-                markup = InlineKeyboardMarkup(row_width=2)
-                markup.add(
-                    InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
-                    InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
-                )
-                
-                bot.send_message(
-                    chat_id,
-                    "⚠️ *Enrollment is currently closed*\n\n"
-                    "New memberships are not available at this time. Please wait for the next "
-                    "announcement from the admins about when enrollment will open again.\n\n"
-                    "• Click *Get Notified* to receive updates when enrollment opens\n"
-                    "• Check our *FAQ* section for more information\n\n"
-                    "Thank you for your interest in Prodigy Trading Academy!",
-                    parse_mode="Markdown",
-                    reply_markup=markup
-                )
-                return
-        
-        # For renewals, check if they can renew
-        elif option == "🔄 Renew Membership":
-            can_renew, message_text = can_renew_membership(user_id)
-            if not can_renew:
-                bot.send_message(chat_id, message_text)
-                return
-
-        # If we get here, either enrollment is open or the user is renewing their membership
-        # Send enrollment benefits image first
-        try:
-            with open('graphics/benefits.jpeg', 'rb') as benefits_img:
-                bot.send_photo(
-                    chat_id,
-                    benefits_img,
-                    caption="Explore our membership benefits and choose the plan that's right for you!"
-                )
-        except FileNotFoundError:
-            logging.error("Enrollment benefits image not found at graphics/benefits.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending enrollment benefits image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1.5)
-        
-        # Continue with normal flow - update status and show mentorship options
-        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
-        PENDING_USERS[chat_id]['is_renewal'] = is_renewal  # Mark as renewal for later handling
-        save_pending_users()
-        
-        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
-        markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
-        bot.send_message(chat_id, "Please select your preferred mentorship level:", reply_markup=markup)
-
-    elif option == "❓ FAQ":
-        # First send the FAQ image
-        try:
-            with open('graphics/faq_main.jpeg', 'rb') as faq_img:
-                bot.send_photo(
-                    chat_id,
-                    faq_img,
-                )
-        except FileNotFoundError:
-            logging.error("FAQ image not found at graphics/faq_main.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending FAQ image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1)
-        
-        # Then show the FAQ categories with inline buttons
-        markup = InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            InlineKeyboardButton("🎓 Join Academy", callback_data="faq_join_academy"),
-            InlineKeyboardButton("📅 Opening of Admissions", callback_data="faq_admissions"),
-            InlineKeyboardButton("💲 Mentorship Plans & Pricings", callback_data="faq_plans_pricing"),
-            InlineKeyboardButton("📦 Products & Services", callback_data="faq_products_services"),
-            InlineKeyboardButton("🌟 Benefits in Enrollment", callback_data="faq_enrollment_benefits"),
-            InlineKeyboardButton("📝 Terms & Conditions", callback_data="faq_terms"),
-            InlineKeyboardButton("🔒 Privacy Policy", callback_data="faq_privacy")
-        )
-        markup.add(InlineKeyboardButton("🏠 Back to Main Menu", callback_data="faq_main_menu"))
-        
+    serial = message.text.strip()
+    
+    # Check if the serial number exists in our database
+    if serial not in SERIAL_NUMBERS:
         bot.send_message(
             chat_id,
-            "🔍 *Frequently Asked Questions*\n\n"
-            "Select a category to view related questions:",
-            reply_markup=markup,
+            "❌ Invalid serial number. Please check and try again, or contact support if you believe this is an error.",
             parse_mode="Markdown"
         )
-
-    elif option == "❌ Cancel Membership":
-        # Check if user has an active membership
-        if str(user_id) not in PAYMENT_DATA:
-            bot.send_message(chat_id, "❌ You don't have an active membership to cancel.")
-            return
-            
-        # Check if the membership is already cancelled
-        if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)].get('cancelled', False):
-            due_date = PAYMENT_DATA[str(user_id)].get('due_date', 'Unknown')
-            try:
-                due_date_obj = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
-                days_remaining = (due_date_obj - datetime.now()).days
-                
-                bot.send_message(
-                    chat_id, 
-                    f"ℹ️ Your membership is already cancelled.\n\n"
-                    f"You will still have access until {due_date_obj.strftime('%Y-%m-%d')} "
-                    f"({days_remaining} days remaining).\n\n"
-                    f"If you wish to reactivate your membership, please use /start and select 'Renew Membership'."
-                )
-            except Exception as e:
-                # Fallback if date parsing fails
-                bot.send_message(chat_id, "ℹ️ Your membership is already cancelled. You will still have access until the next payment cycle.")
-            return
-
-        # Send cancellation confirmation graphic first
-        try:
-            with open('graphics/cancel_membership.jpeg', 'rb') as cancel_img:
-                bot.send_photo(
-                    chat_id,
-                    cancel_img,
-                    caption="⚠️ Please confirm if you wish to cancel your membership"
-                )
-        except FileNotFoundError:
-            logging.error("Cancellation confirmation image not found at graphics/cancel_membership.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending cancellation confirmation image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1.5)
-
-        # Update user status and show confirmation buttons
-        PENDING_USERS[chat_id]['status'] = 'cancel_membership'
-        save_pending_users()
-        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(KeyboardButton("Yes"), KeyboardButton("No"))
-        bot.send_message(chat_id, "Are you sure you want to cancel your membership? You will still have access until next month/year, but you will not be charged. Please confirm.", reply_markup=markup)
-
-    elif option == "⬅️ Go Back":
-        # If user clicks the back button, take them back to main menu
-        show_main_menu(chat_id, user_id)
-        
+        return
+    
+    # Check if the serial has already been used
+    if SERIAL_NUMBERS[serial].get('used', False):
+        bot.send_message(
+            chat_id,
+            "❌ This serial number has already been used. Each serial can only be redeemed once.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Valid serial number - get the associated plan details
+    mentorship_type = SERIAL_NUMBERS[serial].get('mentorship_type', 'regular')
+    plan = SERIAL_NUMBERS[serial].get('plan', 'Trial')
+    
+    # Send confirmation message
+    bot.send_message(
+        chat_id,
+        f"✅ *Valid Serial Number!*\n\n"
+        f"You are redeeming a serial for:\n"
+        f"• Mentorship Type: *{mentorship_type.capitalize()}*\n"
+        f"• Plan: *{plan}*\n\n"
+        f"Processing your redemption...",
+        parse_mode="Markdown"
+    )
+    
+    # Calculate due date based on the plan
+    if plan == "Trial":
+        due_date = datetime.now() + timedelta(days=30)  # 1 month
+    elif plan == "Momentum" or plan == "Apprentice":
+        due_date = datetime.now() + timedelta(days=90)  # 3 months
+    elif plan == "Disciple":
+        due_date = datetime.now() + timedelta(days=180)  # 6 months
+    elif plan == "Regular Legacy":
+        due_date = datetime.now() + timedelta(days=365)  # 1 year
+    elif plan == "Supreme Legacy":
+        due_date = datetime.now() + timedelta(days=3650)  # ~10 years (lifetime)
     else:
-        bot.send_message(chat_id, "❌ Invalid option. Please select from the available options.")
-
-# Add this function at an appropriate location in your code
+        due_date = datetime.now() + timedelta(days=30)  # Default to 1 month
+    
+    # Mark the serial as used
+    SERIAL_NUMBERS[serial]['used'] = True
+    SERIAL_NUMBERS[serial]['used_by'] = user_id
+    SERIAL_NUMBERS[serial]['used_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    save_serial_number(serial, SERIAL_NUMBERS[serial])
+    
+    # Save user membership data
+    username = message.from_user.username or "No Username"
+    
+    if str(user_id) in PAYMENT_DATA:
+        # Update existing data
+        PAYMENT_DATA[str(user_id)].update({
+            "username": username,
+            "payment_plan": plan,
+            "payment_mode": "Serial Redemption",
+            "mentorship_type": mentorship_type,
+            "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+            "haspayed": True,
+            "serial_number": serial
+        })
+    else:
+        # Create new entry
+        PAYMENT_DATA[str(user_id)] = {
+            "username": username,
+            "payment_plan": plan,
+            "payment_mode": "Serial Redemption",
+            "mentorship_type": mentorship_type,
+            "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+            "haspayed": True,
+            "terms_accepted": True,
+            "privacy_accepted": True,
+            "serial_number": serial
+        }
+    
+    save_payment_data()
+    
+    # Clear pending status
+    PENDING_USERS[user_id]['status'] = 'serial_redeemed'
+    save_pending_users()
+    
+    # Send success message with celebration GIF or image
+    try:
+        with open('graphics/serial_success.jpeg', 'rb') as success_img:
+            bot.send_photo(
+                chat_id,
+                success_img,
+                caption=f"🎉 *SERIAL REDEMPTION SUCCESSFUL!*\n\n"
+                        f"Your {mentorship_type.capitalize()} Membership ({plan}) has been activated!\n\n"
+                        f"Membership expires: {due_date.strftime('%Y-%m-%d')}\n\n"
+                        f"We're preparing your onboarding process...",
+                parse_mode="Markdown"
+            )
+    except FileNotFoundError:
+        # Fallback to text message if image not found
+        bot.send_message(
+            chat_id,
+            f"🎉 *SERIAL REDEMPTION SUCCESSFUL!*\n\n"
+            f"Your {mentorship_type.capitalize()} Membership ({plan}) has been activated!\n\n"
+            f"Membership expires: {due_date.strftime('%Y-%m-%d')}\n\n"
+            f"We're preparing your onboarding process...",
+            parse_mode="Markdown"
+        )
+    
+    # Add a small delay for better UX
+    time.sleep(1.5)
+    
+    # Start the onboarding process
+    send_onboarding_form(user_id)
+    
+    # Notify admins about the serial redemption
+    for admin_id in ADMIN_IDS:
+        bot.send_message(
+            admin_id,
+            f"🔑 *SERIAL REDEMPTION*\n\n"
+            f"• User: @{username} (ID: `{user_id}`)\n"
+            f"• Serial: `{serial}`\n"
+            f"• Mentorship: {mentorship_type.capitalize()}\n"
+            f"• Plan: {plan}\n"
+            f"• Expires: {due_date.strftime('%Y-%m-%d')}\n\n"
+            f"Generated by: {SERIAL_NUMBERS[serial].get('generated_by', 'Unknown')}",
+            parse_mode="Markdown"
+        )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("faq_"))
 def handle_faq_category(call):
@@ -1612,676 +3457,6 @@ def handle_faq_category(call):
         
         bot.answer_callback_query(call.id, "Returning to main menu")
 
-# Handle mentorship type selection (Regular vs Supreme)
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_mentorship_type')
-def choose_mentorship_type(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
-    chat_id = message.chat.id
-    mentorship_type = message.text
-    is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
-
-    # Check if user wants to go back
-    if mentorship_type == "⬅️ Go Back":
-        # Return to main menu
-        show_main_menu(chat_id, message.from_user.id)
-        return
-    
-    if mentorship_type == "Regular Mentorship":
-        # Check enrollment status for Regular membership if this is a new purchase
-        if not is_renewal and not BOT_SETTINGS.get('regular_enrollment_open', True):
-            # Create inline keyboard with Get Notified and FAQ buttons
-            markup = InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
-                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
-            )
-            
-            bot.send_message(
-                chat_id,
-                "⚠️ *Regular Membership enrollment is currently CLOSED*\n\n"
-                "New Regular Membership purchases are temporarily unavailable.\n"
-                "Please wait for the next announcement about when enrollment will open again.\n\n"
-                "• Click *Get Notified* to receive updates when enrollment opens\n"
-                "• Check our *FAQ* section for more information\n\n"
-                "Existing members can still renew their memberships.",
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-            return
-            
-        # First send the Regular Mentorship pricing image
-        try:
-            with open('graphics/regular.jpeg', 'rb') as pricing_img:
-                bot.send_photo(
-                    chat_id,
-                    pricing_img,
-                    caption="Regular Mentorship Pricing Options"
-                )
-        except FileNotFoundError:
-            logging.error("Regular pricing image not found at graphics/regular.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending Regular pricing image: {e}")
-            
-        # Add a small delay for better UX
-        time.sleep(1.5)
-        
-        # Get regular discount specifically
-        applicable_discount = DISCOUNTS.get('regular')
-        discount_active = applicable_discount and applicable_discount.get('active', False)
-        
-        # Check if discount applies to this transaction type (new or renewal)
-        if discount_active:
-            transaction_type = "renewal" if is_renewal else "new"
-            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
-            
-            # Determine if discount applies to this transaction type
-            applies_to_transaction = (
-                discount_transaction_type == 'both' or 
-                discount_transaction_type == transaction_type
-            )
-            
-            # Only consider discount active if it applies to this transaction type
-            if not applies_to_transaction:
-                discount_active = False
-                
-        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
-        discount_name = applicable_discount.get('name', '') if discount_active else ''
-        
-        PENDING_USERS[chat_id]['mentorship_type'] = 'regular'
-        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
-        save_pending_users()
-        
-        # Original prices
-        trial_price = 7.99
-        momentum_price = 20.99
-        legacy_price = 89.99
-        
-        # Customize message based on whether this is a renewal
-        intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
-        
-        if discount_active:
-            # Calculate discounted prices
-            trial_discounted = round(trial_price * (1 - discount_percentage / 100), 2)
-            momentum_discounted = round(momentum_price * (1 - discount_percentage / 100), 2)
-            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
-            
-            # Create keyboard with discounted prices
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton(f"Trial (${trial_discounted:.2f}) / Monthly"))
-            markup.add(KeyboardButton(f"Momentum (${momentum_discounted:.2f}) / 3 Months"))
-            markup.add(KeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Yearly"))
-            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
-            
-            # Use HTML formatting for both bold and strikethrough
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
-                          f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
-                          f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
-                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
-        else:
-            # No discount - show regular prices without strikethrough
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton(f"Trial (${trial_price:.2f}) / Monthly"))
-            markup.add(KeyboardButton(f"Momentum (${momentum_price:.2f}) / 3 Months"))
-            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly"))
-            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
-            
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
-                          f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
-                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
-        
-    elif mentorship_type == "Supreme Mentorship":
-        # Check enrollment status for Supreme membership if this is a new purchase
-        if not is_renewal and not BOT_SETTINGS.get('supreme_enrollment_open', True):
-            # Create inline keyboard with Get Notified and FAQ buttons
-            markup = InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
-                InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
-            )
-            
-            bot.send_message(
-                chat_id,
-                "⚠️ *Supreme Membership enrollment is currently CLOSED*\n\n"
-                "New Supreme Membership purchases are temporarily unavailable.\n"
-                "Please wait for the next announcement about when enrollment will open again.\n\n"
-                "• Click *Get Notified* to receive updates when enrollment opens\n"
-                "• Check our *FAQ* section for more information\n\n"
-                "Existing members can still renew their memberships.",
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-            return
-            
-        # First send the Supreme Mentorship pricing image
-        try:
-            with open('graphics/supreme.jpeg', 'rb') as pricing_img:
-                bot.send_photo(
-                    chat_id,
-                    pricing_img,
-                    caption="Supreme Mentorship Pricing Options"
-                )
-        except FileNotFoundError:
-            logging.error("Supreme pricing image not found at graphics/supreme.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending Supreme pricing image: {e}")
-            
-        # Add a small delay for better UX
-        time.sleep(1.5)
-        
-        # Get supreme discount specifically
-        applicable_discount = DISCOUNTS.get('supreme')
-        discount_active = applicable_discount and applicable_discount.get('active', False)
-        
-        # Check if discount applies to this transaction type (new or renewal)
-        if discount_active:
-            transaction_type = "renewal" if is_renewal else "new"
-            discount_transaction_type = applicable_discount.get('transaction_type', 'both')
-            
-            # Determine if discount applies to this transaction type
-            applies_to_transaction = (
-                discount_transaction_type == 'both' or 
-                discount_transaction_type == transaction_type
-            )
-            
-            # Only consider discount active if it applies to this transaction type
-            if not applies_to_transaction:
-                discount_active = False
-                
-        discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
-        discount_name = applicable_discount.get('name', '') if discount_active else ''
-        
-        PENDING_USERS[chat_id]['mentorship_type'] = 'supreme'
-        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
-        save_pending_users()
-        
-        # Original prices
-        apprentice_price = 309.99
-        disciple_price = 524.99
-        legacy_price = 899.99
-        
-        # Customize message based on whether this is a renewal
-        intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
-        
-        if discount_active:
-            # Calculate discounted prices
-            apprentice_discounted = round(apprentice_price * (1 - discount_percentage / 100), 2)
-            disciple_discounted = round(disciple_price * (1 - discount_percentage / 100), 2)
-            legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
-            
-            # Create keyboard with discounted prices
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton(f"Apprentice (${apprentice_discounted:.2f}) / 3 Months"))
-            markup.add(KeyboardButton(f"Disciple (${disciple_discounted:.2f}) / 6 Months"))
-            markup.add(KeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Lifetime"))
-            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
-            
-            # Use HTML formatting for both bold and strikethrough
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
-                          f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
-                          f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
-                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
-        else:
-            # No discount - show regular prices without strikethrough
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months"))
-            markup.add(KeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months"))
-            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime"))
-            markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
-            
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
-                          f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
-                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
-    else:
-        # Add Back button to the error response too
-        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
-        markup.add(KeyboardButton("⬅️ Go Back"))
-        bot.send_message(chat_id, "❌ Please choose either 'Regular Mentorship' or 'Supreme Mentorship'.", reply_markup=markup)
-
-
-# Update the handler to process mentorship plans
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_mentorship_plan')
-def choose_mentorship_plan(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    plan_text = message.text
-    
-    # Check if user wants to go back
-    if plan_text == "⬅️ Go Back":
-        # Return to membership type selection
-        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
-        save_pending_users()
-        
-        # Show mentorship type options again
-        markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-        markup.add(KeyboardButton("Regular Mentorship"), KeyboardButton("Supreme Mentorship"))
-        markup.add(KeyboardButton("⬅️ Go Back"))
-        bot.send_message(chat_id, "Please select your preferred mentorship level:", reply_markup=markup)
-        return
-    
-    # Extract plan data based on selection
-    if "Trial" in plan_text:
-        plan = "Trial"
-        price_usd = 7.99  # Store numeric USD price for currency conversion
-        duration = "Monthly"
-        mentorship_type = "regular"
-        plan_image = "graphics/trial.jpeg"
-    elif "Momentum" in plan_text:
-        plan = "Momentum"
-        price_usd = 20.99
-        duration = "3 Months"
-        mentorship_type = "regular"
-        plan_image = "graphics/momentum.jpeg"
-    elif "Apprentice" in plan_text:
-        plan = "Apprentice"
-        price_usd = 309.99
-        duration = "3 Months"
-        mentorship_type = "supreme"
-        plan_image = "graphics/apprentice.jpeg"
-    elif "Disciple" in plan_text:
-        plan = "Disciple"
-        price_usd = 524.99
-        duration = "6 Months" 
-        mentorship_type = "supreme"
-        plan_image = "graphics/disciple.jpeg"
-    elif "Legacy" in plan_text and "$89.99" in plan_text:
-        plan = "Legacy"
-        price_usd = 89.99
-        duration = "Yearly"
-        mentorship_type = "regular"
-        plan_image = "graphics/regular_legacy.jpeg"
-    elif "Legacy" in plan_text and "$899.99" in plan_text:
-        plan = "Legacy"
-        price_usd = 899.99
-        duration = "Lifetime"
-        mentorship_type = "supreme"
-        plan_image = "graphics/master.jpeg"
-    else:
-        bot.send_message(chat_id, "❌ Invalid plan selection. Please choose a valid plan.")
-        return
-
-    # Send the plan-specific graphic
-    try:
-        with open(plan_image, 'rb') as img:
-            bot.send_photo(
-                chat_id,
-                img,
-            )
-    except FileNotFoundError:
-        logging.error(f"Plan image not found at {plan_image}")
-    except Exception as e:
-        logging.error(f"Error sending plan image: {e}")
-    
-    # Add a small delay for better UX
-    time.sleep(1.5)
-
-    # Store original price before any discounts
-    original_price_usd = price_usd
-    original_price = f"${original_price_usd:.2f}"
-    
-    # Apply appropriate discount based on mentorship type
-    discount_applied = False
-    applicable_discount = DISCOUNTS.get(mentorship_type)
-    
-    if applicable_discount and applicable_discount.get('active', False):
-        # Get transaction type - renewal or new purchase
-        is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
-        transaction_type = "renewal" if is_renewal else "new"
-        
-        # Debug log to identify the issue
-        logging.info(f"Discount check for {mentorship_type}: is_renewal={is_renewal}, user_transaction={transaction_type}, discount_type={applicable_discount.get('transaction_type', 'both')}")
-        
-        # Fix the transaction type check logic
-        applies_to_transaction = (
-            applicable_discount.get('transaction_type', 'both') == 'both' or 
-            applicable_discount.get('transaction_type', 'both') == transaction_type
-        )
-        
-        # Only apply if the discount is valid for this transaction type
-        if applies_to_transaction:
-            # Get discount percentage and user limit
-            discount_percentage = applicable_discount.get('percentage', 0)
-            user_limit = applicable_discount.get('user_limit')
-            users_used = applicable_discount.get('users_used', [])
-            discount_name = applicable_discount.get('name', f'Special {mentorship_type.capitalize()} Discount')
-            
-            # Check if user limit is reached and if this user already used the discount
-            if (user_limit is None or len(users_used) < user_limit) and str(user_id) not in users_used:
-                # Apply the discount
-                price_usd = original_price_usd * (1 - discount_percentage / 100)
-                
-                # Store discount info for later use
-                PENDING_USERS[chat_id]['discount_percentage'] = discount_percentage
-                PENDING_USERS[chat_id]['discount_name'] = discount_name
-                PENDING_USERS[chat_id]['original_price_usd'] = original_price_usd
-                
-                # Mark discount as applied
-                discount_applied = True
-                
-                # Add user to the list of users who used this discount
-                DISCOUNTS[mentorship_type]['users_used'].append(str(user_id))
-                save_discount(DISCOUNTS[mentorship_type], mentorship_type)
-                
-                # Log the discount application
-                logging.info(f"Applied {discount_percentage}% {mentorship_type} discount to user {user_id}, price reduced from ${original_price_usd} to ${price_usd}")
-            elif user_limit is not None and len(users_used) >= user_limit and str(user_id) not in users_used:
-                # User limit reached
-                bot.send_message(chat_id, f"❌ The {discount_name} discount has reached its user limit. Your purchase will continue at the regular price.")
-            elif str(user_id) in users_used:
-                # User already used the discount
-                bot.send_message(chat_id, f"ℹ️ You've already used the {discount_name} discount. This purchase will be at the regular price.")
-        else:
-            # Not applicable - inform user if this is a specific discount type
-            if applicable_discount.get('transaction_type') == "renewal" and not is_renewal:
-                bot.send_message(chat_id, f"ℹ️ The current {mentorship_type.capitalize()} discount is only available for renewals, not new purchases.")
-            elif applicable_discount.get('transaction_type') == "new" and is_renewal:
-                bot.send_message(chat_id, f"ℹ️ The current {mentorship_type.capitalize()} discount is only available for new purchases, not renewals.")
-    
-    # Format the price for display (always .99)
-    price = f"${price_usd:.2f}"
-
-    # Store the plan details including the numeric USD price
-    PENDING_USERS[chat_id]['plan'] = plan
-    PENDING_USERS[chat_id]['price'] = price
-    PENDING_USERS[chat_id]['price_usd'] = price_usd  # Store numeric price for conversion
-    PENDING_USERS[chat_id]['mentorship_type'] = mentorship_type  # Store for later use
-    PENDING_USERS[chat_id]['duration'] = duration
-    PENDING_USERS[chat_id]['status'] = 'choosing_payment_method'
-    save_pending_users()
-
-    # Customize message based on discount
-    if discount_applied:
-        plan_message = (
-            f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
-            f"• Original price: {original_price}\n"
-            f"🔖 Discount: {PENDING_USERS[chat_id]['discount_percentage']}% OFF ({PENDING_USERS[chat_id]['discount_name']})\n\n"
-            f"• You pay: {price}\n"
-            f"• Duration: {duration}\n\n"
-            f"Please be prepared for the following steps:\n"
-            f"• Payment\n"
-            f"• Registration Forms\n\n"
-        )
-    else:
-        plan_message = (
-            f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
-            f"• Price: {price}\n"
-            f"• Duration: {duration}\n\n"
-            f"Please be prepared for the following steps:\n"
-            f"• Payment\n"
-            f"• Registration Forms\n\n"
-        )
-    
-    # Show plan confirmation message
-    bot.send_message(chat_id, plan_message)
-    
-    # Add a transition message with typing indicator
-    bot.send_chat_action(chat_id, 'typing')
-    transition_msg = bot.send_message(chat_id, "⏳ Moving on to payment options...")
-    
-    # Add a small delay for better UX
-    time.sleep(1.5)
-    
-    # Delete the transition message
-    try:
-        bot.delete_message(chat_id, transition_msg.message_id)
-    except Exception as e:
-        logging.error(f"Error deleting transition message: {e}")
-    
-    # Create payment method markup
-    markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    markup.add(KeyboardButton("💳 Paypal"), KeyboardButton("📱 GCash"))
-    markup.add(KeyboardButton("💸 Exness Direct"), KeyboardButton("🏦 Bank Transfer"))
-    markup.add(KeyboardButton("⬅️ Go Back"))  # Add Back button
-        
-    # Ask for payment method after transition
-    bot.send_message(chat_id, "Please select your payment method:", reply_markup=markup)
-
-# Handle Payment Method Selection
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'choosing_payment_method')
-def choose_payment_method(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
-    chat_id = message.chat.id
-    method = message.text
-
-    # Check if user wants to go back
-    if method == "⬅️ Go Back":
-        # Return to plan selection
-        mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', 'regular')
-        PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_plan'
-        save_pending_users()
-        
-        # Re-display appropriate plan options based on mentorship type
-        if mentorship_type == 'regular':
-            # Show regular plans
-            trial_price = 7.99
-            momentum_price = 20.99
-            legacy_price = 89.99
-            
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton(f"Trial (${trial_price:.2f}) / Monthly"))
-            markup.add(KeyboardButton(f"Momentum (${momentum_price:.2f}) / 3 Months"))
-            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly"))
-            markup.add(KeyboardButton("⬅️ Go Back"))
-            
-            bot.send_message(chat_id, "Please select your Regular Mentorship plan:", reply_markup=markup)
-        else:
-            # Show supreme plans
-            apprentice_price = 309.99
-            disciple_price = 524.99
-            legacy_price = 899.99
-            
-            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-            markup.add(KeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months"))
-            markup.add(KeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months"))
-            markup.add(KeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime"))
-            markup.add(KeyboardButton("⬅️ Go Back"))
-            
-            bot.send_message(chat_id, "Please select your Supreme Mentorship plan:", reply_markup=markup)
-        return
-
-    if method not in ["💳 Paypal", "🏦 Bank Transfer", "📱 GCash", "📱 PayMaya", "💸 Exness Direct"]:
-        bot.send_message(chat_id, "❌ Invalid payment method. Please select a valid method.")
-        return
-
-    # Store the user's payment method choice
-    PENDING_USERS[chat_id]['method'] = method
-    PENDING_USERS[chat_id]['status'] = 'awaiting_payment'
-    save_pending_users()
-    
-    # Determine which payment graphic to show based on the selected method
-    payment_image = None
-    if "Paypal" in method:
-        payment_image = "graphics/paypal.jpeg"
-    elif "Bank Transfer" in method:
-        payment_image = "graphics/bank.jpeg"
-    elif "GCash" in method:
-        payment_image = "graphics/gcash.jpeg"
-    elif "Exness Direct" in method:
-        payment_image = "graphics/exness.jpeg"
-    
-    # Send the payment method-specific graphic if available
-    if payment_image:
-        try:
-            with open(payment_image, 'rb') as img:
-                bot.send_photo(
-                    chat_id,
-                    img,
-                    caption=f"You've selected {method.strip('💳📱🏦🌐💸 ')} as your payment method"
-                )
-        except FileNotFoundError:
-            logging.error(f"Payment method image not found at {payment_image}")
-        except Exception as e:
-            logging.error(f"Error sending payment method image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1.5)
-    
-    # Get plan details for the message
-    mentorship_type = PENDING_USERS[chat_id].get('mentorship_type', '')
-    plan = PENDING_USERS[chat_id].get('plan', '')
-    price = PENDING_USERS[chat_id].get('price', '')
-    price_usd = PENDING_USERS[chat_id].get('price_usd', 0)  # Get numeric discounted price
-    original_price_usd = PENDING_USERS[chat_id].get('original_price_usd')  # Original price before discount
-    duration = PENDING_USERS[chat_id].get('duration', '')
-    
-    # Calculate payment method fee based on the ALREADY DISCOUNTED price
-    fee_percentage = PAYMENT_FEES.get(method, 0.0)
-    if fee_percentage > 0:
-        fee_adjusted_price = price_usd * (1 + fee_percentage/100)
-        fee_adjusted_price_str = f"${fee_adjusted_price:.2f}"
-    else:
-        fee_adjusted_price = price_usd  # No fee adjustment
-        fee_adjusted_price_str = price
-    
-    # Fetch real-time exchange rates - use fee_adjusted_price for conversions
-    exchange_rates = get_exchange_rates()
-    
-    # Prepare currency conversion information based on the FINAL price
-    currency_info = ""
-    if exchange_rates:
-        currency_info = "\n\n💱 *Equivalent Prices*:\n"
-        
-        # Define currency symbols for better display
-        currency_symbols = {
-            'USD': '$', 'GBP': '£', 'EUR': '€', 'IDR': 'Rp', 'PHP': '₱'
-        }
-        
-        for currency, rate in exchange_rates.items():
-            if currency == 'USD':
-                continue  # Skip USD as it's already shown
-            
-            # Use the final fee-adjusted price for all currency conversions
-            equivalent_price = fee_adjusted_price * rate
-            
-            symbol = currency_symbols.get(currency, '')
-            
-            # Format based on currency
-            if currency in ['IDR', 'PHP']:
-                formatted_price = f"{symbol}{equivalent_price:,.0f}"
-            else:
-                whole_price = int(equivalent_price)
-                formatted_price = f"{symbol}{whole_price:,}.99"
-            
-            currency_info += f"• *{currency}*: {formatted_price}\n"
-    
-    # Format plan details based on discount and payment fee combinations
-    discount_percentage = PENDING_USERS[chat_id].get('discount_percentage')
-    discount_name = PENDING_USERS[chat_id].get('discount_name')
-
-    # Create a comprehensive message showing all calculations clearly
-    if original_price_usd and discount_percentage:
-        # Case: Has discount
-        if fee_percentage > 0:
-            # Has both discount AND payment fee - show complete calculation
-            plan_details = (
-                f"*Plan Details*:\n"
-                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
-                f"- Plan: {plan}\n"
-                f"- Original Price: ${original_price_usd:.2f} USD\n"
-                f"- *{discount_name}: {discount_percentage}% OFF* (-${(original_price_usd - price_usd):.2f})\n"
-                f"- Discounted Price: ${price_usd:.2f} USD\n"
-                f"- *{method.strip('💳📱🏦🌐💸 ')} Fee: {fee_percentage}%* (+${(fee_adjusted_price - price_usd):.2f})\n"
-                f"- **Final Price: {fee_adjusted_price_str} USD**\n"
-                f"- Duration: {duration}{currency_info}\n\n"
-                f"*Note: A {fee_percentage}% fee applies to cover {method.strip('💳📱🏦🌐💸 ')} transaction costs.*\n\n"
-            )
-        else:
-            # Has discount but NO payment fee
-            plan_details = (
-                f"*Plan Details*:\n"
-                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
-                f"- Plan: {plan}\n"
-                f"- Original Price: ${original_price_usd:.2f} USD\n"
-                f"- *{discount_name}: {discount_percentage}% OFF* (-${(original_price_usd - price_usd):.2f})\n"
-                f"- **Final Price: ${price_usd:.2f} USD**\n"
-                f"- Duration: {duration}{currency_info}\n\n"
-            )
-    else:
-        # Case: No discount applied
-        if fee_percentage > 0:
-            # No discount, but has payment fee
-            plan_details = (
-                f"*Plan Details*:\n"
-                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
-                f"- Plan: {plan}\n"
-                f"- Base Price: ${price_usd:.2f} USD\n"
-                f"- *{method.strip('💳📱🏦🌐💸 ')} Fee: {fee_percentage}%* (+${(fee_adjusted_price - price_usd):.2f})\n"
-                f"- **Final Price: {fee_adjusted_price_str} USD**\n"
-                f"- Duration: {duration}{currency_info}\n\n"
-                f"*Note: A {fee_percentage}% fee applies to cover {method.strip('💳📱🏦🌐💸 ')} transaction costs.*\n\n"
-            )
-        else:
-            # No discount, no payment fee - simplest case
-            plan_details = (
-                f"*Plan Details*:\n"
-                f"- Type: {mentorship_type.capitalize()} Mentorship\n"
-                f"- Plan: {plan}\n"
-                f"- **Price: ${price_usd:.2f} USD**\n"
-                f"- Duration: {duration}{currency_info}\n\n"
-            )
-
-    # Also update the payment information in PENDING_USERS to track the final price
-    PENDING_USERS[chat_id]['final_price_usd'] = fee_adjusted_price
-    save_pending_users()
-
-    # Send payment credentials based on the selected method
-    payment_details = {
-        "💳 Paypal": "PayPal:\nOption 1: https://paypal.me/daintyrich\n\nOption 2: \nName: R Mina\nEmail: romeomina061109@gmail.com",
-        "🏦 Bank Transfer": "🏦 **Bank Details:**\nBank: BDO\nDebit Number: 5210 6912 0103 9329\nAccount Name: Romeo B. Mina III",
-        "📱 GCash": "📱 **GCash Number:** 09274478330 (R. U.)",
-        "💸 Exness Direct": {
-            "account_id_1": "108377569",
-            "email_1": "diamondchay626@gmail.com",
-            "account_id_2": "217136604",
-            "email_2": "romeomina061109@gmail.com"
-        }
-    }
-
-    # Format the message properly with plan details
-    if method == "💸 Exness Direct":
-        message = (
-            "💰 **Payment Instructions:**\n\n"
-            f"{plan_details}"
-            "For Exness Direct:\n"
-            f"📌 **Exness Account ID 1:** {payment_details['💸 Exness Direct']['account_id_1']}\n"
-            f"📧 **Email 1:** {payment_details['💸 Exness Direct']['email_1']}\n\n"
-            f"📌 **Exness Account ID 2:** {payment_details['💸 Exness Direct']['account_id_2']}\n"
-            f"📧 **Email 2:** {payment_details['💸 Exness Direct']['email_2']}\n\n"
-            "After completing your transaction, please use `/verify` to confirm your payment.\n\n"
-            "Note: Your Telegram ID and name will be securely recorded."
-        )
-    else:
-        message = (
-            "💰 **Payment Instructions:**\n\n"
-            f"{plan_details}"
-            f"{payment_details[method]}\n\n"
-            "After completing your transaction, please use `/verify` to confirm your payment.\n\n"
-            "Note: Your Telegram ID and name will be securely recorded."
-        )
-
-    # Send the message
-    bot.send_message(chat_id, message, parse_mode="Markdown")
-
 # Verify Command - Asks for proof of payment
 @bot.message_handler(commands=['verify'])
 def request_payment_proof(message):
@@ -2392,6 +3567,40 @@ def handle_payment_screenshot(message):
         markup.add(InlineKeyboardButton("Reject", callback_data=f"reject_payment_{user_id}"))
 
         bot.forward_message(admin, chat_id, message.message_id)
+
+        price_usd = PENDING_USERS[chat_id].get('price_usd', 0)  # Base price
+        fee_adjusted_price = PENDING_USERS[chat_id].get('final_price_usd', price_usd)  # With payment fee if applicable
+
+        exchange_rates = get_exchange_rates()
+
+        currency_info = ""
+        if exchange_rates:
+            currency_info = "\n\n💱 *Currency Equivalents*:\n"
+            
+            # Define currency symbols for better display
+            currency_symbols = {
+                'USD': '$', 'GBP': '£', 'EUR': '€', 'IDR': 'Rp', 'PHP': '₱'
+            }
+            
+            for currency, rate in exchange_rates.items():
+                if currency == 'USD':
+                    continue  # Skip USD as it's already shown
+                
+                # Calculate equivalent price in this currency
+                equivalent_price = fee_adjusted_price * rate
+                
+                symbol = currency_symbols.get(currency, '')
+                
+                # Format based on currency
+                if currency in ['IDR', 'PHP']:
+                    formatted_price = f"{symbol}{equivalent_price:,.0f}"
+                else:
+                    # For currencies like GBP and EUR, always use .99 ending for consistent pricing
+                    whole_price = int(equivalent_price)
+                    formatted_price = f"{symbol}{whole_price}.99"
+                
+                currency_info += f"• *{currency}*: {formatted_price}\n"
+
         bot.send_message(admin,
             f"🔔 *Payment Request:*\n"
             f"Someone is waiting for a payment approval. Here are the details:\n\n"
@@ -2399,7 +3608,8 @@ def handle_payment_screenshot(message):
             f"💳 Mode of Payment: {method}\n"
             f"📅 Mentorship Type: {mentorship_type.capitalize()}\n"
             f"📅 Plan: {plan} ({price_display})\n"  # Now shows adjusted price if needed
-            f"📅 Due Date: {USER_PAYMENT_DUE[user_id].strftime('%Y-%m-%d %H:%M:%S')}",
+            f"📅 Due Date: {USER_PAYMENT_DUE[user_id].strftime('%Y-%m-%d %H:%M:%S')}"
+            f"{currency_info}",
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -2541,7 +3751,7 @@ def callback_approve_payment(call):
 
                         # 📅 Step 2: Determine and send due date
             USER_PAYMENT_DUE[user_id] = due_date
-            bot.send_message(user_id, f"📅 **Your next payment is due on:** {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
+            bot.send_message(user_id, f"📅 *Your next payment is due on:* {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
 
             # Send registration form graphic first
             try:
@@ -2583,35 +3793,6 @@ def callback_approve_payment(call):
 
             # Then call send_onboarding_form which will set the proper status
             send_onboarding_form(user_id)
-            
-            # The rest of the function (social links, group invite) will be sent after form completion
-            # We'll save the invite link for later use
-            try:
-                # Check if the user is already in the group they should be invited to
-                target_group_id = PENDING_USERS[user_id]['target_group_id']
-                try:
-                    member = bot.get_chat_member(target_group_id, user_id)
-                    if member.status in ["member", "administrator", "creator"]:
-                        PENDING_USERS[user_id]['already_in_group'] = True
-                        save_pending_users()
-                        return  # No invite needed
-                except Exception:
-                    pass  # User not found in the group
-                
-                # User is not in the group → Create a one-time use invite link but don't send it yet
-                invite_link: ChatInviteLink = bot.create_chat_invite_link(
-                    target_group_id,
-                    member_limit=1,  # One-time use only
-                    creates_join_request=False
-                )
-                
-                # Save the invite link for later
-                PENDING_USERS[user_id]['invite_link'] = invite_link.invite_link
-                save_pending_users()
-                
-            except ApiException as e:
-                bot.send_message(call.message.chat.id, f"❌ Link generation failed: {e.result_json['description']}")
-                return
             
         except Exception as e:
             bot.answer_callback_query(call.id, f"❌ Error sending onboarding form: {e}")
@@ -3350,110 +4531,126 @@ def complete_onboarding(user_id):
         # 1. Send social media connections
         send_welcome_package(user_id)
         
-        # 2. Send group invite - FIXED VERSION FOR SERIAL REDEMPTION
+        # 2. Send group invite - IMPROVED VERSION WITH ALREADY-IN-GROUP CHECK
         invite_link = PENDING_USERS[user_id].get('invite_link')
         already_in_group = PENDING_USERS[user_id].get('already_in_group', False)
         membership_type = PENDING_USERS[user_id].get('membership_type', 'regular')
         
         # Determine target group based on membership type
         target_group_id = SUPREME_GROUP_ID if membership_type == 'supreme' else PAID_GROUP_ID
-        
-        # If we don't have an invite link yet, generate one
-        if not invite_link and not already_in_group:
-            try:
-                # Generate a new invite link
-                new_invite = bot.create_chat_invite_link(
-                    target_group_id,
-                    name=f"User {user_id} onboarding",
-                    creates_join_request=False,
-                    member_limit=1,
-                    expire_date=int((datetime.now() + timedelta(minutes=15)).timestamp())
-                )
-                invite_link = new_invite.invite_link
-                
-                # Save the new invite link
-                PENDING_USERS[user_id]['invite_link'] = invite_link
-                PENDING_USERS[user_id]['target_group_id'] = target_group_id
-                save_pending_users()
-                
-                logging.info(f"Generated new invite link for user {user_id} joining group {target_group_id}")
-            except Exception as e:
-                logging.error(f"Failed to create invite link for user {user_id}: {e}")
-                
-                # Send error notification to admins
-                for admin_id in ADMIN_IDS:
-                    bot.send_message(
-                        admin_id,
-                        f"⚠️ *Error generating invite link*\n\n"
-                        f"Could not create invite link for user {user_id} during serial redemption flow.\n"
-                        f"Error: {e}\n\n"
-                        f"Please manually send an invite to this user.",
-                        parse_mode="Markdown"
-                    )
-                
-                # Notify user about the issue
-                bot.send_message(
-                    user_id,
-                    "⚠️ *Group Invite Pending*\n\n"
-                    "We're currently having trouble generating your group invite link. "
-                    "An admin has been notified and will send you an invite shortly.\n\n"
-                    "Thank you for your patience!",
-                    parse_mode="Markdown"
-                )
-        
-        # Get group name based on target group ID
         group_name = "Supreme Mentorship" if target_group_id == SUPREME_GROUP_ID else "Prodigy Trading Academy"
         
-        if not already_in_group and invite_link:
-            # ADDED: Send an important disclaimer about trading before group invite
-            disclaimer_message = (
-                "⚠️ *IMPORTANT TRADING DISCLAIMER*\n\n"
-                "Before you join our trading community, please understand:\n\n"
-                "• Trading is NOT a 'get rich quick' scheme\n"
-                "• Trading does NOT guarantee easy money\n"
-                "• Our content is purely EDUCATIONAL in nature\n"
-                "• We are NOT financial advisors and do not provide personalized financial advice\n"
-                "• Any decisions you make are your own responsibility\n\n"
-                "Success in trading requires dedication, discipline, and continuous learning. "
-                "Our academy provides education and community support, but trading always involves risk."
-            )
-            
-            # Send disclaimer first
+        # Check if user is already in the group - ADDED CHECK
+        if already_in_group:
+            # Notify user they're already in the group
             bot.send_message(
                 user_id,
-                disclaimer_message,
+                f"✅ *You're already a member!*\n\n"
+                f"You're already in our {group_name} group. No need to join again.",
                 parse_mode="Markdown"
             )
-            
-            # Wait 2 seconds for user to read disclaimer before sending invite
-            time.sleep(1)
-            
-            # Add another transition message before sending group invite
-            group_transition_msg = bot.send_message(user_id, "🔗 Generating your exclusive group invite link...")
-            time.sleep(1.5)
-            try:
-                bot.delete_message(user_id, group_transition_msg.message_id)
-            except Exception as e:
-                logging.error(f"Error deleting group transition message: {e}")
-            
-            # Then send group invite
-            bot.send_message(
-                user_id,
-                f"🎉 *Welcome to {group_name}!*\n\nPlease join our community here: {invite_link}",
-                parse_mode="Markdown"
-            )
-            
-            # Set up delayed link revocation with longer timeout (15 seconds)
-            def revoke_link_later(chat_id, invite_link, admin_ids):
-                time.sleep(60)  # Wait 60 seconds before revoking
+            logging.info(f"User {user_id} is already in group {target_group_id}, skipping invite")
+        else:
+            # If we don't have an invite link yet, generate one
+            if not invite_link:
                 try:
-                    bot.revoke_chat_invite_link(chat_id, invite_link)
-                    for admin_id in admin_ids:
-                        bot.send_message(admin_id, f"🔒 One-time invite link revoked: {invite_link}")
+                    # Generate a new invite link
+                    new_invite = bot.create_chat_invite_link(
+                        target_group_id,
+                        name=f"User {user_id} onboarding",
+                        creates_join_request=False,
+                        member_limit=1,
+                        expire_date=int((datetime.now() + timedelta(minutes=15)).timestamp())
+                    )
+                    invite_link = new_invite.invite_link
+                    
+                    # Save the new invite link
+                    PENDING_USERS[user_id]['invite_link'] = invite_link
+                    PENDING_USERS[user_id]['target_group_id'] = target_group_id
+                    save_pending_users()
+                    
+                    logging.info(f"Generated new invite link for user {user_id} joining group {target_group_id}")
                 except Exception as e:
-                    logging.error(f"⚠️ Failed to revoke invite link: {e}")
+                    logging.error(f"Failed to create invite link for user {user_id}: {e}")
+                    
+                    # Send error notification to admins
+                    for admin_id in ADMIN_IDS:
+                        bot.send_message(
+                            admin_id,
+                            f"⚠️ *Error generating invite link*\n\n"
+                            f"Could not create invite link for user {user_id} during serial redemption flow.\n"
+                            f"Error: {e}\n\n"
+                            f"Please manually send an invite to this user.",
+                            parse_mode="Markdown"
+                        )
+                    
+                    # Notify user about the issue
+                    bot.send_message(
+                        user_id,
+                        "⚠️ *Group Invite Pending*\n\n"
+                        "We're currently having trouble generating your group invite link. "
+                        "An admin has been notified and will send you an invite shortly.\n\n"
+                        "Thank you for your patience!",
+                        parse_mode="Markdown"
+                    )
+                    
+            # If we have a valid invite link, send it along with disclaimer
+            if invite_link:
+                # ADDED: Send an important disclaimer about trading before group invite
+                disclaimer_message = (
+                    "⚠️ *IMPORTANT TRADING DISCLAIMER*\n\n"
+                    "Before you join our trading community, please understand:\n\n"
+                    "• Trading is NOT a 'get rich quick' scheme\n"
+                    "• Trading does NOT guarantee easy money\n"
+                    "• Our content is purely EDUCATIONAL in nature\n"
+                    "• We are NOT financial advisors and do not provide personalized financial advice\n"
+                    "• Any decisions you make are your own responsibility\n\n"
+                    "Success in trading requires dedication, discipline, and continuous learning. "
+                    "Our academy provides education and community support, but trading always involves risk."
+                )
+                
+                # Send disclaimer first
+                bot.send_message(
+                    user_id,
+                    disclaimer_message,
+                    parse_mode="Markdown"
+                )
+                
+                # Wait 1 second for user to read disclaimer before sending invite
+                time.sleep(1)
+                
+                # Add another transition message before sending group invite
+                group_transition_msg = bot.send_message(user_id, "🔗 Generating your exclusive group invite link...")
+                time.sleep(1.5)
+                
+                try:
+                    bot.delete_message(user_id, group_transition_msg.message_id)
+                except Exception as e:
+                    logging.error(f"Error deleting group transition message: {e}")
+                
+                # Then send group invite
+                expiration_time = datetime.now() + timedelta(seconds=60)  # Link expires in 60 seconds
+                formatted_expiration = expiration_time.strftime("%I:%M:%S %p")  # Format as hour:minute:second AM/PM
 
-            threading.Thread(target=revoke_link_later, args=(target_group_id, invite_link, ADMIN_IDS)).start()
+                bot.send_message(
+                    user_id,
+                    f"🎉 *Welcome to {group_name}!*\n\n"
+                    f"Please join our community here: {invite_link}\n\n"
+                    f"⏰ *Link expires at:* {formatted_expiration} (60 seconds from now)",
+                    parse_mode="Markdown"
+                )
+                
+                # Set up delayed link revocation with longer timeout
+                def revoke_link_later(chat_id, invite_link, admin_ids):
+                    time.sleep(60)  # Wait 60 seconds before revoking
+                    try:
+                        bot.revoke_chat_invite_link(chat_id, invite_link)
+                        for admin_id in admin_ids:
+                            bot.send_message(admin_id, f"🔒 One-time invite link revoked: {invite_link}")
+                    except Exception as e:
+                        logging.error(f"⚠️ Failed to revoke invite link: {e}")
+
+                threading.Thread(target=revoke_link_later, args=(target_group_id, invite_link, ADMIN_IDS)).start()
         
         # 3. Record user form responses for admin reference
         try:
@@ -3569,7 +4766,7 @@ def send_completion_certificate(user_id):
         
         # Get user's full name from form answers
         full_name = form_answers.get('full_name', 'Member')
-        
+
         # Format current date
         current_date = datetime.now().strftime('%B %d, %Y')
         
@@ -3850,103 +5047,7 @@ def safe_markdown_escape(text):
         return escaped_text
     except Exception:
         # If anything fails, sanitize by removing problematic characters
-        return ''.join(c for c in text if c.isalnum() or c.isspace() or c in '.-_')
-
-# Handle Cancel Membership Confirmation
-@bot.message_handler(func=lambda message: PENDING_USERS.get(message.chat.id, {}).get('status') == 'cancel_membership')
-def handle_cancel_confirmation(message):
-    if message.chat.type != 'private':
-        return  # Ignore if not in private chat
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    confirmation = message.text
-
-    # Check if user actually has an active membership
-    if str(user_id) not in PAYMENT_DATA or not PAYMENT_DATA[str(user_id)].get('haspayed', False):
-        bot.send_message(chat_id, "❌ You don't have an active membership to cancel.")
-        PENDING_USERS.pop(user_id, None)
-        delete_pending_user(user_id)
-        return
-
-    # Get membership details for better context
-    plan = PAYMENT_DATA[str(user_id)].get('payment_plan', 'Unknown')
-    due_date = PAYMENT_DATA[str(user_id)].get('due_date', 'Unknown')
-    
-    if confirmation == "Yes":
-        # User confirmed cancellation
-        PENDING_USERS[user_id]['status'] = 'membership_cancelled'
-        save_pending_users()
-
-        # Set cancellation flags in payment data
-        PAYMENT_DATA[str(user_id)]['cancelled'] = True
-        PAYMENT_DATA[str(user_id)]['reminder_sent'] = True  # Prevent future reminders
-        PAYMENT_DATA[str(user_id)]['cancellation_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        save_payment_data()
-
-        # Get user's information first
-        try:
-            user_info = bot.get_chat(user_id)
-            username = user_info.username or f"User {user_id}"
-            username = safe_markdown_escape(username)
-        except Exception as e:
-            username = f"User {user_id}"  # Fallback if we can't get username
-            
-        # Send cancellation graphic first
-        try:
-            with open('graphics/confirm_cancel.jpeg', 'rb') as cancellation_img:
-                bot.send_photo(
-                    chat_id,
-                    cancellation_img,
-                )
-        except FileNotFoundError:
-            logging.error("Cancellation image not found at graphics/confirm_cancel.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending cancellation image: {e}")
-            
-        # Add a small delay for better UX
-        time.sleep(1)
-
-        # Forward the cancellation request to admins with additional context
-        for admin in ADMIN_IDS:
-            bot.send_message(
-                admin, 
-                f"🚫 *MEMBERSHIP CANCELLATION*\n\n"
-                f"👤 Username: @{username}\n"
-                f"🆔 User ID: `{user_id}`\n"
-                f"📅 Plan: {plan}\n"
-                f"⏰ Due date: {due_date}\n"
-                f"📝 Cancelled on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                parse_mode="Markdown"
-            )
-
-        # Provide better information to the user
-        try:
-            due_date_obj = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
-            days_remaining = (due_date_obj - datetime.now()).days
-            
-            bot.send_message(
-                chat_id, 
-                f"✅ Your membership is cancelled. You will still have access until {due_date_obj.strftime('%Y-%m-%d')} "
-                f"({days_remaining} days remaining), but will not be renewed.\n\n"
-                f"Thank you for being with us! If you change your mind before expiration, use /start to reactivate.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            # Fallback if date parsing fails
-            bot.send_message(chat_id, "✅ Your membership is cancelled. You will still have access until the next payment cycle, but will not be charged next month/year. Thank you for being with us!")
-            logging.error(f"Error parsing due date during cancellation: {e}")
-    
-    elif confirmation == "No":
-        # User did not confirm cancellation
-        bot.send_message(chat_id, "❌ No changes have been made to your membership. You will continue with the current payment plan.")
-    
-    else:
-        bot.send_message(chat_id, "❌ Invalid response. Please choose 'Yes' or 'No'.")
-        return  # Don't remove from pending users so they can try again
-
-    PENDING_USERS.pop(user_id, None)  # Remove from dictionary
-    delete_pending_user(user_id)  # Remove from MongoDB
-    
+        return ''.join(c for c in text if c.isalnum() or c.isspace() or c in '.-_')    
 
 # Function to remind users 3 days before payment deadline
 def escape_markdown(text):
@@ -5011,7 +6112,7 @@ def admin_dashboard(message):
     
     # Send the dashboard link with a simple button
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔐 Open Admin Dashboard", url="https://ptabot.onrender.com/dashboard"))
+    markup.add(InlineKeyboardButton("🔐 Open Admin Dashboard", url="https://ptabot.up.railway.app/"))
     
     bot.send_message(
         message.chat.id,
@@ -5102,7 +6203,7 @@ def send_scheduled_gifs():
         sleep_time = 60 - now.second - now.microsecond / 1_000_000
         time.sleep(sleep_time)
 
-CREATOR_USERNAME = "FujiiiiiPTA" 
+CREATOR_USERNAME = "FujiPTA" 
 
 @bot.message_handler(commands=['tip'])
 def handle_tip_command(message):
@@ -7227,113 +8328,6 @@ def remove_self_from_pending(message):
     else:
         bot.reply_to(message, "✅ You're not in the pending users list.")
 
-@bot.message_handler(commands=['notify'])
-def send_manual_reminders(message):
-    """Admin command to manually trigger payment reminders only to users at specific day thresholds"""
-    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
-        bot.reply_to(message, "❌ This command is only available to administrators.")
-        return
-        
-    bot.reply_to(message, "🔄 Processing targeted payment reminders for users at 7 days, 3 days, and expiring/expired... Please wait.")
-    
-    notified_users = 0
-    failed_users = 0
-    skipped_users = 0
-    notified_list = []
-    failed_list = []
-    
-    current_time = datetime.now()
-    
-    for user_id_str, data in PAYMENT_DATA.items():
-        try:
-            # Skip users without active payments
-            if not data.get('haspayed', False):
-                skipped_users += 1
-                continue
-                
-            # Skip cancelled memberships
-            if data.get('cancelled', False):
-                skipped_users += 1
-                continue
-                
-            user_id = int(user_id_str)
-            due_date = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
-            days_until_due = (due_date - current_time).days
-            username = safe_markdown_escape(data.get('username', None) or f"ID:{user_id}")
-            
-            # ONLY send reminders at specific thresholds: exactly 7 days, exactly 3 days, or 0/negative days
-            if days_until_due == 7:
-                reminder_message = (
-                    f"📝 *Payment Reminder*\n\n"
-                    f"Your membership will expire in *7 days* on {due_date.strftime('%Y-%m-%d')}.\n\n"
-                    f"Thank you for being a member of Prodigy Trading Academy! Please prepare to renew soon."
-                )
-            elif days_until_due == 3:
-                reminder_message = (
-                    f"⚠️ *Payment Reminder - Action Required Soon*\n\n"
-                    f"Your membership will expire in *3 days* on {due_date.strftime('%Y-%m-%d')}.\n\n"
-                    f"Please prepare to renew your membership to avoid losing access."
-                )
-            elif days_until_due <= 0:
-                reminder_message = (
-                    f"🚨 *URGENT: Payment Overdue*\n\n"
-                    f"Your membership has expired or will expire today.\n\n"
-                    f"Please renew immediately to maintain your access to Prodigy Trading Academy services."
-                )
-            else:
-                # Skip users who are not at the targeted day thresholds
-                skipped_users += 1
-                continue
-            
-            # Try to send the message
-            try:
-                bot.send_chat_action(user_id, 'typing')
-                bot.send_message(user_id, reminder_message, parse_mode="Markdown")
-                notified_users += 1
-                notified_list.append(f"@{username} ({days_until_due} days left)")
-                logging.info(f"Manual reminder sent to user {user_id} ({days_until_due} days remaining)")
-            except ApiException as e:
-                failed_users += 1
-                failed_list.append(f"@{username} ({days_until_due} days left)")
-                logging.error(f"Failed to send manual reminder to user {user_id}: {e}")
-                
-        except Exception as e:
-            logging.error(f"Error processing manual reminder for user {user_id_str}: {e}")
-            failed_users += 1
-    
-    # Send summary to admin
-    summary = (
-        f"📊 *Targeted Payment Reminder Summary*\n\n"
-        f"✅ Successfully notified: {notified_users} users\n"
-        f"❌ Failed to notify: {failed_users} users\n"
-        f"⏩ Skipped (inactive/cancelled/not at threshold): {skipped_users} users\n\n"
-    )
-    
-    # Add the lists of notified and failed users
-    if notified_list:
-        summary += "✅ *Notified Users:*\n"
-        for i, user in enumerate(notified_list, 1):
-            if i <= 20:  # Limit to 20 users to avoid message length issues
-                summary += f"  {i}. {user}\n"
-        if len(notified_list) > 20:
-            summary += f"  ...and {len(notified_list) - 20} more\n"
-        summary += "\n"
-    
-    if failed_list:
-        summary += "❌ *Failed Users:*\n"
-        for i, user in enumerate(failed_list, 1):
-            if i <= 20:  # Limit to 20 users to avoid message length issues
-                summary += f"  {i}. {user}\n"
-        if len(failed_list) > 20:
-            summary += f"  ...and {len(failed_list) - 20} more\n"
-    
-    # Send summary message
-    try:
-        bot.send_message(message.chat.id, summary, parse_mode="Markdown")
-    except ApiException:
-        # If markdown parsing fails, send without formatting
-        bot.send_message(message.chat.id, summary.replace('*', ''), parse_mode=None)
-
 # Function to handle payment proof and old member verification requests
 def send_pending_request_reminders():
     while True:
@@ -7358,7 +8352,7 @@ def send_pending_request_reminders():
                     time_elapsed = (current_time - request_time).total_seconds() / 60  # in minutes
                     
                     # Check if it's been more than 10 minutes and reminder not sent yet
-                    if time_elapsed > 10 and not data.get('reminder_sent', False):
+                    if time_elapsed > 15 and not data.get('reminder_sent', False):
                         # Send reminder to user
                         try:
                             bot.send_message(
@@ -7492,21 +8486,6 @@ TRADING_CHALLENGES = [
     {"type": "QUESTION", "content": "Review your latest loss and what you can learn"}
 ]
 
-TRADING_PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "NZD/USD", "USD/CAD", 
-    "EUR/GBP", "EUR/JPY", "EUR/CHF", "GBP/JPY", "GBP/CHF", "AUD/JPY", "NZD/JPY",
-    "USD/SGD", "EUR/AUD", "AUD/CAD", "CAD/JPY", "CHF/JPY", "AUD/NZD", "XAU/USD", "XAG/USD"
-]
-
-CHART_ANALYSIS_INSTRUCTIONS = """
-Look for:
-- Key support / resistance areas
-- Trends in the market
-- Current market sentiment (bullish, bearish, or stagnant?)
-- Possible buy areas
-- Possible sell areas
-Check in the 5m, 15m, and 1h timeframe. Send the screenshot of the 15M timeframe of your analysis.
-"""
 
 def generate_daily_challenge():
     """Generate a truly random daily challenge from the predefined lists."""
@@ -7524,9 +8503,6 @@ def generate_daily_challenge():
     # Select a random trading challenge
     trading = random.choice(TRADING_CHALLENGES)
     
-    # Select a random trading pair for chart analysis
-    pair = random.choice(TRADING_PAIRS)
-    
     # Format the message with enhanced styling
     message = f"📆 {today}\n"
     message += f"𝗗𝗔𝗜𝗟𝗬 𝗖𝗛𝗔𝗟𝗟𝗘𝗡𝗚𝗘𝗦\n\n"
@@ -7538,8 +8514,12 @@ def generate_daily_challenge():
     message += f"▫️ *{trading['type']}:* {trading['content']}\n\n"
     
     message += f"💻 *DAILY CHARTING* (20 POINTS)\n"
-    message += f"▫️ *Pair:* {pair}\n"
-    message += CHART_ANALYSIS_INSTRUCTIONS
+    message += f"Share a trade you took or analyzed with the following details:\n"
+    message += f"• Strategy used\n"
+    message += f"• Confluences that supported your analysis\n"
+    message += f"• Pair/instrument traded\n"
+    message += f"• Win-rate for this strategy (estimated)\n"
+    message += f"• Risk-to-reward ratio (R:R)\n\n"
     
     message += f"⭐ Complete all challenges for 40 TOTAL POINTS!\n"
     message += f"📸 Share your progress in the chat to earn points!"
@@ -7630,47 +8610,6 @@ def send_daily_challenges():
         except Exception as e:
             logging.error(f"Failed to send daily challenge or reminder: {e}")
             time.sleep(60)  # Wait a minute on error before trying again
-
-# Command to manually trigger a daily challenge (for testing or admin use)
-@bot.message_handler(commands=['challenge'])
-def manual_challenge(message):
-    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
-        bot.reply_to(message, "❌ This command is only available to administrators.")
-        return
-    
-    try:
-        challenge_message = generate_daily_challenge()
-        
-        # Send to the group chat if command is used in a group
-        if message.chat.type in ['group', 'supergroup']:
-            # Check if we should send to a specific topic
-            if DAILY_CHALLENGE_TOPIC_ID and message.chat.id == PAID_GROUP_ID:
-                bot.send_message(
-                    message.chat.id, 
-                    challenge_message,
-                    message_thread_id=DAILY_CHALLENGE_TOPIC_ID,
-                    parse_mode="Markdown"  # Add this parameter for formatting
-                )
-            else:
-                # Send to whatever chat or topic the command was used in
-                thread_id = message.message_thread_id if hasattr(message, 'message_thread_id') else None
-                bot.send_message(
-                    message.chat.id, 
-                    challenge_message,
-                    message_thread_id=thread_id,
-                    parse_mode="Markdown"  # Add this parameter for formatting
-                )
-        # Otherwise send to the admin who requested it
-        else:
-            bot.send_message(
-                message.chat.id, 
-                challenge_message,
-                parse_mode="Markdown"  # Add this parameter for formatting
-            )
-            
-        bot.reply_to(message, "✅ Challenge generated and sent successfully!")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error generating challenge: {e}")
 
 # Command to set the daily challenge topic ID
 @bot.message_handler(commands=['setchallengetopic'])
@@ -8562,86 +9501,6 @@ def send_daily_leaderboard():
             logging.error(f"Error sending leaderboard: {e}")
             time.sleep(60)  # Wait for a minute before trying again
 
-@bot.message_handler(commands=['leaderboard'])
-def manual_leaderboard(message):
-    """Command to manually generate and send leaderboards for testing"""
-    # Check if user is admin or creator
-    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
-        bot.reply_to(message, "❌ This command is only available to administrators.")
-        return
-    
-    args = message.text.split()
-    
-    try:
-        # Default to today's leaderboard
-        now = datetime.now(pytz.timezone('Asia/Manila'))
-        
-        if len(args) > 1 and args[1].lower() == "monthly":
-            # Generate monthly leaderboard
-            if len(args) > 2:
-                # Parse specified month
-                try:
-                    year_month = args[2]  # Format YYYY-MM
-                    leaderboard_text = generate_monthly_leaderboard_text(year_month)
-                except:
-                    bot.reply_to(message, "❌ Invalid month format. Use YYYY-MM (e.g., 2025-03)")
-                    return
-            else:
-                # Use current month
-                year_month = now.strftime('%Y-%m')
-                leaderboard_text = generate_monthly_leaderboard_text(year_month)
-                
-            board_type = "monthly"
-        else:
-            # Generate daily leaderboard
-            if len(args) > 1:
-                # Parse specified date
-                try:
-                    date = datetime.strptime(args[1], '%Y-%m-%d')
-                    date = date.replace(tzinfo=pytz.timezone('Asia/Manila'))
-                except:
-                    bot.reply_to(message, "❌ Invalid date format. Use YYYY-MM-DD")
-                    return
-            else:
-                # Use today's date
-                date = now
-                
-            leaderboard_text = generate_daily_leaderboard_text(date)
-            board_type = "daily"
-        
-        # Send the leaderboard
-        if message.chat.type in ['group', 'supergroup'] and message.chat.id == PAID_GROUP_ID:
-            # If in the group chat, respect topic configuration
-            if LEADERBOARD_TOPIC_ID:
-                bot.send_message(
-                    PAID_GROUP_ID,
-                    leaderboard_text,
-                    parse_mode="Markdown",
-                    message_thread_id=LEADERBOARD_TOPIC_ID
-                )
-            else:
-                # Send to current topic if in a topic, or main group
-                thread_id = message.message_thread_id if hasattr(message, 'message_thread_id') else None
-                bot.send_message(
-                    message.chat.id,
-                    leaderboard_text,
-                    parse_mode="Markdown",
-                    message_thread_id=thread_id
-                )
-        else:
-            # Send directly to the user
-            bot.send_message(
-                message.chat.id,
-                leaderboard_text,
-                parse_mode="Markdown"
-            )
-            
-        bot.reply_to(message, f"✅ {board_type.capitalize()} leaderboard generated successfully!")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error generating leaderboard: {str(e)}")
-        logging.error(f"Error in manual_leaderboard: {e}")
-
-
 # Command handler for /setconfessiontopic
 @bot.message_handler(commands=['setconfessiontopic'])
 def set_confession_topic(message):
@@ -9010,208 +9869,6 @@ def refresh_expired_members(message):
     
     save_payment_data()  # Save changes to database
     bot.reply_to(message, f"✅ Added admin_action_pending flag to {count} expired members.")
-
-@bot.message_handler(commands=['resend'])
-def resend_reminders(message):
-    """Force a cleanup and resend of payment reminders"""
-    # Check if user is admin or creator
-    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
-        bot.reply_to(message, "❌ This command is only available to administrators.")
-        return
-    
-    try:
-        # First inform that we're starting the process
-        bot.reply_to(message, "🔄 Forcing reminder cleanup and resend... Please wait.")
-        
-        # Perform midnight cleanup to delete all existing reminders
-        delete_all_reminders()
-        
-        # Track counts for notification results
-        upcoming_reminders = 0
-        expired_reminders = 0
-        failed_reminders = 0
-        
-        # Process all users for eligible reminders
-        current_time = datetime.now(pytz.timezone('Asia/Manila'))
-        
-        for user_id_str, data in PAYMENT_DATA.items():
-            try:
-                user_id = int(user_id_str)
-                
-                # Skip users who don't have active payments or have cancelled
-                if not data.get('haspayed', False) or data.get('cancelled', False):
-                    continue
-                
-                # Get user's due date
-                due_date_naive = datetime.strptime(data['due_date'], '%Y-%m-%d %H:%M:%S')
-                manila_tz = pytz.timezone('Asia/Manila')
-                due_date = manila_tz.localize(due_date_naive)
-                
-                # Calculate days until due
-                days_until_due = (due_date - current_time).days
-                
-                # Get display info
-                username = data.get('username', None)
-                if username:
-                    username = escape_markdown(username)
-                    user_display = f"@{username}"
-                else:
-                    user_display = f"User {user_id}"
-                
-                # Check if this user should get an upcoming payment reminder (3 days or less)
-                if 0 <= days_until_due <= 3:
-                    try:
-                        # Send reminder to user
-                        bot.send_chat_action(user_id, 'typing')
-                        user_msg = bot.send_message(
-                            user_id, 
-                            f"⏳ Reminder: Your next payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}."
-                        )
-                        
-                        # Send notification to admins
-                        admin_messages = {}
-                        for admin_id in ADMIN_IDS:
-                            admin_msg = bot.send_message(
-                                admin_id, 
-                                f"Admin Notice: {user_display} has an upcoming payment due in {days_until_due} days."
-                            )
-                            admin_messages[admin_id] = admin_msg.message_id
-                        
-                        # Store new message IDs
-                        reminder_messages[user_id] = {
-                            'user_msg_id': user_msg.message_id,
-                            'admin_msg_ids': admin_messages
-                        }
-                        # Save to MongoDB
-                        save_reminder_message(user_id, reminder_messages[user_id])
-                        
-                        upcoming_reminders += 1
-                        
-                    except ApiException:
-                        # Failed to send to user, still notify admins
-                        admin_messages = {}
-                        for admin_id in ADMIN_IDS:
-                            admin_msg = bot.send_message(
-                                admin_id, 
-                                f"⚠️ *Failed to send payment reminder*\n\n"
-                                f"Could not send payment reminder to {user_display}.\n"
-                                f"The user hasn't started a conversation with the bot or has blocked it.\n\n"
-                                f"Their payment is due in {days_until_due} days: {due_date.strftime('%Y/%m/%d')}\n\n"
-                                f"Please contact them manually.",
-                                parse_mode="Markdown"
-                            )
-                            admin_messages[admin_id] = admin_msg.message_id
-                        
-                        # Store only admin message IDs
-                        reminder_messages[user_id] = {
-                            'admin_msg_ids': admin_messages
-                        }
-                        # Save to MongoDB
-                        save_reminder_message(user_id, reminder_messages[user_id])
-                        
-                        failed_reminders += 1
-                
-                # Check if membership has expired
-                elif due_date < current_time and not data.get('grace_period', False):
-                    # Handle expired membership
-                    try:
-                        # Calculate days since expiration
-                        days_expired = (current_time - due_date).days
-                        
-                        # Update payment data
-                        PAYMENT_DATA[user_id_str]['haspayed'] = False
-                        PAYMENT_DATA[user_id_str]['admin_action_pending'] = True
-                        PAYMENT_DATA[user_id_str]['reminder_sent'] = False
-                        
-                        # Send notification to admins with action buttons based on expiration duration
-                        admin_messages = {}
-                        for admin_id in ADMIN_IDS:
-                            markup = InlineKeyboardMarkup()
-                            
-                            # If expired more than 3 days, only offer kick or keep (no grace period)
-                            if days_expired > 3:
-                                markup.add(
-                                    InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}"),
-                                    InlineKeyboardButton("✓ Keep Member", callback_data=f"keep_{user_id}")
-                                )
-                                
-                                admin_msg = bot.send_message(
-                                    admin_id, 
-                                    f"⚠️ *LONG-EXPIRED MEMBERSHIP*\n\n"
-                                    f"{user_display}'s membership has been expired for {days_expired} days.\n\n"
-                                    f"What would you like to do with this member?",
-                                    parse_mode="Markdown",
-                                    reply_markup=markup
-                                )
-                            else:
-                                # For recently expired members, offer grace period
-                                markup.add(
-                                    InlineKeyboardButton("⏳ Give 2 Days Grace", callback_data=f"grace_{user_id}"),
-                                    InlineKeyboardButton("❌ Kick Member", callback_data=f"kick_{user_id}")
-                                )
-                                
-                                admin_msg = bot.send_message(
-                                    admin_id, 
-                                    f"⚠️ *MEMBERSHIP EXPIRED*\n\n"
-                                    f"{user_display}'s membership has expired and has been marked as unpaid in the system.\n\n"
-                                    f"What would you like to do with this member?",
-                                    parse_mode="Markdown",
-                                    reply_markup=markup
-                                )
-                                
-                            admin_messages[admin_id] = admin_msg.message_id
-                            
-                        # Send expiry notice to user
-                        try:
-                            bot.send_chat_action(user_id, 'typing')
-                            user_msg = bot.send_message(
-                                user_id, 
-                                "❌ Your membership has expired. Please renew your membership to continue accessing our services."
-                            )
-                            
-                            # Store new message IDs
-                            reminder_messages[user_id] = {
-                                'user_msg_id': user_msg.message_id,
-                                'admin_msg_ids': admin_messages
-                            }
-                            # Save to MongoDB
-                            save_reminder_message(user_id, reminder_messages[user_id])
-                            
-                        except ApiException:
-                            # Failed to send to user, store only admin messages
-                            reminder_messages[user_id] = {
-                                'admin_msg_ids': admin_messages
-                            }
-                            # Save to MongoDB
-                            save_reminder_message(user_id, reminder_messages[user_id])
-                            
-                        expired_reminders += 1
-                        
-                    except Exception as e:
-                        logging.error(f"Error processing expired membership for user {user_id_str}: {e}")
-                        failed_reminders += 1
-                        
-            except Exception as e:
-                logging.error(f"Error processing user {user_id_str} in resend: {e}")
-                failed_reminders += 1
-        
-        # Save updated payment data
-        save_payment_data()
-        
-        # Send summary to admin
-        summary = (
-            f"✅ *Reminder Resend Complete*\n\n"
-            f"📊 *Results:*\n"
-            f"• Upcoming payment reminders: {upcoming_reminders}\n"
-            f"• Expired membership notifications: {expired_reminders}\n"
-            f"• Failed notifications: {failed_reminders}\n\n"
-            f"All previous reminder messages have been cleaned up."
-        )
-        bot.send_message(message.chat.id, summary, parse_mode="Markdown")
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error during resend operation: {str(e)}")
-        logging.error(f"Error in resend_reminders command: {e}")
 
 @bot.message_handler(commands=['discount'])
 def start_discount_setup(message):
@@ -13455,9 +14112,6 @@ def redeem_serial(message):
         if current_status.startswith('redeeming'):
             bot.reply_to(message, "⏳ You already have a redemption in progress. Please complete it or send /cancel to stop.")
             return
-        elif 'choosing' in current_status:
-            bot.reply_to(message, "⏳ You're in the middle of another process. Please finish that first or send /cancel to stop.")
-            return
     
     # Start the redemption process
     PENDING_USERS[user_id] = {
@@ -13470,7 +14124,7 @@ def redeem_serial(message):
         message,
         "🎁 *SERIAL NUMBER REDEMPTION*\n\n"
         "Please enter your serial number in the exact format it was provided (e.g., 629326d5-a191-cefb-e7e8-e18bcd774b1a).\n\n"
-        "Type /cancel to cancel the redemption process.",
+        "Type /cancelRedeem to cancel the redemption process.",
         parse_mode="Markdown"
     )
 
@@ -13481,7 +14135,7 @@ def handle_serial_input(message):
     serial_input = message.text.strip()  # Don't convert to uppercase here
     
     # Check if it's a cancel command
-    if serial_input.upper() == '/cancel_redeem':
+    if serial_input.strip() == '/cancelRedeem':
         PENDING_USERS.pop(user_id, None)
         delete_pending_user(user_id)
         bot.reply_to(message, "❌ Serial redemption cancelled.")
@@ -13492,7 +14146,7 @@ def handle_serial_input(message):
         bot.reply_to(
             message, 
             "❌ Invalid serial format. Please enter the serial exactly as provided (e.g., 629326d5-a191-cefb-e7e8-e18bcd774b1a).\n\n"
-            "Try again or send /cancel to stop."
+            "Try again or send /cancelRedeem to stop."
         )
         return
     
@@ -13509,7 +14163,7 @@ def handle_serial_input(message):
             message,
             "❌ *Invalid Serial Number*\n\n"
             "The serial number you entered is not recognized. Please check and try again, or contact an administrator for assistance.\n\n"
-            "Try again or send /cancel to stop.",
+            "Try again or send /cancelRedeem to stop.",
             parse_mode="Markdown"
         )
         return
@@ -13553,54 +14207,6 @@ def handle_serial_input(message):
         parse_mode="Markdown",
         reply_markup=markup
     )
-
-@bot.message_handler(commands=['debug_serial'])
-def debug_serial(message):
-    """Debug a specific serial number (admin only)"""
-    global SERIAL_NUMBERS  # Add this line to fix the error
-    
-    # Check if user is admin
-    if message.from_user.id not in ADMIN_IDS and message.from_user.id != CREATOR_ID:
-        bot.reply_to(message, "❌ This command is only available to administrators.")
-        return
-        
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "Usage: /debug_serial [serial]")
-        return
-        
-    serial = args[1]
-    
-    # Check if serial exists in SERIAL_NUMBERS dictionary
-    if serial in SERIAL_NUMBERS:
-        serial_data = SERIAL_NUMBERS[serial]
-        bot.reply_to(message, 
-            f"✅ Serial found in memory:\n\n"
-            f"Serial: `{serial}`\n"
-            f"Type: {serial_data.get('mentorship_type', 'unknown')}\n"
-            f"Plan: {serial_data.get('plan', 'unknown')}\n"
-            f"Used: {serial_data.get('used', False)}",
-            parse_mode="Markdown"
-        )
-    else:
-        # If not in memory, check directly in database
-        db_result = serial_numbers_collection.find_one({"serial": serial})
-        if db_result:
-            bot.reply_to(message,
-                f"⚠️ Serial found in database but NOT in memory:\n\n"
-                f"Serial: `{serial}`\n"
-                f"Data: {db_result}",
-                parse_mode="Markdown"
-            )
-            
-            # Refresh SERIAL_NUMBERS to fix the issue
-            SERIAL_NUMBERS = load_serial_numbers()
-            bot.reply_to(message, "♻️ SERIAL_NUMBERS dictionary has been refreshed from database.")
-        else:
-            bot.reply_to(message,
-                f"❌ Serial not found in memory or database: `{serial}`",
-                parse_mode="Markdown"
-            )
 
 @bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'confirming_redemption')
 def handle_redemption_confirmation(message):
@@ -13945,6 +14551,10 @@ def notify_discount_created(discount_name, reg_discount, sup_discount):
     reg_end_date = datetime.strptime(reg_discount['end_date'], '%Y-%m-%d %H:%M:%S')
     sup_end_date = datetime.strptime(sup_discount['end_date'], '%Y-%m-%d %H:%M:%S')
     
+    # Get user limits if available
+    reg_user_limit = reg_discount.get('user_limit')
+    sup_user_limit = sup_discount.get('user_limit')
+    
     # Safely escape discount name for markdown
     safe_discount_name = safe_markdown_escape(discount_name)
     
@@ -13954,11 +14564,25 @@ def notify_discount_created(discount_name, reg_discount, sup_discount):
         f"📢 **{safe_discount_name}**\n\n"
         f"*REGULAR MEMBERSHIP PLANS*\n"
         f"💰 **{reg_percentage}% OFF** on all regular membership plans!\n"
-        f"⏰ Valid until: {reg_end_date.strftime('%B %d, %Y')}\n\n"
-        f"*SUPREME MEMBERSHIP PLANS*\n"
+        f"⏰ Valid until: {reg_end_date.strftime('%B %d, %Y')}"
+    )
+    
+    # Add user limit info for regular plans if available
+    if reg_user_limit:
+        message_text += f"\n👥 Limited to first {reg_user_limit} users only!"
+    
+    message_text += (
+        f"\n\n*SUPREME MEMBERSHIP PLANS*\n"
         f"💰 **{sup_percentage}% OFF** on all supreme membership plans!\n"
-        f"⏰ Valid until: {sup_end_date.strftime('%B %d, %Y')}\n\n"
-        f"🔸 Regular plans include: Trial, Momentum & Legacy\n"
+        f"⏰ Valid until: {sup_end_date.strftime('%B %d, %Y')}"
+    )
+    
+    # Add user limit info for supreme plans if available
+    if sup_user_limit:
+        message_text += f"\n👥 Limited to first {sup_user_limit} users only!"
+    
+    message_text += (
+        f"\n\n🔸 Regular plans include: Trial, Momentum & Legacy\n"
         f"🔸 Supreme plans include: Apprentice, Disciple & Lifetime\n\n"
         f"Act fast! Use the /start command to take advantage of this limited-time offer!"
     )
@@ -14003,7 +14627,45 @@ def notify_discount_created(discount_name, reg_discount, sup_discount):
     
     logging.info(f"Discount '{discount_name}' created: Notified {success_count} subscribers ({fail_count} failed)")
 
+def check_and_reset_rate_limits():
+    """Background thread to periodically check and reset expired rate limits"""
+    logging.info("Rate limit checker thread started")
+    
+    while True:
+        try:
+            now = time.time()
+            users_reset = 0
+            
+            # Check each user's rate limit
+            for user_id, data in list(QWEN_USAGE.items()):
+                last_used = data.get('last_used', 0)
+                
+                # If more than an hour has passed since last use
+                if now - last_used >= 3600:
+                    # Reset count to 0
+                    QWEN_USAGE[user_id]['count'] = 0
+                    # Update in MongoDB too
+                    jarvis_usage_collection.update_one(
+                        {"user_id": user_id},
+                        {"$set": {"count": 0}},
+                        upsert=True
+                    )
+                    users_reset += 1
+            
+            if users_reset > 0:
+                logging.info(f"Reset rate limits for {users_reset} users")
+            
+            # Run this check every minute
+            time.sleep(60)
+            
+        except Exception as e:
+            logging.error(f"Error in rate limit checker: {e}")
+            time.sleep(60)  # Wait a minute before retrying on error
+
 keep_alive()
+
+# Start the rate limit checker thread
+threading.Thread(target=check_and_reset_rate_limits, daemon=True).start()
 
 # Start reminder thread
 reminder_thread = threading.Thread(target=send_payment_reminder)
@@ -14059,13 +14721,6 @@ def start_bot():
     while True:
         try:
             logging.info("Starting the bot...")
-            
-            # Ensure clean start with no active webhooks
-            try:
-                bot.delete_webhook()
-                logging.info("Webhook deleted successfully")
-            except Exception as webhook_error:
-                logging.warning(f"Error deleting webhook: {webhook_error}")
             
             # Add connection status tracking
             connection_time = datetime.now()
