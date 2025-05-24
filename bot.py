@@ -17242,6 +17242,28 @@ birthday_thread.start()
 threading.Thread(target=check_trial_reminders, daemon=True).start()
 
 # Function to start the bot with auto-restart
+@server.route('/telegram_webhook', methods=['POST'])
+def webhook():
+    try:
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    except Exception as e:
+        logging.error(f"Error in webhook handler: {e}", exc_info=True)
+        return '', 500
+
+# Add health check endpoint
+@server.route('/health', methods=['GET'])
+def health_check():
+    return 'Bot is running', 200
+
+# Add root endpoint
+@server.route('/', methods=['GET'])
+def index():
+    return 'PTA Bot is running', 200
+
+# Now modify your start_bot function to not define these routes again
 def start_bot():
     """Start the bot using webhooks instead of polling"""
     # Set up webhook
@@ -17260,28 +17282,6 @@ def start_bot():
         # Set up the new webhook
         bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_SECRET_PATH)
         logging.info("Webhook set successfully")
-        
-        # Set up Flask route to handle webhook updates
-        @server.route('/' + WEBHOOK_SECRET_PATH, methods=['POST'])
-        def webhook():
-            try:
-                json_string = request.get_data().decode('utf-8')
-                update = telebot.types.Update.de_json(json_string)
-                bot.process_new_updates([update])
-                return '', 200
-            except Exception as e:
-                logging.error(f"Error in webhook handler: {e}", exc_info=True)
-                return '', 500
-        
-        # Add a health check endpoint for monitoring
-        @server.route('/health', methods=['GET'])
-        def health_check():
-            return 'Bot is running', 200
-        
-        # Add a root endpoint
-        @server.route('/', methods=['GET'])
-        def index():
-            return 'PTA Bot is running', 200
         
         # Start the Flask server
         logging.info(f"Starting Flask server on port {PORT}")
