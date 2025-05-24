@@ -17294,6 +17294,27 @@ def start_bot():
         logging.info("Falling back to polling method")
         use_polling_fallback()
 
+def set_webhook():
+    """Set up the webhook without starting the server"""
+    WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://ptabot.up.railway.app/')
+    WEBHOOK_SECRET_PATH = os.environ.get('WEBHOOK_SECRET_PATH', 'telegram_webhook')
+    
+    # Log webhook setup
+    logging.info(f"Setting up webhook at {WEBHOOK_URL + WEBHOOK_SECRET_PATH}")
+    
+    try:
+        # Remove any existing webhook first
+        bot.remove_webhook()
+        time.sleep(1)  # Small delay to ensure webhook is removed
+        
+        # Set up the new webhook
+        bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_SECRET_PATH)
+        logging.info("Webhook set successfully")
+        return True
+    except Exception as e:
+        logging.critical(f"Critical error setting up webhook: {e}", exc_info=True)
+        return False
+
 def use_polling_fallback():
     """Fallback to polling if webhook fails"""
     consecutive_errors = 0
