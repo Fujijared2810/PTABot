@@ -17242,106 +17242,43 @@ birthday_thread.start()
 threading.Thread(target=check_trial_reminders, daemon=True).start()
 
 # Function to start the bot with auto-restart
-@server.route('/telegram_webhook', methods=['POST'])
-def webhook():
-    try:
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    except Exception as e:
-        logging.error(f"Error in webhook handler: {e}", exc_info=True)
-        return '', 500
-
-# Add health check endpoint
-@server.route('/health', methods=['GET'])
-def health_check():
-    return 'Bot is running', 200
-
-# Add root endpoint
-@server.route('/', methods=['GET'])
-def index():
-    return 'PTA Bot is running', 200
-
-# Now modify your start_bot function to not define these routes again
 def start_bot():
-    """Start the bot using webhooks instead of polling"""
-    # Set up webhook
-    WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://ptabot.up.railway.app/')
-    WEBHOOK_SECRET_PATH = os.environ.get('WEBHOOK_SECRET_PATH', 'telegram_webhook')
-    PORT = int(os.environ.get('PORT', 5001))
-    
-    # Log webhook setup
-    logging.info(f"Setting up webhook at {WEBHOOK_URL + WEBHOOK_SECRET_PATH}")
-    
-    try:
-        # Remove any existing webhook first
-        bot.remove_webhook()
-        time.sleep(1)  # Small delay to ensure webhook is removed
-        
-        # Set up the new webhook
-        bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_SECRET_PATH)
-        logging.info("Webhook set successfully")
-        
-        # Start the Flask server
-        logging.info(f"Starting Flask server on port {PORT}")
-        server.run(host='0.0.0.0', port=PORT)
-        
-    except Exception as e:
-        logging.critical(f"Critical error setting up webhook: {e}", exc_info=True)
-        
-        # If webhook setup fails, fall back to polling as a backup
-        logging.info("Falling back to polling method")
-        use_polling_fallback()
-
-def set_webhook():
-    """Set up the webhook without starting the server"""
-    WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://ptabot.up.railway.app/')
-    WEBHOOK_SECRET_PATH = os.environ.get('WEBHOOK_SECRET_PATH', 'telegram_webhook')
-    
-    # Log webhook setup
-    logging.info(f"Setting up webhook at {WEBHOOK_URL + WEBHOOK_SECRET_PATH}")
-    
-    try:
-        # Remove any existing webhook first
-        bot.remove_webhook()
-        time.sleep(1)  # Small delay to ensure webhook is removed
-        
-        # Set up the new webhook
-        bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_SECRET_PATH)
-        logging.info("Webhook set successfully")
-        return True
-    except Exception as e:
-        logging.critical(f"Critical error setting up webhook: {e}", exc_info=True)
-        return False
-
-def use_polling_fallback():
-    """Fallback to polling if webhook fails"""
+    """Start the bot with enhanced error handling and reconnection logic"""
     consecutive_errors = 0
     max_consecutive_errors = 5
     backoff_time = 5  # Initial backoff time in seconds
     max_backoff_time = 300  # Maximum backoff time (5 minutes)
     
-    logging.warning("Using polling as fallback method")
-    
     while True:
         try:
-            # Make sure webhook is removed before polling
-            bot.remove_webhook()
-            time.sleep(2)
+            logging.info("Starting the bot...")
+            # Add these lines to help prevent the 409 conflict error
+            bot.delete_webhook()  # Ensure no webhooks are active
+            time.sleep(10)  # Wait a moment to ensure previous connections are closed
             
-            logging.info("Starting polling mode...")
+            # Ensure clean start with no active webhooks
+            try:
+                bot.delete_webhook()
+                logging.info("Webhook deleted successfully")
+            except Exception as webhook_error:
+                logging.warning(f"Error deleting webhook: {webhook_error}")
+            
+            # Add connection status tracking
             connection_time = datetime.now()
             logging.info(f"Bot connecting at {connection_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
+            # Wait for any previous connections to close
+            time.sleep(10)
+            
             # Start polling with better parameters
-            bot.polling(none_stop=True, interval=1, timeout=60)
+            bot.polling()
+            logging.info("Bot is online")
             
             # Reset error counter on successful connection
             consecutive_errors = 0
             backoff_time = 5
             
-            logging.info("Bot is online and processing messages via polling")
+            logging.info("Bot is online and processing messages")
             
         except requests.exceptions.ReadTimeout:
             # Handle timeout separately - this is generally not critical
@@ -17376,6 +17313,8 @@ def use_polling_fallback():
                 time.sleep(wait_time)
         
         except Exception as e:
+            logging.error(f"Error occurred: {e}")
+            time.sleep(5)  # Wait for 5 seconds before restarting
             # General exception handling with exponential backoff
             consecutive_errors += 1
             wait_time = min(backoff_time * consecutive_errors, max_backoff_time)
