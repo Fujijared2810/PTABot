@@ -16,7 +16,6 @@ import pymongo
 from pymongo import MongoClient
 import random
 import secrets
-from datetime import datetime
 from keep_alive import keep_alive
 import calendar
 from collections import Counter
@@ -26,14 +25,19 @@ import io
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
+from flask import Flask, request
 import json
+import gunicorn
+
+# Create Flask app
+server = Flask(__name__)
 
 DISCOUNTS = {
     'regular': None,  # Discount for Regular membership
     'supreme': None   # Discount for Supreme membership
 }
 
-BOT_VERSION = "v5.1.10a"  # v[Major].[Minor].[Build][Status]
+BOT_VERSION = "v5.1.11b"  # v[Major].[Minor].[Build][Status]
 
 load_dotenv()
 
@@ -68,7 +72,6 @@ serial_numbers_collection = db["serial_numbers"]
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Rich context template for more accurate responses
 QWEN_PROMPT_TEMPLATE = """You are the AI assistant for Prodigy Trading Academy (PTA), a top-tier trading education platform.
 
 ### IDENTITY
@@ -85,18 +88,37 @@ QWEN_PROMPT_TEMPLATE = """You are the AI assistant for Prodigy Trading Academy (
 5. Encourage journaling, discipline, and long-term growth.
 
 ### MEMBERSHIP INFO
-- Regular Membership:
-  - Trial: $7.99/month
-  - Momentum: $20.99/3 months
-  - Legacy: $89.99/year
-- Supreme Membership:
+- Regular Membership (FREE through XM Partnership):
+  - Available at no cost when you register with our XM partner code: PTAPARTNER
+  - Users must maintain an active XM account with our partner code and show active trading
+  - Lifetime access with monthly verification to confirm the partnership remains active
+- Supreme Membership (Premium Paid Tier):
   - Apprentice: $309.99/3 months
   - Disciple: $524.99/6 months
   - Legacy: $899.99/lifetime
 - Payment options: PayPal, GCash, Bank Transfer, Exness Direct
 - Renewals allowed only within 3 days of expiration
 
-Always provide exact dates and numbers from user data — never say “check your dashboard.”
+### REGISTRATION FLOW
+1. Start with `/start` command to access the main menu
+2. Choose membership type (Regular free through XM or Supreme paid tier)
+3. For Regular membership:
+   - Register with XM using our partner code PTAPARTNER
+   - Submit verification screenshots showing the partner code
+   - Complete a 5-question onboarding form
+   - Receive your group invite
+4. For Supreme membership:
+   - Select your preferred plan duration
+   - Choose payment method
+   - Submit payment proof for verification
+   - Complete a 10-question onboarding form
+   - Receive certificates and group invite
+
+### CONTACT INFORMATION
+- Technical Support: @FujiPTA on Telegram
+- Admin Contact: @rom_pta on Telegram
+- Email for payments: romeomina061109@gmail.com (Romeo Mina)
+- Note: PTA does not have a dedicated business email or website yet
 
 ### FORMATTING RULES
 - Speak naturally like a friend chatting
@@ -110,6 +132,8 @@ Always provide exact dates and numbers from user data — never say “check you
 - Mention commands like `/dashboard`, `/verify`, and `/ai` where relevant
 - Be helpful, not verbose
 - Stay educational, never prescriptive
+
+Always provide exact dates and numbers from user data — never say "check your dashboard."
 
 You exist to help people become better traders — always stay focused on that goal."""
 
@@ -141,7 +165,7 @@ def get_exchange_rates():
 def signal_handler(sig, frame):
     logging.info("Stopping bot...")
     bot.stop_polling()  # Stop bot polling first
-    sys.exit(0)  # Exit program
+    os._exit(0)  # Use os._exit instead of sys.exit to force immediate termination
 
 # Attach signal handler for Ctrl+C
 signal.signal(signal.SIGINT, signal_handler)
@@ -1025,8 +1049,8 @@ def process_ai_query(chat_id, user_id, query_text):
     bot.send_chat_action(chat_id, "typing")
     
     try:
-        # Just pass the raw query text directly to call_qwen_api
-        response = call_qwen_api(query_text, user_id=user_id)
+        # Pass chat_id when calling call_qwen_api to support streaming
+        response = call_qwen_api(query_text, user_id=user_id, chat_id=chat_id)
         
         # Send the response - HANDLE MARKDOWN SAFELY
         try:
@@ -1040,7 +1064,7 @@ def process_ai_query(chat_id, user_id, query_text):
         logging.error(f"Error in AI query: {e}")
         bot.send_message(chat_id, "I'm sorry, I couldn't process that request right now. Please try again later.")
 
-def call_qwen_api(prompt, user_id=None):
+def call_qwen_api(prompt, user_id=None, chat_id=None):
     """Make an API call to the QWEN model with conversation memory"""
     if not QWEN_API_KEY:
         return "Sorry, AI chat is currently unavailable. Please contact an admin."
@@ -1049,6 +1073,27 @@ def call_qwen_api(prompt, user_id=None):
         # Initialize conversation history for this user if it doesn't exist
         if user_id not in QWEN_USAGE:
             QWEN_USAGE[user_id] = {'last_used': time.time(), 'count': 0, 'messages': []}
+        
+        # Check if user has hit rate limit (assuming max of 5 queries per hour)
+        if QWEN_USAGE[user_id]['count'] >= 5:
+            # User is rate limited - only start a thread if we haven't already scheduled one
+            if not QWEN_USAGE[user_id].get('reset_scheduled', False):
+                QWEN_USAGE[user_id]['reset_scheduled'] = True
+                # Start a thread that will reset this specific user's count after 1 hour
+                threading.Thread(
+                    target=reset_user_rate_limit,
+                    args=(user_id,),
+                    daemon=True
+                ).start()
+                logging.info(f"Rate limit hit for user {user_id}, scheduled reset in 1 hour")
+            
+            # Calculate time remaining until reset
+            last_used = QWEN_USAGE[user_id]['last_used']
+            time_remaining = 3600 - (time.time() - last_used)
+            minutes = int(time_remaining // 60)
+            seconds = int(time_remaining % 60)
+            
+            return f"⏱️ *AI Query Limit Reached*\n\nYou've used all 5 of your AI queries for this hour.\n\n⏰ Limit resets in: {minutes} min {seconds} sec\n🔄 Please try again after the cooldown period."
         
         # Add database context to system prompt if needed for specific queries
         system_prompt = QWEN_PROMPT_TEMPLATE
@@ -1114,18 +1159,16 @@ Please use this information to provide a personalized response, but don't explic
             }
         }
 
-        # 🔍 Logging before request
-        logging.info("Calling Qwen API...")
-        logging.info(f"Payload: {json.dumps(payload, indent=2)}")
-        
         response = requests.post(QWEN_API_URL, headers=headers, data=json.dumps(payload), timeout=30)
-
-        logging.info(f"Qwen API responded with status code: {response.status_code}")
         response.raise_for_status()
         
         response_json = response.json()
         # Fix: Using the correct path to get the response content
         ai_response = response_json['output']['choices'][0]['message']['content']
+        
+        # Update usage count and timestamp
+        QWEN_USAGE[user_id]['count'] += 1
+        QWEN_USAGE[user_id]['last_used'] = time.time()
         
         # Save the assistant's response to the conversation history
         QWEN_USAGE[user_id]['messages'].append({"role": "assistant", "content": ai_response})
@@ -1141,6 +1184,28 @@ Please use this information to provide a personalized response, but don't explic
     except Exception as e:
         logging.error(f"Unknown error in QWEN API call: {e}")
         raise Exception(f"Unknown error in QWEN API call: {e}")
+    
+def reset_user_rate_limit(user_id):
+    """Reset the rate limit for a specific user after waiting for 1 hour"""
+    try:
+        # Wait for 1 hour
+        time.sleep(3600)
+        
+        # Reset the user's count and the scheduled flag
+        if user_id in QWEN_USAGE:
+            QWEN_USAGE[user_id]['count'] = 0
+            QWEN_USAGE[user_id]['reset_scheduled'] = False
+            
+            # Update MongoDB too
+            jarvis_usage_collection.update_one(
+                {"user_id": user_id},
+                {"$set": {"count": 0}},
+                upsert=True
+            )
+            
+            logging.info(f"Reset rate limit for user {user_id}")
+    except Exception as e:
+        logging.error(f"Error in reset_user_rate_limit: {e}")
     
 def get_user_database_context(user_id):
     """Get relevant user data from database to provide context for AI responses"""
@@ -1385,7 +1450,7 @@ def send_welcome_message(chat_id):
                 caption=f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
                 "🎉 Welcome to Prodigy Trading Academy!\n\n"
                 "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀\n\n"
-                "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.",
+                "📢 *Note:* This bot is currently in *Beta*, so you may experience occasional updates or improvements.",
                 parse_mode="Markdown"
             )
     except FileNotFoundError:
@@ -1395,7 +1460,7 @@ def send_welcome_message(chat_id):
             f"🏫 *Prodigy Trading Academy Bot {BOT_VERSION}*\n\n"
             "🎉 Welcome to Prodigy Trading Academy!\n\n"
             "You're one step closer to leveling up your trading journey. We're excited to have you on board — let's make progress, not just promises. 🚀\n\n"
-            "📢 *Note:* This bot is currently in *Alpha*, so you may experience occasional updates or improvements.",
+            "📢 *Note:* This bot is currently in *Beta*, so you may experience occasional updates or improvements.",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -1505,30 +1570,60 @@ def show_main_menu(chat_id, user_id, message_id=None):
     
     # Check if the user is an existing member with active membership
     is_existing_member = False
-    if str(user_id) in PAYMENT_DATA and PAYMENT_DATA[str(user_id)].get('haspayed', False):
-        is_existing_member = True
+    needs_deposit = False
+    needs_forms = False
+    
+    if str(user_id) in PAYMENT_DATA:
+        is_existing_member = PAYMENT_DATA[str(user_id)].get('haspayed', False)
+        needs_deposit = PAYMENT_DATA[str(user_id)].get('needs_deposit', False)
+        needs_forms = PAYMENT_DATA[str(user_id)].get('forms_needed', False)
     
     # Create appropriate inline keyboard based on user status
     markup = InlineKeyboardMarkup(row_width=2)
     
     if is_existing_member:
-        # Options for existing members
-        markup.add(
-            InlineKeyboardButton("🔄 Renew Membership", callback_data="menu_renew"),
-            InlineKeyboardButton("❌ Cancel Membership", callback_data="menu_cancel")
-        )
-        markup.add(
-            InlineKeyboardButton("📊 My Dashboard", callback_data="menu_dashboard"),
-            InlineKeyboardButton("❓ FAQ", callback_data="menu_faq")
-        )
-        # Add AI Chat option
-        markup.add(
-            InlineKeyboardButton("🤖 AI Chat", callback_data="menu_aichat")
-        )
+        if needs_forms:
+            # Special case: User needs to complete registration forms
+            markup.add(
+                InlineKeyboardButton("📝 Finish Forms", callback_data="menu_finish_forms")
+            )
+            markup.add(
+                InlineKeyboardButton("❓ FAQ", callback_data="menu_faq")
+            )
+            # Add AI Chat option
+            markup.add(
+                InlineKeyboardButton("🤖 AI Chat", callback_data="menu_aichat")
+            )
+        elif needs_deposit:
+            # Options for existing members who need to deposit
+            markup.add(
+                InlineKeyboardButton("💰 Deposit Now", callback_data="menu_xm_deposit")
+            )
+            markup.add(
+                InlineKeyboardButton("❓ FAQ", callback_data="menu_faq")
+            )
+            # Add AI Chat option
+            markup.add(
+                InlineKeyboardButton("🤖 AI Chat", callback_data="menu_aichat")
+            )
+        else:
+            # Options for existing members
+            markup.add(
+                InlineKeyboardButton("⚙️ Manage Membership", callback_data="menu_manage"),
+                InlineKeyboardButton("❌ Cancel Membership", callback_data="menu_cancel")
+            )
+            markup.add(
+                InlineKeyboardButton("📊 My Dashboard", callback_data="menu_dashboard"),
+                InlineKeyboardButton("❓ FAQ", callback_data="menu_faq")
+            )
+            # Add AI Chat option
+            markup.add(
+                InlineKeyboardButton("🤖 AI Chat", callback_data="menu_aichat")
+            )
     else:
         # Options for new users
         markup.add(
-            InlineKeyboardButton("📅 Buy Membership", callback_data="menu_buy"),
+            InlineKeyboardButton("📅 Avail Membership", callback_data="menu_buy"),
             InlineKeyboardButton("🔑 Redeem Serial", callback_data="menu_redeem")
         )
         markup.add(
@@ -1588,21 +1683,2388 @@ def show_main_menu(chat_id, user_id, message_id=None):
     # Return the sent message object if we sent a new message
     return sent_message
 
+@bot.callback_query_handler(func=lambda call: call.data == "menu_manage")
+def handle_manage_membership(call):
+    """Handle user clicking on 'Manage Membership' button"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Opening membership management options...")
+    
+    # Create inline keyboard with membership management options
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🔄 Renew Current Plan", callback_data="menu_renew"),
+        InlineKeyboardButton("⬆️ Upgrade Membership", callback_data="menu_upgrade")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Edit the message to show management options
+    bot.edit_message_text(
+        "⚙️ *Membership Management*\n\n"
+        "Choose what you'd like to do with your membership:",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_upgrade")
+def handle_upgrade_membership(call):
+    """Handle user choosing to upgrade their membership"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    user_id_str = str(user_id)
+    
+    bot.answer_callback_query(call.id, "Loading upgrade options...")
+    
+    # Check if user has membership data
+    if user_id_str not in PAYMENT_DATA:
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        bot.edit_message_text(
+            "❌ You don't have an active membership to upgrade. Please purchase a membership first.",
+            chat_id,
+            message_id,
+            reply_markup=markup
+        )
+        return
+    
+    # Get current membership type
+    current_type = PAYMENT_DATA[user_id_str].get('mentorship_type', '').lower()
+    
+    # If already on Supreme, no upgrade available
+    if current_type == 'supreme':
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_manage"))
+        
+        bot.edit_message_text(
+            "ℹ️ You already have our premium Supreme Membership. There are no higher tiers available.",
+            chat_id,
+            message_id,
+            reply_markup=markup
+        )
+        return
+    
+    # For Regular members, offer upgrade to Supreme
+    # Mark as upgrade in pending users (similar logic to renewal)
+    PENDING_USERS[chat_id] = {
+        'status': 'choosing_mentorship_type',
+        'is_renewal': False,
+        'is_upgrade': True  # New flag to indicate this is an upgrade
+    }
+    save_pending_users()
+    
+    # Check enrollment status for Supreme membership
+    if not BOT_SETTINGS.get('supreme_enrollment_open', True):
+        # Create inline keyboard with Get Notified and FAQ buttons
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+            InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_manage"))
+        
+        bot.edit_message_text(
+            "⚠️ *Supreme Membership enrollment is currently CLOSED*\n\n"
+            "Supreme Membership upgrades are temporarily unavailable.\n"
+            "Please wait for the next announcement about when enrollment will open again.\n\n"
+            "• Click *Get Notified* to receive updates when enrollment opens\n"
+            "• Check our *FAQ* section for more information",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        return
+    
+    # Get supreme discount if applicable
+    applicable_discount = DISCOUNTS.get('supreme')
+    discount_active = applicable_discount and applicable_discount.get('active', False)
+    
+    # Check if discount applies to upgrades
+    if discount_active:
+        discount_transaction_type = applicable_discount.get('transaction_type', 'both')
+        
+        # For upgrades, we'll consider them as "new" transactions for the supreme tier
+        applies_to_transaction = (
+            discount_transaction_type == 'both' or 
+            discount_transaction_type == 'new'
+        )
+        
+        # Only consider discount active if it applies to upgrades
+        if not applies_to_transaction:
+            discount_active = False
+            
+    discount_percentage = applicable_discount.get('percentage', 0) if discount_active else 0
+    discount_name = applicable_discount.get('name', '') if discount_active else ''
+    
+    # Original prices
+    apprentice_price = 309.99
+    disciple_price = 524.99
+    legacy_price = 899.99
+    
+    # Create markup for plan selection
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    if discount_active:
+        # Calculate discounted prices
+        apprentice_discounted = round(apprentice_price * (1 - discount_percentage / 100), 2)
+        disciple_discounted = round(disciple_price * (1 - discount_percentage / 100), 2)
+        legacy_discounted = round(legacy_price * (1 - discount_percentage / 100), 2)
+        
+        # Add buttons with discounted prices
+        markup.add(
+            InlineKeyboardButton(f"Apprentice (${apprentice_discounted:.2f}) / 3 Months", callback_data="plan_apprentice"),
+            InlineKeyboardButton(f"Disciple (${disciple_discounted:.2f}) / 6 Months", callback_data="plan_disciple"),
+            InlineKeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
+        )
+        
+        # Add back button
+        markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="menu_manage"))
+        
+        # FIXED: Use edit_message_text instead of send_message
+        bot.edit_message_text(
+            f"⬆️ *Upgrade to Supreme Membership*\n\n"
+            f"Choose your Supreme plan:\n\n"
+            f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+            f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
+            f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
+            f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
+            chat_id,
+            message_id,
+            reply_markup=markup, 
+            parse_mode="HTML"
+        )
+    else:
+        # No discount - show regular prices without strikethrough
+        markup.add(
+            InlineKeyboardButton(f"Apprentice (${apprentice_price:.2f}) / 3 Months", callback_data="plan_apprentice"),
+            InlineKeyboardButton(f"Disciple (${disciple_price:.2f}) / 6 Months", callback_data="plan_disciple"),
+            InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
+        )
+        
+        # Add back button
+        markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="menu_manage"))
+        
+        # FIXED: Use edit_message_text instead of send_message
+        bot.edit_message_text(
+            f"⬆️ *Upgrade to Supreme Membership*\n\n"
+            f"Choose your Supreme plan:\n\n"
+            f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
+            f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
+            f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
+            chat_id,
+            message_id,
+            reply_markup=markup, 
+            parse_mode="HTML"
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_finish_forms")
+def handle_menu_finish_forms(call):
+    """Handle user clicking on 'Finish Forms' button"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Starting registration forms...")
+    
+    # Send registration form graphic if available
+    try:
+        with open('graphics/registration_form.jpeg', 'rb') as form_img:
+            bot.send_photo(
+                user_id,
+                form_img,
+                caption="Please complete the registration form to continue"
+            )
+    except FileNotFoundError:
+        logging.error("Registration form image not found at graphics/registration_form.jpeg")
+    except Exception as e:
+        logging.error(f"Error sending registration form image: {e}")
+    
+    # Add another small delay
+    time.sleep(1.5)
+    
+    # Get membership type from user data
+    membership_type = "regular"
+    if str(user_id) in PAYMENT_DATA:
+        membership_type = PAYMENT_DATA[str(user_id)].get('mentorship_type', 'regular').lower()
+    
+    # Prepare for onboarding form
+    PENDING_USERS[user_id] = {
+        'status': 'onboarding_form_regular_step1' if membership_type == 'regular' else 'onboarding_form_supreme_step1',
+        'form_answers': {},  # Initialize empty dict to store responses
+        'membership_type': membership_type,
+        'target_group_id': SUPREME_GROUP_ID if membership_type == 'supreme' else PAID_GROUP_ID
+    }
+    save_pending_users()
+    
+    # Start onboarding form process
+    send_onboarding_form(user_id)
+
+def check_form_completion_reminders():
+    """Check for users who need form completion reminders"""
+    logging.info("Checking for pending form completions")
+    
+    now = datetime.now()
+    
+    for user_id_str, data in PAYMENT_DATA.items():
+        if data.get('forms_needed', False) and data.get('trial_end_date'):
+            try:
+                # Parse trial end date
+                trial_end_date = datetime.strptime(data['trial_end_date'], '%Y-%m-%d %H:%M:%S')
+                
+                # Check if we're within 2 days of expiration and haven't sent reminder yet
+                days_remaining = (trial_end_date - now).days
+                if days_remaining <= 2 and not data.get('form_reminder_sent', False):
+                    # Time to send reminder
+                    user_id = int(user_id_str)
+                    
+                    # Send reminder message
+                    try:
+                        bot.send_message(
+                            user_id,
+                            f"📝 *Form Completion Reminder*\n\n"
+                            f"Your trial access expires in {days_remaining} days. To maintain your access, "
+                            f"please complete your registration forms by clicking the 'Finish Forms' button in the main menu.",
+                            parse_mode="Markdown"
+                        )
+                        
+                        # Mark reminder as sent
+                        PAYMENT_DATA[user_id_str]['form_reminder_sent'] = True
+                        save_payment_data()
+                        
+                        logging.info(f"Sent form completion reminder to user {user_id}")
+                    except Exception as e:
+                        logging.error(f"Failed to send form reminder to user {user_id}: {e}")
+                
+                # Check if trial has expired
+                elif now > trial_end_date and not data.get('form_expiry_notified', False):
+                    # Trial expired, notify admins
+                    user_id = int(user_id_str)
+                    
+                    # Get username for notification
+                    username = data.get('username', f"User {user_id}")
+                    username = safe_markdown_escape(username)
+                    
+                    # Notify admins
+                    markup = InlineKeyboardMarkup(row_width=2)
+                    markup.add(
+                        InlineKeyboardButton("❌ Kick User", callback_data=f"kick_form_{user_id}"),
+                        InlineKeyboardButton("⏳ Extend Trial", callback_data=f"extend_form_{user_id}")
+                    )
+                    
+                    for admin_id in ADMIN_IDS:
+                        bot.send_message(
+                            admin_id,
+                            f"⚠️ *FORM COMPLETION EXPIRED*\n\n"
+                            f"User: @{username}\n"
+                            f"ID: `{user_id}`\n\n"
+                            f"This user's 1-week trial period has expired without completing registration forms.\n"
+                            f"Please take action:",
+                            parse_mode="Markdown",
+                            reply_markup=markup
+                        )
+                    
+                    # Mark as notified
+                    PAYMENT_DATA[user_id_str]['form_expiry_notified'] = True
+                    save_payment_data()
+            except Exception as e:
+                logging.error(f"Error checking form completion for user {user_id_str}: {e}")
+    
+    # Schedule next check in 12 hours
+    threading.Timer(43200, check_form_completion_reminders).start()
+
+# Start the form completion checker
+threading.Timer(5, check_form_completion_reminders).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kick_form_"))
+def handle_kick_form_user(call):
+    """Handle admin kicking a user who didn't complete forms"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        username = "Unknown User"
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Try to notify user
+        try:
+            bot.send_message(
+                user_id,
+                "❌ *Membership Terminated*\n\n"
+                "Your trial membership has been terminated because you didn't complete your registration forms.\n\n"
+                "To rejoin, please start a new application with /start and make sure to complete the forms.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except Exception:
+            user_notified = False
+        
+        # Try to kick from group
+        try:
+            group_id = PAYMENT_DATA[user_id_str].get('target_group_id', PAID_GROUP_ID)
+            bot.ban_chat_member(group_id, user_id)
+            bot.unban_chat_member(group_id, user_id)  # Immediately unban so they can rejoin later
+            kick_successful = True
+        except Exception as e:
+            logging.error(f"Failed to kick user {user_id}: {e}")
+            kick_successful = False
+        
+        # Update payment data
+        if user_id_str in PAYMENT_DATA:
+            PAYMENT_DATA[user_id_str]['haspayed'] = False
+            PAYMENT_DATA[user_id_str]['forms_needed'] = False
+            PAYMENT_DATA[user_id_str]['kicked_for_no_forms'] = True
+            PAYMENT_DATA[user_id_str]['kicked_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[user_id_str]['kicked_by'] = admin_id
+            save_payment_data()
+        
+        # Update admin message
+        bot.edit_message_text(
+            f"{'✅' if kick_successful else '❌'} *ACTION TAKEN: USER KICKED*\n\n"
+            f"@{username} has {'been removed from' if kick_successful else 'FAILED to be removed from'} the group.\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.\n"
+            f"Action taken by admin @{re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', call.from_user.username or f'ID:{admin_id}')}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify all admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        
+        for other_admin_id in ADMIN_IDS:
+            if other_admin_id != admin_id:
+                bot.send_message(
+                    other_admin_id,
+                    f"📝 *Activity Log*\n\n"
+                    f"@{admin_username} kicked @{username} for not completing registration forms.",
+                    parse_mode="Markdown"
+                )
+        
+        bot.answer_callback_query(call.id, f"User {username or user_id} has been kicked")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        logging.error(f"Error kicking user who didn't complete forms: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("extend_form_"))
+def handle_extend_form_period(call):
+    """Handle admin extending a user's trial period for form completion"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        username = "Unknown User"
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Calculate new trial end date (7 more days)
+        new_trial_end_date = datetime.now() + timedelta(days=7)
+        
+        # Update payment data
+        if user_id_str in PAYMENT_DATA:
+            PAYMENT_DATA[user_id_str]['trial_end_date'] = new_trial_end_date.strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[user_id_str]['form_reminder_sent'] = False  # Reset so they get a new reminder
+            PAYMENT_DATA[user_id_str]['form_expiry_notified'] = False  # Reset expiry notification flag
+            save_payment_data()
+        
+        # Try to notify user
+        try:
+            bot.send_message(
+                user_id,
+                "⏳ *Trial Period Extended*\n\n"
+                "Good news! Your trial period for completing registration forms has been extended by 7 days.\n\n"
+                f"Your new deadline is: {new_trial_end_date.strftime('%Y-%m-%d')}\n\n"
+                "Please complete your registration forms by clicking the 'Finish Forms' button in the main menu.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except Exception:
+            user_notified = False
+        
+        # Update admin message
+        bot.edit_message_text(
+            f"✅ *ACTION TAKEN: TRIAL PERIOD EXTENDED*\n\n"
+            f"@{username}'s trial period has been extended by 7 days.\n"
+            f"New deadline: {new_trial_end_date.strftime('%Y-%m-%d')}\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.\n"
+            f"Action taken by admin @{re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', call.from_user.username or f'ID:{admin_id}')}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify all admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        
+        for other_admin_id in ADMIN_IDS:
+            if other_admin_id != admin_id:
+                bot.send_message(
+                    other_admin_id,
+                    f"📝 *Activity Log*\n\n"
+                    f"@{admin_username} extended @{username}'s trial period for form completion by 7 days.",
+                    parse_mode="Markdown"
+                )
+        
+        bot.answer_callback_query(call.id, f"Trial period extended for {username or user_id}")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        logging.error(f"Error extending trial period for form completion: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_xm_deposit")
+def handle_menu_xm_deposit(call):
+    """Handle user clicking on 'Deposit Now' button"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    user_id_str = str(user_id)
+    
+    # Check if they're in grace period
+    if user_id_str in PAYMENT_DATA and PAYMENT_DATA[user_id_str].get('xm_grace_period', False):
+        # Calculate days remaining in grace period
+        grace_end_date_str = PAYMENT_DATA[user_id_str].get('xm_grace_end_date')
+        days_remaining = 0
+        
+        if grace_end_date_str:
+            try:
+                grace_end_date = datetime.strptime(grace_end_date_str, '%Y-%m-%d %H:%M:%S')
+                now = datetime.now()
+                days_remaining = (grace_end_date - now).days
+            except Exception as e:
+                logging.error(f"Error calculating grace period days: {e}")
+        
+        # Create inline keyboard for deposit confirmation
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Yes, I've deposited", callback_data="xm_deposit_confirm"),
+            InlineKeyboardButton("❌ Not yet", callback_data="xm_deposit_not_yet")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        # Show deposit instructions
+        bot.edit_message_text(
+            "💰 *XM Deposit Instructions*\n\n"
+            f"You have {days_remaining if days_remaining > 0 else 'less than 1'} days remaining in your grace period.\n\n"
+            "To fully activate your membership, please deposit a minimum of $30 to your XM account.\n\n"
+            "*Option 1*\n"
+            "👆 In your XM Members' Area dashboard, click funding on the left panel of your screen\n"
+            "💳 Choose your desired payment method.\n"
+            "💵 Fund your account. Choose a trading account\n\n"
+            "*Option 2:*\n"
+            "👆 Click deposit from your account in accounts overview.\n"
+            "💳 Choose your desired payment method. XM has various payment methods for you to choose!\n"
+            "💵 Start funding your live trading account with a minimum of $30.\n\n"
+            "This is easy, but for more guidance, you may watch our YouTube tutorial down below.\n\n"
+            "Have you completed your deposit?",
+            chat_id, 
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+        bot.answer_callback_query(call.id, "Showing deposit instructions")
+    else:
+        # User is not in grace period - show error
+        bot.answer_callback_query(call.id, "You don't need to make a deposit right now.", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_deposit_confirm")
+def handle_xm_deposit_confirm(call):
+    """Handle user confirming they've made a deposit"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    user_id_str = str(user_id)
+    
+    # Create keyboard for proof submission
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Update message to request proof
+    bot.edit_message_text(
+        "📸 *XM Deposit Verification*\n\n"
+        "Great! Please send a screenshot showing your deposit in your XM account.\n\n"
+        "The screenshot should clearly show:\n"
+        "• Your XM account ID\n"
+        "• The deposit amount (minimum $30)\n"
+        "• The transaction date\n\n"
+        "Please upload your screenshot now.",
+        chat_id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Update status to await screenshot
+    PENDING_USERS[user_id] = {
+        'status': 'xm_awaiting_deposit_screenshot',
+        'xm_account_id': PAYMENT_DATA[user_id_str].get('xm_account_id', 'Unknown')
+    }
+    save_pending_users()
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_deposit_not_yet")
+def handle_xm_deposit_not_yet(call):
+    """Handle user indicating they haven't deposited yet"""
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+    user_id_str = str(user_id)
+    
+    # Get days remaining in grace period
+    grace_end_date_str = PAYMENT_DATA[user_id_str].get('xm_grace_end_date')
+    days_remaining = 0
+    
+    if grace_end_date_str:
+        try:
+            grace_end_date = datetime.strptime(grace_end_date_str, '%Y-%m-%d %H:%M:%S')
+            now = datetime.now()
+            days_remaining = (grace_end_date - now).days
+        except Exception as e:
+            logging.error(f"Error calculating grace period days: {e}")
+    
+    # Create back button
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Update message with reminder
+    bot.edit_message_text(
+        "⏳ *Deposit Reminder*\n\n"
+        f"You have {days_remaining if days_remaining > 0 else 'less than 1'} days remaining in your grace period.\n\n"
+        "Remember, you need to make a deposit of at least $30 to your XM account to maintain your membership.\n\n"
+        "You can use the 'Deposit Now' option in the main menu when you're ready to proceed.",
+        chat_id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    bot.answer_callback_query(call.id)
+
+# Handle screenshot submission for deposit verification
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'xm_awaiting_deposit_screenshot', content_types=['photo'])
+def handle_deposit_screenshot(message):
+    """Handle the deposit screenshot submission"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    user_id_str = str(user_id)
+    
+    # Store the screenshot message ID for reference
+    PENDING_USERS[user_id]['screenshot_message_id'] = message.message_id
+    
+    # Get account ID 
+    xm_account_id = PENDING_USERS[user_id].get('xm_account_id', 'Unknown')
+    
+    # Forward screenshot to admins for verification
+    for admin_id in ADMIN_IDS:
+        # Forward the screenshot
+        bot.forward_message(admin_id, chat_id, message.message_id)
+        
+        # Create verification buttons for admins
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Verify Deposit", callback_data=f"verify_deposit_{user_id}"),
+            InlineKeyboardButton("❌ Reject Deposit", callback_data=f"reject_deposit_{user_id}")
+        )
+        
+        # Get username for display
+        username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Send context message to admin
+        bot.send_message(
+            admin_id,
+            f"🔔 *XM Deposit Verification*\n\n"
+            f"User @{username} (ID: `{user_id}`) has submitted proof of their XM deposit.\n\n"
+            f"• Account ID: `{xm_account_id}`\n"
+            f"• Required: $30 minimum deposit\n\n"
+            f"Please verify that the deposit meets requirements.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    
+    # Update user status
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_deposit_verification'
+    save_pending_users()
+    
+    # Inform user that verification is in progress
+    bot.send_message(
+        chat_id,
+        "✅ *Verification Submitted*\n\n"
+        "Your deposit proof has been sent to our admin team for verification.\n"
+        "You'll be notified once your verification is approved or rejected.",
+        parse_mode="Markdown"
+    )
+
+# Add handlers for admin deposit verification
+@bot.callback_query_handler(func=lambda call: call.data.startswith("verify_deposit_"))
+def handle_verify_deposit(call):
+    """Handle admin verifying a user's deposit"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Check if user data exists
+        if user_id_str not in PAYMENT_DATA:
+            bot.answer_callback_query(call.id, "❌ User data not found.")
+            return
+        
+        # Get username for display
+        username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Update user data to remove grace period and deposit need
+        PAYMENT_DATA[user_id_str]['xm_grace_period'] = False
+        PAYMENT_DATA[user_id_str]['needs_deposit'] = False
+        PAYMENT_DATA[user_id_str]['deposit_verified'] = True
+        PAYMENT_DATA[user_id_str]['deposit_verified_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        PAYMENT_DATA[user_id_str]['deposit_verified_by'] = admin_id
+        save_payment_data()
+        
+        # Update message to admin
+        bot.edit_message_text(
+            f"✅ *XM Deposit VERIFIED*\n\n"
+            f"You have verified @{username}'s XM deposit.\n"
+            f"They have been notified and their account is now fully activated.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify user
+        try:
+            bot.send_message(
+                user_id,
+                "✅ *XM Deposit Verified!*\n\n"
+                "Your deposit has been verified and your membership is now fully activated.\n\n"
+                "Thank you for completing this important step. Enjoy your full access to Prodigy Trading Academy!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify user {user_id} about deposit verification: {e}")
+        
+        # Remove from pending users
+        if user_id in PENDING_USERS:
+            PENDING_USERS.pop(user_id)
+            delete_pending_user(user_id)
+        
+        # Notify all admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        
+        for other_admin_id in ADMIN_IDS:
+            if other_admin_id != admin_id:
+                bot.send_message(
+                    other_admin_id,
+                    f"📝 *Activity Log*\n\n"
+                    f"@{admin_username} verified @{username}'s XM deposit.",
+                    parse_mode="Markdown"
+                )
+        
+        bot.answer_callback_query(call.id, "✅ Deposit verified successfully!")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        logging.error(f"Error verifying deposit: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_deposit_"))
+def handle_reject_deposit(call):
+    """Handle admin rejecting a user's deposit proof"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        username = "Unknown User"
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Update message to admin
+        bot.edit_message_text(
+            f"❌ *XM Deposit REJECTED*\n\n"
+            f"You have rejected @{username}'s XM deposit proof.\n"
+            f"They have been notified to provide a clearer proof.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify user
+        try:
+            bot.send_message(
+                user_id,
+                "❌ *XM Deposit Verification Failed*\n\n"
+                "We couldn't verify your XM deposit from the screenshot provided.\n\n"
+                "Possible issues:\n"
+                "• The deposit amount was not visible or below $30\n"
+                "• The account ID was not clearly shown\n"
+                "• The image quality was too low\n\n"
+                "Please try again with a clearer screenshot by selecting 'Deposit Now' from the main menu.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Failed to notify user {user_id} about deposit rejection: {e}")
+        
+        # Reset pending status to allow them to try again
+        if user_id in PENDING_USERS:
+            PENDING_USERS[user_id]['status'] = 'at_main_menu'
+            save_pending_users()
+        
+        # Notify all admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        
+        for other_admin_id in ADMIN_IDS:
+            if other_admin_id != admin_id:
+                bot.send_message(
+                    other_admin_id,
+                    f"📝 *Activity Log*\n\n"
+                    f"@{admin_username} rejected @{username}'s XM deposit proof.",
+                    parse_mode="Markdown"
+                )
+        
+        bot.answer_callback_query(call.id, "❌ Deposit proof rejected")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        logging.error(f"Error rejecting deposit: {e}")
+
+def check_grace_periods():
+    """Check for users with expired grace periods and notify admins"""
+    logging.info("Checking for expired grace periods")
+    
+    now = datetime.now()
+    
+    for user_id_str, data in PAYMENT_DATA.items():
+        if data.get('xm_grace_period', False) and data.get('xm_grace_end_date'):
+            try:
+                # Parse grace end date
+                grace_end_date = datetime.strptime(data['xm_grace_end_date'], '%Y-%m-%d %H:%M:%S')
+                
+                # Check if grace period has expired
+                if now > grace_end_date:
+                    # Grace period expired - notify admins
+                    username = data.get('username', "No Username")
+                    username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+                    user_id = int(user_id_str)
+                    
+                    # Create action buttons for admins
+                    markup = InlineKeyboardMarkup(row_width=2)
+                    markup.add(
+                        InlineKeyboardButton("❌ Kick User", callback_data=f"kick_grace_{user_id}"),
+                        InlineKeyboardButton("⏳ Extend Grace", callback_data=f"extend_grace_{user_id}")
+                    )
+                    
+                    # Notify all admins
+                    for admin_id in ADMIN_IDS:
+                        bot.send_message(
+                            admin_id,
+                            f"⚠️ *GRACE PERIOD EXPIRED*\n\n"
+                            f"User: @{username}\n"
+                            f"ID: `{user_id}`\n\n"
+                            f"This user's 14-day grace period for XM deposit has expired.\n"
+                            f"Please take action:",
+                            parse_mode="Markdown",
+                            reply_markup=markup
+                        )
+                    
+                    # Mark as notified to avoid duplicate notifications
+                    PAYMENT_DATA[user_id_str]['grace_period_expired_notified'] = True
+                    save_payment_data()
+                    
+            except Exception as e:
+                logging.error(f"Error checking grace period for user {user_id_str}: {e}")
+    
+    # Schedule next check in 12 hours
+    threading.Timer(43200, check_grace_periods).start()
+
+# Start the grace period checker
+threading.Timer(5, check_grace_periods).start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("kick_grace_"))
+def handle_kick_grace_user(call):
+    """Handle admin kicking a user with expired grace period"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        username = "Unknown User"
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Try to notify user
+        try:
+            bot.send_message(
+                user_id,
+                "❌ *Membership Terminated*\n\n"
+                "Your membership has been terminated because your grace period has expired without a deposit.\n\n"
+                "To rejoin, please start a new application with /start and make sure to complete the deposit.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except Exception:
+            user_notified = False
+        
+        # Try to kick from group
+        try:
+            group_id = PAID_GROUP_ID  # Regular membership group
+            bot.ban_chat_member(group_id, user_id)
+            bot.unban_chat_member(group_id, user_id)  # Immediately unban so they can rejoin later
+            kick_successful = True
+        except Exception as e:
+            logging.error(f"Failed to kick user {user_id}: {e}")
+            kick_successful = False
+        
+        # Update payment data
+        if user_id_str in PAYMENT_DATA:
+            PAYMENT_DATA[user_id_str]['haspayed'] = False
+            PAYMENT_DATA[user_id_str]['xm_grace_period'] = False
+            PAYMENT_DATA[user_id_str]['kicked_for_no_deposit'] = True
+            PAYMENT_DATA[user_id_str]['kicked_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[user_id_str]['kicked_by'] = admin_id
+            save_payment_data()
+        
+        # Update admin message
+        bot.edit_message_text(
+            f"{'✅' if kick_successful else '❌'} *ACTION TAKEN: USER KICKED*\n\n"
+            f"@{username} has {'been removed from' if kick_successful else 'FAILED to be removed from'} the group.\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.\n"
+            f"Action taken by admin @{re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', call.from_user.username or f'ID:{admin_id}')}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify all admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        
+        for other_admin_id in ADMIN_IDS:
+            if other_admin_id != admin_id:
+                bot.send_message(
+                    other_admin_id,
+                    f"📝 *Activity Log*\n\n"
+                    f"@{admin_username} kicked @{username} for expired grace period without deposit.",
+                    parse_mode="Markdown"
+                )
+        
+        bot.answer_callback_query(call.id, f"User {username or user_id} has been kicked")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        logging.error(f"Error kicking grace period user: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("extend_grace_"))
+def handle_extend_grace_period(call):
+    """Handle admin extending a user's grace period"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get username for display
+        username = "Unknown User"
+        if user_id_str in PAYMENT_DATA:
+            username = PAYMENT_DATA[user_id_str].get('username', "No Username")
+        username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Calculate new grace period end date (7 more days)
+        new_grace_end_date = datetime.now() + timedelta(days=7)
+        
+        # Update payment data
+        if user_id_str in PAYMENT_DATA:
+            PAYMENT_DATA[user_id_str]['xm_grace_period'] = True
+            PAYMENT_DATA[user_id_str]['xm_grace_end_date'] = new_grace_end_date.strftime('%Y-%m-%d %H:%M:%S')
+            PAYMENT_DATA[user_id_str]['grace_period_extended'] = True
+            PAYMENT_DATA[user_id_str]['grace_period_extended_by'] = admin_id
+            PAYMENT_DATA[user_id_str]['grace_period_extended_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            save_payment_data()
+        
+        # Try to notify user
+        try:
+            bot.send_message(
+                user_id,
+                "⏳ *Grace Period Extended*\n\n"
+                "Good news! Your grace period for XM deposit has been extended by 7 days.\n\n"
+                f"Your new deadline to deposit is: {new_grace_end_date.strftime('%Y-%m-%d')}\n\n"
+                "Please make your deposit of at least $30 using the 'Deposit Now' option in the main menu.",
+                parse_mode="Markdown"
+            )
+            user_notified = True
+        except Exception:
+            user_notified = False
+        
+        # Update admin message
+        bot.edit_message_text(
+            f"✅ *ACTION TAKEN: GRACE PERIOD EXTENDED*\n\n"
+            f"@{username}'s grace period has been extended by 7 days.\n"
+            f"New deadline: {new_grace_end_date.strftime('%Y-%m-%d')}\n"
+            f"User notification {'sent' if user_notified else 'FAILED'}.\n"
+            f"Action taken by admin @{re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', call.from_user.username or f'ID:{admin_id}')}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        # Notify all admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        admin_username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', admin_username)
+        
+        for other_admin_id in ADMIN_IDS:
+            if other_admin_id != admin_id:
+                bot.send_message(
+                    other_admin_id,
+                    f"📝 *Activity Log*\n\n"
+                    f"@{admin_username} extended @{username}'s grace period by 7 days.",
+                    parse_mode="Markdown"
+                )
+        
+        bot.answer_callback_query(call.id, f"Grace period extended for {username or user_id}")
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        logging.error(f"Error extending grace period: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "menu_xm_free")
+def handle_xm_free_mentorship(call):
+    """Handle the XM Free mentorship option"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # CHECK ENROLLMENT STATUS FIRST - This is the fix
+    if not BOT_SETTINGS.get('regular_enrollment_open', True):
+        # Create inline keyboard with Get Notified and FAQ buttons
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
+            InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
+        )
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        bot.edit_message_text(
+            "⚠️ *XM Partnership enrollment is currently CLOSED*\n\n"
+            "New XM Partnership registrations are temporarily unavailable.\n"
+            "Please wait for the next announcement about when enrollment will open again.\n\n"
+            "• Click *Get Notified* to receive updates when enrollment opens\n"
+            "• Check our *FAQ* section for more information",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        bot.answer_callback_query(call.id, "XM Partnership enrollment is currently closed")
+        return
+    
+    # If enrollment is open, continue with normal process
+    # Answer callback for feedback to user
+    bot.answer_callback_query(call.id, "Starting XM Free Mentorship process...")
+    
+    # Update user status
+    PENDING_USERS[user_id] = {'status': 'xm_free_mentorship'}
+    save_pending_users()
+    
+    # Rest of the existing code...
+    # Create inline keyboard for Yes/No response
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("Yes", callback_data="xm_existing_yes"),
+        InlineKeyboardButton("No", callback_data="xm_existing_no")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Edit the existing message to ask about XM account with more comprehensive information
+    bot.edit_message_text(
+        "📚 *Regular Mentorship (FREE)*\n\n"
+        "Start your trading journey with Prodigy Trading Academy's foundational program — the Regular Mentorship, completely free of charge and packed with all the essential resources to help you grow.\n\n"
+        "As we are partnered with the No.1 broker in the Philippines, XM has helped give you the opportunity to join our mentorship for free.\n\n"
+        "Everyone in our academy would need to register, create an XM account, and engage in active trading with us through our connection with XM in order to join us.\n\n"
+        "Do you already have an XM account before we continue?",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_existing_yes")
+def handle_xm_existing_yes(call):
+    """Handle user confirming they have an existing XM account"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status
+    PENDING_USERS[user_id]['status'] = 'xm_add_partner_code'
+    save_pending_users()
+    
+    # Create inline keyboard for compliance response
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("Yes, I Agree", callback_data="xm_comply_yes"),
+        InlineKeyboardButton("No", callback_data="xm_comply_no")
+    )
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="menu_xm_free"))
+    
+    # Edit the message to show partner code instructions with updated text
+    bot.edit_message_text(
+        "📸 *Regular Mentorship: XM Partnership - Account Verification*\n\n"
+        "Please provide the following:\n\n"
+        "📱 A screenshot showing that you've entered the partner code PTAPARTNER during registration\n"
+        "🪪 Your XM Members' Area dashboard\n\n"
+        "Please upload your screenshot now, and include your account ID in a follow-up message.\n\n"
+        "‼️ In case you forgot to screenshot everything, you'll have to try over again and register with a new e-mail. "
+        "This only likely will happen if instructions aren't clear, so make sure to watch the video tutorial if you didn't!",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_existing_no")
+def handle_xm_existing_no(call):
+    """Handle user indicating they don't have an XM account"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status
+    PENDING_USERS[user_id] = {
+        'status': 'xm_new_account_instructions',
+    }
+    save_pending_users()
+    
+    # Create buttons for the video tutorial
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("📺 Watch Registration Tutorial", url="https://youtu.be/6PNg7OrltTY?si=QCta4xODaTXuSiDb"),
+        InlineKeyboardButton("⬅️ Back", callback_data="menu_xm_free")
+    )
+    
+    # Edit message to show instructions for new accounts with updated text
+    bot.edit_message_text(
+        "📝 *Regular Mentorship: XM Partnership - New Account Registration*\n\n"
+        "To qualify for free mentorship, please follow these steps to create an XM account with our partnership code:\n\n"
+        "🔗 *Step 1: Register for an XM Account*\n"
+        "Sign up using our official link: https://affs.click/WLw2n\n\n"
+        "🧾 *Step 2: Input Our Partner Code*\n"
+        "During registration, enter this partner code: *PTAPARTNER*\n"
+        "✅ Take a screenshot of this step showing the partner code clearly before you click continue.\n\n"
+        "🛡 *Step 3: Verify Your Account*\n"
+        "After successfully doing Step 2, you will be redirected to the dashboard and verify your identity and residence.\n"
+        "✅ Take a screenshot of your Members' Area dashboard.\n\n"
+        "💳 *Step 4: Make Your Initial Deposit*\n"
+        "You'll need to fund your account a minimum of $30 to complete eligibility. In case you aren't able to deposit right away, we'll give you a 1-week grace period!\n\n"
+        "📸 *Important:*\n"
+        "We'll ask for verification later, so save the following now:\n\n"
+        "- Screenshot showing PTAPARTNER entered during registration\n"
+        "- Your XM Trading Account ID\n\n"
+        "📌 Finishing the registration is better if you watch the registration tutorial to get a smooth and convenient processing! Please watch the tutorial video below.\n\n"
+        "‼️ After this message, you will be given a continue button in order to proceed shortly.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Wait 10 seconds to ensure they have time to view the instructions
+    time.sleep(10)
+    
+    # Follow up with verification prompt
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Yes, continue", callback_data="xm_verify_proceed"),
+        InlineKeyboardButton("❌ No, cancel", callback_data="xm_verify_cancel")
+    )
+    
+    bot.send_message(
+        chat_id,
+        "⚠️ *Important*\n\n"
+        "Did you watch the tutorial video? Do you wish to proceed with verification?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_verify_proceed")
+def handle_xm_verify_proceed(call):
+    """Handle user proceeding with XM verification"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_account_screenshot'
+    save_pending_users()
+    
+    # Create back button
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="xm_existing_no"))
+    
+    # Edit message to request screenshot with new improved text
+    bot.edit_message_text(
+        "📸 *XM Account Verification*\n\n"
+        "You're almost done with registering! Now we'll start verifying your account registration in the academy in order to confirm if you really registered through our XM broker.\n\n"
+        "To proceed, please be informed to prepare the following:\n\n"
+        "1️⃣ A screenshot showing that you've entered the partner code PTAPARTNER during registration\n"
+        "2️⃣ Your XM Trading Account ID\n\n"
+        "Let's first start with the screenshot showing your proof of registration and integrating our partnership code.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'xm_awaiting_account_screenshot', content_types=['photo'])
+def handle_xm_registration_screenshot(message):
+    """Handle the first screenshot (registration screenshot)"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Store screenshot details
+    PENDING_USERS[user_id]['screenshot_message_id'] = message.message_id
+    PENDING_USERS[user_id]['registration_screenshot'] = message.photo[-1].file_id
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_dashboard_screenshot'
+    save_pending_users()
+    
+    # Ask for XM Dashboard screenshot instead of account ID
+    bot.send_message(
+        chat_id,
+        "✅ Thanks for the registration screenshot!\n\n"
+        "📊 *Now please provide a screenshot of your XM Dashboard*\n\n"
+        "This should show your account ID and other account details for verification.",
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_verify_cancel")
+def handle_xm_verify_cancel(call):
+    """Handle user cancelling the XM verification process"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Cancelling XM verification process...")
+    
+    # Clear user's pending status
+    if user_id in PENDING_USERS:
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+    
+    # Create markup for return to main menu
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Edit the message to show cancellation
+    bot.edit_message_text(
+        "❌ *Verification Cancelled*\n\n"
+        "You've cancelled the XM verification process. You can restart it anytime from the main menu.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'xm_awaiting_dashboard_screenshot', content_types=['photo'])
+def handle_xm_dashboard_screenshot(message):
+    """Handle the second screenshot (dashboard screenshot)"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Store dashboard screenshot details
+    PENDING_USERS[user_id]['dashboard_screenshot'] = message.photo[-1].file_id
+    PENDING_USERS[user_id]['dashboard_message_id'] = message.message_id
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_deposit_confirmation'
+    save_pending_users()
+    
+    # Create inline keyboard for deposit confirmation
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Yes", callback_data="xm_deposit_yes"),
+        InlineKeyboardButton("❌ No, deposit later", callback_data="xm_deposit_no")
+    )
+    
+    # Ask for deposit confirmation
+    bot.send_message(
+        chat_id,
+        "💰 *Deposit Confirmation*\n\n"
+        "Thank you for providing your verification screenshots.\n\n"
+        "An initial deposit is required to activate your XM account.\n\n"
+        "Are you willing to make a deposit to your XM account?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_deposit_yes")
+def handle_xm_deposit_yes(call):
+    """Handle user confirming willingness to deposit"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_compliance'
+    save_pending_users()
+    
+    # Create inline keyboard for compliance confirmation
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Yes, I comply", callback_data="xm_compliance_yes"),
+        InlineKeyboardButton("❌ No", callback_data="xm_compliance_no")
+    )
+    
+    # Edit message to show deposit instructions
+    bot.edit_message_text(
+        "✅ *Regular Mentorship: XM Partnership - Deposit Notice*\n\n"
+        "That's great to hear! Depositing in your XM account is as easy as 1-2-3, just read and do the following steps below!\n\n"
+        "Just choose whether method or procedure is much more convenient for you. Either way works.\n\n"
+        "*Option 1*\n"
+        "👆 In your XM Members' Area dashboard, click funding on the left panel of your screen\n"
+        "💳 Choose your desired payment method.\n"
+        "💵 Fund your account. Choose a trading account\n\n"
+        "*Option 2:*\n"
+        "👆 Click deposit from your account in accounts overview.\n"
+        "💳 Choose your desired payment method. XM has various payment methods for you to choose!\n"
+        "💵 Start funding your live trading account with a minimum of $30.\n\n"
+        "This is easy, but for more guidance, you may watch our Youtube tutorial down below.\n\n"
+        "📸 After this message, we will need you to verify your deposit. The following screenshot is what we need:\n"
+        "- XM Members' Area dashboard\n\n"
+        "Do you agree to comply with the following instructions?\n\n"
+        "1️⃣ Maintain the partner code PTAPARTNER in your XM account\n"
+        "2️⃣ Complete regular trading activity in your account\n"
+        "3️⃣ Submit monthly verification of your active partnership status",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_deposit_no")
+def handle_xm_deposit_no(call):
+    """Handle user choosing to deposit later"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Calculate grace period end date (2 weeks from now)
+    grace_end_date = datetime.now() + timedelta(days=14)
+    
+    # Update user status to proceed to compliance agreement
+    # Instead of terminating, we continue the process with grace period
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_compliance'
+    PENDING_USERS[user_id]['grace_period'] = True
+    PENDING_USERS[user_id]['grace_end_date'] = grace_end_date.strftime('%Y-%m-%d %H:%M:%S')
+    save_pending_users()
+    
+    # Create inline keyboard for compliance confirmation
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Yes, I comply", callback_data="xm_compliance_yes"),
+        InlineKeyboardButton("❌ No", callback_data="xm_compliance_no")
+    )
+    
+    # Edit message to show compliance instructions with new message text
+    bot.edit_message_text(
+        "💡 *Regular Mentorship: XM Partnership - Deposit Notice*\n\n"
+        "To fully activate your mentorship access, a minimum deposit of $30 is required in your XM account.\n\n"
+        "We understand that not everyone may be able to deposit immediately — that's totally okay! 😊\n"
+        "You'll automatically receive a 2-week grace period from the moment your account is verified.\n\n"
+        "During this time, you can still explore our resources and settle your deposit when you're ready. After the 14 days, we will ask you about your deposit.\n\n"
+        "Do you agree to comply with the following instructions?\n\n"
+        "1️⃣ Maintain the partner code PTAPARTNER in your XM account\n"
+        "2️⃣ Complete regular trading activity in your account\n"
+        "3️⃣ Submit monthly verification of your active partnership status",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_compliance_yes")
+def handle_xm_compliance_yes(call):
+    """Handle user agreeing to comply with instructions"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status
+    PENDING_USERS[user_id]['status'] = 'xm_waiting_approval'
+    save_pending_users()
+    
+    # Get metadata
+    xm_account_id = PENDING_USERS[user_id].get('xm_account_id', 'Unknown')
+    username = call.from_user.username or "No Username"
+    
+    # Properly escape username for Markdown - this fixes the issue
+    if username != "No Username":
+        username = safe_markdown_escape(username)
+    
+    # Get both screenshots for forwarding
+    registration_screenshot_id = PENDING_USERS[user_id].get('registration_screenshot')
+    dashboard_screenshot_id = PENDING_USERS[user_id].get('dashboard_screenshot')
+    
+    # Forward both screenshots and details to admins for verification
+    for admin_id in ADMIN_IDS:
+        # Send an intro message first
+        intro_message = (
+            f"🔔 *XM Verification Request*\n\n"
+            f"User @{username} (ID: `{user_id}`) has submitted verification for XM Partnership.\n\n"
+            f"• Partner Code: PTAPARTNER\n"
+            f"• Account ID: `{xm_account_id}`\n\n"
+            f"Please review the following screenshots:"
+        )
+        
+        bot.send_message(
+            admin_id,
+            intro_message,
+            parse_mode="Markdown"
+        )
+        
+        # Forward registration screenshot if available
+        if registration_screenshot_id:
+            bot.send_photo(
+                admin_id,
+                registration_screenshot_id,
+                caption="📸 1/2: Registration screenshot showing PTAPARTNER code"
+            )
+        
+        # Forward dashboard screenshot if available
+        if dashboard_screenshot_id:
+            bot.send_photo(
+                admin_id,
+                dashboard_screenshot_id,
+                caption="📊 2/2: XM Dashboard screenshot showing account details"
+            )
+            
+        # Create approval buttons for admins
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Approve XM", callback_data=f"approve_xm_{user_id}"),
+            InlineKeyboardButton("❌ Reject XM", callback_data=f"reject_xm_{user_id}")
+        )
+        
+        # Send verification action buttons
+        bot.send_message(
+            admin_id,
+            f"⬆️ Please verify the screenshots above for user @{username}\n"
+            f"Both screenshots should clearly show valid XM account with partner code.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+    
+    # Edit the message to inform user their submission is pending approval
+    bot.edit_message_text(
+        "✅ *Verification Submitted*\n\n"
+        "Your XM account verification has been submitted to our admin team.\n"
+        "You will be notified once your verification is approved or rejected.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_compliance_no")
+def handle_xm_compliance_no(call):
+    """Handle user declining to comply with instructions"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Create back to main menu button
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Edit message to deny access
+    bot.edit_message_text(
+        "❌ *Access Denied*\n\n"
+        "Compliance with the partner instructions is required to qualify for free mentorship.\n\n"
+        "If you change your mind in the future, you can restart the process from the main menu.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    
+    # Clean up pending data
+    PENDING_USERS.pop(user_id, None)
+    delete_pending_user(user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_xm_"))
+def handle_approve_xm(call):
+    """Handle admin approval of XM partnership verification"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID from callback data
+    user_id = int(call.data.split("_")[2])
+    user_id_str = str(user_id)
+    
+    try:
+        # Get user info for notifications
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or "No Username"
+            if username != "No Username":
+                username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        except Exception:
+            username = f"User {user_id}"
+            
+        # Check for any evidence of a previous valid membership
+        is_renewal = user_id_str in PAYMENT_DATA and PAYMENT_DATA[user_id_str].get('haspayed', False)
+
+        # Calculate membership due date (1 month for XM partnership)
+        due_date = datetime.now() + timedelta(days=30)
+        
+        # Check if user is in grace period
+        grace_period = False
+        grace_end_date = None
+        if user_id in PENDING_USERS and PENDING_USERS[user_id].get('grace_period', False):
+            grace_period = True
+            grace_end_date = PENDING_USERS[user_id].get('grace_end_date')
+        
+        # Update payment data - note it's free but still tracked
+        if user_id_str in PAYMENT_DATA:
+            # Update existing record
+            PAYMENT_DATA[user_id_str].update({
+                "username": username,
+                "payment_plan": "Monthly",
+                "payment_mode": "XM Partnership",
+                "mentorship_type": "Regular",  # XM partnership is only for Regular membership
+                "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "xm_verified": True,
+                "xm_verified_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "xm_verified_by": admin_id
+            })
+            
+            # Add grace period data if applicable
+            if grace_period and grace_end_date:
+                PAYMENT_DATA[user_id_str].update({
+                    "xm_grace_period": True,
+                    "xm_grace_end_date": grace_end_date,
+                    "needs_deposit": True  # This flag will be used to show "Deposit now" in main menu
+                })
+        else:
+            # Create new entry
+            PAYMENT_DATA[user_id_str] = {
+                "username": username,
+                "payment_plan": "Monthly",
+                "payment_mode": "XM Partnership",
+                "mentorship_type": "Regular",  # XM partnership is only for Regular membership
+                "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "xm_verified": True,
+                "xm_verified_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "xm_verified_by": admin_id,
+                "terms_accepted": True,
+                "privacy_accepted": True
+            }
+            
+            # Add grace period data if applicable
+            if grace_period and grace_end_date:
+                PAYMENT_DATA[user_id_str].update({
+                    "xm_grace_period": True,
+                    "xm_grace_end_date": grace_end_date,
+                    "needs_deposit": True  # This flag will be used to show "Deposit now" in main menu
+                })
+        
+        save_payment_data()
+        
+        # Mark as verified in PENDING_USERS
+        if user_id in PENDING_USERS:
+            PENDING_USERS[user_id]['xm_verified'] = True
+            PENDING_USERS[user_id]['status'] = 'xm_approved'
+            save_pending_users()
+        
+        # Update the admin's message
+        bot.edit_message_text(
+            f"✅ *XM Partnership APPROVED*\n\n"
+            f"You have approved @{username}'s XM partnership verification."
+            f"{' User has 14-day grace period for deposit.' if grace_period else ''}\n"
+            f"They will now be prompted to complete registration forms.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "XM Partnership approved")
+        
+        # Skip forms for renewals
+        if is_renewal:
+            # For renewals, just send confirmation message
+            bot.send_message(
+                user_id,
+                "✅ *XM Partnership Renewal Approved!*\n\n"
+                "Your XM partnership verification has been approved and your membership has been extended.\n\n"
+                f"Your new expiration date is: {due_date.strftime('%Y-%m-%d')}\n\n"
+                f"{'You have a 14-day grace period to make your deposit of $30 minimum.' if grace_period else ''}\n\n"
+                "Thank you for continuing with Prodigy Trading Academy!",
+                parse_mode="Markdown"
+            )
+            
+            # Log that we skipped forms for renewal
+            logging.info(f"Skipped forms for renewal user {user_id}")
+        else:
+            # For new users, prompt to complete registration forms
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("✅ Yes, proceed", callback_data="xm_registration_yes"),
+                InlineKeyboardButton("❌ No, later", callback_data="xm_registration_no")
+            )
+            
+            bot.send_message(
+                user_id,
+                "✅ *XM Partnership Approved!*\n\n"
+                "Congratulations! Your XM partnership has been verified and approved.\n"
+                f"{'You have a 14-day grace period to make your deposit of $30 minimum.' if grace_period else ''}\n\n"
+                "📝 *Registration Forms*\n\n"
+                "Would you like to proceed with completing the PTA registration forms now?",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
+        logging.error(f"Error in XM approval: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_xm_"))
+def handle_reject_xm(call):
+    """Handle admin rejection of XM partnership"""
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    # Extract user ID from callback data
+    user_id = int(call.data.split("_")[2])
+    
+    try:
+        # Get user info for notifications
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or "No Username"
+        except Exception:
+            username = f"User {user_id}"
+        
+        # Update the admin's message
+        bot.edit_message_text(
+            f"❌ *XM Partnership REJECTED*\n\n"
+            f"You have rejected @{username}'s XM partnership verification.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        
+        bot.answer_callback_query(call.id, "XM Partnership rejected")
+        
+        # Notify the user of rejection
+        bot.send_message(
+            user_id,
+            "❌ *XM Partnership Rejected*\n\n"
+            "Unfortunately, your XM partnership verification has been rejected.\n\n"
+            "Please ensure you've correctly followed all the registration instructions and provided valid information. "
+            "You may contact an admin for further assistance.",
+            parse_mode="Markdown"
+        )
+        
+        # Clean up PENDING_USERS
+        if user_id in PENDING_USERS:
+            PENDING_USERS.pop(user_id)
+            delete_pending_user(user_id)
+        
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Error: {str(e)}", show_alert=True)
+        logging.error(f"Error in XM rejection: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_registration_yes")
+def handle_xm_registration_yes(call):
+    """Handle user choosing to proceed with registration forms"""
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status to indicate they're completing the registration forms
+    PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step1'
+    save_pending_users()
+    
+    # Proceed directly to onboarding forms without sending another verification
+    bot.send_message(
+        call.message.chat.id,
+        "📝 *Registration Forms*\n\n"
+        "Thank you for choosing to complete the registration forms now. "
+        "Let's get started with your onboarding process.",
+        parse_mode="Markdown"
+    )
+    
+    # Add a small delay for better UX
+    time.sleep(1)
+    
+    # Send registration form graphic if available
+    try:
+        with open('graphics/registration_form.jpeg', 'rb') as form_img:
+            bot.send_photo(
+                user_id,
+                form_img,
+                caption="Please complete the registration form to continue"
+            )
+    except FileNotFoundError:
+        logging.error("Registration form image not found at graphics/registration_form.jpeg")
+    except Exception as e:
+        logging.error(f"Error sending registration form image: {e}")
+    
+    # Add another small delay
+    time.sleep(1.5)
+    
+    # Start the onboarding form process
+    send_onboarding_form(user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_registration_no")
+def handle_xm_registration_no(call):
+    """Handle user choosing to delay registration forms for trial period"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Calculate trial end date (1 week from now)
+    trial_end_date = datetime.now() + timedelta(days=7)
+    
+    # Update user's payment data to indicate they need to complete forms
+    user_id_str = str(user_id)
+    if user_id_str in PAYMENT_DATA:
+        PAYMENT_DATA[user_id_str]['forms_needed'] = True
+        PAYMENT_DATA[user_id_str]['trial_end_date'] = trial_end_date.strftime('%Y-%m-%d %H:%M:%S')
+        save_payment_data()
+        
+    # Update user status
+    PENDING_USERS[user_id]['status'] = 'form_completion_pending'
+    save_pending_users()
+    
+    # Edit the message to show trial information
+    if PENDING_USERS[user_id].get('grace_period', False):
+        # User selected "No, deposit later" option
+        bot.edit_message_text(
+            "⏳ *Trial Access Granted*\n\n"
+            f"You now have 1-week trial access until {trial_end_date.strftime('%Y-%m-%d')}.\n\n"
+            f"For a smooth onboarding experience, please complete your Deposit before your trial expires."
+            f"You'll find a 'Finish Forms' button in the main menu.\n\n"
+            f"‼️ *Get Verified Before Your Trial Access Expires*\n\n"
+            f"Here is what you get by becoming a ✅ Verified PTA Student:\n\n"
+            f"Deposit\n"
+            f"⚡️ Full access to our Mentorship",
+            chat_id,
+            message_id,
+            parse_mode="Markdown"
+        )
+    else:
+        # User selected deposit option
+        bot.edit_message_text(
+            "⏳ *Trial Access Granted*\n\n"
+            f"You now have 1-week trial access until {trial_end_date.strftime('%Y-%m-%d')}.\n\n"
+            f"For a smooth onboarding experience, please complete your registration forms before your trial expires. "
+            f"You'll find a 'Finish Forms' button in the main menu.\n\n"
+            f"‼️ *Get Verified Before Your Trial Access Expires*\n\n"
+            f"Our registration only takes a few minutes or exactly 5 simple questions! Here is what you get by becoming a ✅ Verified PTA Student:\n\n"
+            f"📝 Certificate of Completion (Registration Forms)\n"
+            f"📝 Certificate of Enrollment\n"
+            f"⚡️ Full access to our Mentorship",
+            chat_id,
+            message_id,
+            parse_mode="Markdown"
+        )
+    
+    # Generate an invite link for the appropriate group
+    target_group_id = PENDING_USERS[user_id].get('target_group_id', PAID_GROUP_ID)
+    try:
+        # Check if user is already in the group
+        already_in_group = False
+        try:
+            chat_member = bot.get_chat_member(target_group_id, user_id)
+            already_in_group = True
+        except ApiException:
+            already_in_group = False
+        
+        if not already_in_group:
+            # Generate a new invite link
+            new_invite = bot.create_chat_invite_link(
+                target_group_id,
+                name=f"User {user_id} trial access",
+                creates_join_request=False,
+                member_limit=1,
+                expire_date=int((datetime.now() + timedelta(minutes=15)).timestamp())
+            )
+            invite_link = new_invite.invite_link
+            
+            # Send invite link to user
+            bot.send_message(
+                user_id,
+                f"🔗 *Join Our Community*\n\n"
+                f"Here's your invitation to join the group: {invite_link}\n\n"
+                f"This link will expire in 15 minutes.",
+                parse_mode="Markdown"
+            )
+            
+            # Revoke link after 15 minutes
+            def revoke_link_later(chat_id, invite_link):
+                time.sleep(900)  # 15 minutes
+                try:
+                    bot.revoke_chat_invite_link(chat_id, invite_link)
+                except Exception as e:
+                    logging.error(f"Error revoking invite link: {e}")
+                    
+            threading.Thread(target=revoke_link_later, args=(target_group_id, invite_link)).start()
+        else:
+            bot.send_message(
+                user_id,
+                "✅ *You're Already a Member*\n\n"
+                "You're already in our community group, so no need to join again.",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logging.error(f"Error generating group invite: {e}")
+        bot.send_message(
+            user_id,
+            "⚠️ *Error Generating Invite*\n\n"
+            "There was a problem generating your group invite link. Please contact an admin for assistance.",
+            parse_mode="Markdown"
+        )
+    
+    # Show main menu (which will now have the "Finish Forms" button)
+    show_main_menu(chat_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_xm_trial_"))
+def callback_approve_xm_trial(call):
+    """Handle admin approval of XM trial access"""
+    user_id = int(call.data.split("_")[3])
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    try:
+        # Get user info for notifications
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or "No Username"
+            if username != "No Username":
+                username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        except Exception:
+            username = f"User {user_id}"
+            
+        # Get trial end date from PENDING_USERS
+        trial_end_date_str = PENDING_USERS[user_id].get('trial_end_date')
+        if trial_end_date_str:
+            trial_end_date = datetime.strptime(trial_end_date_str, '%Y-%m-%d %H:%M:%S')
+        else:
+            # Default to 1 week if not found
+            trial_end_date = datetime.now() + timedelta(days=7)
+            
+        # Calculate reminder date (2 days before expiry)
+        reminder_date = trial_end_date - timedelta(days=2)
+        
+        # Update payment data for trial access
+        if str(user_id) in PAYMENT_DATA:
+            # Update existing data
+            PAYMENT_DATA[str(user_id)].update({
+                "username": username,
+                "payment_plan": "Trial",
+                "payment_mode": "XM Partnership",
+                "mentorship_type": "Regular",
+                "due_date": trial_end_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "xm_verified": True,
+                "xm_verified_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "xm_verified_by": admin_id,
+                "xm_trial": True,
+                "forms_needed": True,
+                "reminder_date": reminder_date.strftime('%Y-%m-%d %H:%M:%S')
+            })
+        else:
+            # Create new entry
+            PAYMENT_DATA[str(user_id)] = {
+                "username": username,
+                "payment_plan": "Trial",
+                "payment_mode": "XM Partnership",
+                "mentorship_type": "Regular",
+                "due_date": trial_end_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "xm_verified": True, 
+                "xm_verified_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "xm_verified_by": admin_id,
+                "terms_accepted": True,
+                "privacy_accepted": True,
+                "xm_trial": True,
+                "forms_needed": True,
+                "reminder_date": reminder_date.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        
+        save_payment_data()
+        
+        # Update PENDING_USERS status
+        PENDING_USERS[user_id]['status'] = 'xm_trial_approved'
+        save_pending_users()
+        
+        # Notify admins
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        for admin in ADMIN_IDS:
+            if admin != admin_id:  # Don't notify the admin who took action
+                bot.send_message(
+                    admin,
+                    f"📝 *Activity Log*\n\n@{admin_username} has approved trial access for @{username}.",
+                    parse_mode="Markdown"
+                )
+        
+        # Edit admin message
+        bot.edit_message_text(
+            f"✅ *XM Trial Access APPROVED*\n\n"
+            f"You have granted @{username} trial access until {trial_end_date.strftime('%Y-%m-%d')}.\n\n"
+            f"They will be reminded 2 days before expiration to complete their registration forms.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(call.id, "✅ Trial access approved")
+        
+        # Send invite link to the user
+        # Check if user is already in the group
+        target_group_id = PAID_GROUP_ID  # Trial is for regular membership only
+        already_in_group = False
+        
+        try:
+            chat_member = bot.get_chat_member(target_group_id, user_id)
+            already_in_group = True
+            logging.info(f"User {user_id} is already in group {target_group_id}, will skip invite")
+        except ApiException:
+            already_in_group = False
+            logging.info(f"User {user_id} is not in group {target_group_id}, will generate invite")
+        
+        if not already_in_group:
+            try:
+                # Generate a new invite link
+                new_invite = bot.create_chat_invite_link(
+                    target_group_id,
+                    name=f"User {user_id} trial access",
+                    creates_join_request=False,
+                    member_limit=1,
+                    expire_date=int((datetime.now() + timedelta(minutes=15)).timestamp())
+                )
+                invite_link = new_invite.invite_link
+                
+                # Send approval and invite to user
+                bot.send_message(
+                    user_id,
+                    f"✅ *Trial Access Approved!*\n\n"
+                    f"You have been granted trial access to Prodigy Trading Academy until {trial_end_date.strftime('%Y-%m-%d')}.\n\n"
+                    f"Please join our community here: {invite_link}\n\n"
+                    f"⚠️ Important: You will need to complete the registration forms before your trial expires.",
+                    parse_mode="Markdown"
+                )
+                
+                # Revoke link after 15 minutes
+                def revoke_link_later(chat_id, invite_link):
+                    time.sleep(900)  # 15 minutes
+                    try:
+                        bot.revoke_chat_invite_link(chat_id, invite_link)
+                    except Exception as e:
+                        logging.error(f"Error revoking invite link: {e}")
+                        
+                threading.Thread(target=revoke_link_later, args=(target_group_id, invite_link)).start()
+                
+            except Exception as e:
+                logging.error(f"Error generating invite link: {e}")
+                bot.send_message(
+                    user_id,
+                    f"✅ *Trial Access Approved!*\n\n"
+                    f"You have been granted trial access to Prodigy Trading Academy until {trial_end_date.strftime('%Y-%m-%d')}.\n\n"
+                    f"Please contact an admin to get access to the group.\n\n"
+                    f"⚠️ Important: You will need to complete the registration forms before your trial expires.",
+                    parse_mode="Markdown"
+                )
+        else:
+            # User is already in the group
+            bot.send_message(
+                user_id,
+                f"✅ *Trial Access Approved!*\n\n"
+                f"You have been granted trial access to Prodigy Trading Academy until {trial_end_date.strftime('%Y-%m-%d')}.\n\n"
+                f"You're already a member of our group, so no need to join again.\n\n"
+                f"⚠️ Important: You will need to complete the registration forms before your trial expires.",
+                parse_mode="Markdown"
+            )
+        
+    except Exception as e:
+        logging.error(f"Error in XM trial approval: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        bot.send_message(call.message.chat.id, f"Error processing XM trial approval: {e}")
+
+def check_trial_reminders():
+    """Check for users needing form completion reminders"""
+    while True:
+        try:
+            now = datetime.now()
+            
+            for user_id_str, data in PAYMENT_DATA.items():
+                # Check if this is a trial account needing forms
+                if data.get('xm_trial') and data.get('forms_needed'):
+                    # Check if it's time for the reminder
+                    reminder_date_str = data.get('reminder_date')
+                    
+                    if reminder_date_str:
+                        reminder_date = datetime.strptime(reminder_date_str, '%Y-%m-%d %H:%M:%S')
+                        
+                        # If it's time to send the reminder (current time >= reminder time)
+                        if now >= reminder_date:
+                            try:
+                                user_id = int(user_id_str)
+                                
+                                # Get due date for message
+                                due_date = datetime.strptime(data.get('due_date', '2099-01-01 00:00:00'), '%Y-%m-%d %H:%M:%S')
+                                days_remaining = (due_date - now).days
+                                
+                                # Create registration buttons
+                                markup = InlineKeyboardMarkup(row_width=1)
+                                markup.add(InlineKeyboardButton("📝 Complete Registration Forms", callback_data="start_xm_forms"))
+                                
+                                # Send reminder
+                                bot.send_message(
+                                    user_id,
+                                    f"⚠️ *Trial Expiring Soon!*\n\n"
+                                    f"Your trial access expires in {days_remaining} days.\n\n"
+                                    f"To maintain your access to Prodigy Trading Academy, you need to complete the registration forms.",
+                                    parse_mode="Markdown",
+                                    reply_markup=markup
+                                )
+                                
+                                # Update to prevent sending reminder again
+                                PAYMENT_DATA[user_id_str]['reminder_sent'] = True
+                                save_payment_data()
+                                
+                            except Exception as e:
+                                logging.error(f"Error sending trial reminder to user {user_id_str}: {e}")
+            
+            # Check every hour
+            time.sleep(3600)
+            
+        except Exception as e:
+            logging.error(f"Error in trial reminder checker: {e}")
+            time.sleep(3600)  # Sleep and try again in an hour
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_xm_forms")
+def start_xm_forms(call):
+    """Start registration forms from trial reminder"""
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Starting registration forms...")
+    
+    # Send registration form graphic
+    try:
+        with open('graphics/registration_form.jpeg', 'rb') as form_img:
+            bot.send_photo(
+                user_id,
+                form_img,
+                caption="Please complete the registration form to continue"
+            )
+    except FileNotFoundError:
+        logging.error("Registration form image not found at graphics/registration_form.jpeg")
+    except Exception as e:
+        logging.error(f"Error sending registration form image: {e}")
+    
+    # Add a small delay for better UX
+    time.sleep(1.5)
+    
+    # Start onboarding forms
+    send_onboarding_form(user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_comply_yes")
+def handle_xm_comply_yes(call):
+    """Handle user agreeing to add partner code"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    user_id = call.from_user.id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Update user status to await screenshot
+    PENDING_USERS[user_id]['status'] = 'xm_awaiting_screenshot'
+    save_pending_users()
+    
+    # Create back button
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back", callback_data="xm_existing_yes"))
+    
+    # Edit message to request screenshot
+    bot.edit_message_text(
+        "📸 *XM Partnership Verification*\n\n"
+        "Please send a screenshot showing that you have applied the partner code *PTAPARTNER* in your XM account.\n\n"
+        "The screenshot should clearly show:\n"
+        "• Your XM account ID\n"
+        "• The partner code field with our code\n\n"
+        "Please upload your screenshot now.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "xm_comply_no")
+def handle_xm_comply_no(call):
+    """Handle user not agreeing to add partner code"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    # Answer callback
+    bot.answer_callback_query(call.id, "Processing...")
+    
+    # Create back to main menu button
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+    
+    # Edit message to show inability to proceed
+    bot.edit_message_text(
+        "❌ *Process Terminated*\n\n"
+        "To qualify for free mentorship, you must add our partner code to your XM account.\n\n"
+        "If you change your mind, you can restart the process from the main menu.",
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_xm_"))
+def callback_approve_xm(call):
+    """Handle admin approval of XM verification"""
+    user_id = int(call.data.split("_")[2])
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    try:
+        # Get user info for notifications
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or "No Username"
+            if username != "No Username":
+                username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        except Exception:
+            username = f"User {user_id}"
+            
+        # Calculate membership due date (1 month for XM partnership)
+        due_date = datetime.now() + timedelta(days=30)
+        
+        # Update payment data - note it's free but still tracked
+        if str(user_id) in PAYMENT_DATA:
+            # Update existing record
+            PAYMENT_DATA[str(user_id)].update({
+                "username": username,
+                "payment_plan": "Monthly",
+                "payment_mode": "XM Partnership",
+                "mentorship_type": "Regular",  # XM partnership is only for Regular membership
+                "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "xm_verified": True,  # Add flag for XM verification
+                "xm_verified_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "xm_verified_by": admin_id
+            })
+        else:
+            # Create new entry
+            PAYMENT_DATA[str(user_id)] = {
+                "username": username,
+                "payment_plan": "Monthly",
+                "payment_mode": "XM Partnership",
+                "mentorship_type": "Regular",  # XM partnership is only for Regular membership
+                "due_date": due_date.strftime('%Y-%m-%d %H:%M:%S'),
+                "haspayed": True,
+                "xm_verified": True,  # Add flag for XM verification
+                "xm_verified_date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "xm_verified_by": admin_id,
+                "terms_accepted": True,
+                "privacy_accepted": True
+            }
+        
+        logging.info(f"XM verification approved for user {user_id}")
+        save_payment_data()
+        
+        # Remove user from pending status
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+        
+        # Notify admins of the approval
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        for admin in ADMIN_IDS:
+            if admin != admin_id:  # Don't notify the admin who took action
+                bot.send_message(
+                    admin,
+                    f"📝 *Activity Log*\n\n@{admin_username} has approved XM verification for @{username}.",
+                    parse_mode="Markdown"
+                )
+        
+        # Update message to confirming approval
+        bot.edit_message_text(
+            f"✅ *XM Verification APPROVED*\n\n"
+            f"You have approved @{username}'s XM partnership verification.\n\n"
+            f"They will now receive free access to Regular mentorship.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(call.id, "✅ XM verification approved")
+        
+        # Now notify the user and start onboarding process
+        # First send success graphic if available
+        try:
+            with open('graphics/xm_verified.jpeg', 'rb') as approval_img:
+                bot.send_photo(
+                    user_id,
+                    approval_img,
+                    caption="Your XM Partnership verification has been approved!"
+                )
+        except FileNotFoundError:
+            logging.error("XM approval image not found at graphics/xm_verified.jpeg")
+            bot.send_message(
+                user_id,
+                "✅ *XM Verification Successful!*\n\n"
+                "Your XM account verification has been approved. Welcome to the Prodigy Trading Academy!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Error sending XM approval image: {e}")
+            bot.send_message(
+                user_id,
+                "✅ *XM Verification Successful!*\n\n"
+                "Your XM account verification has been approved. Welcome to the Prodigy Trading Academy!",
+                parse_mode="Markdown"
+            )
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+        
+        # Send membership details message
+        bot.send_message(
+            user_id, 
+            f"📅 *Your free mentorship is active!*\n\n"
+            f"• Membership Type: Regular Mentorship\n"
+            f"• Duration: 1 Month (Free through XM Partnership)\n"
+            f"• Expiration: {due_date.strftime('%Y-%m-%d')}\n\n"
+            f"To maintain your free membership, you must keep your XM account active with our partner code.\n"
+            f"Monthly verification may be required.",
+            parse_mode="Markdown"
+        )
+        
+        # Send registration form graphic first
+        try:
+            with open('graphics/registration_form.jpeg', 'rb') as form_img:
+                bot.send_photo(
+                    user_id,
+                    form_img,
+                    caption="Please complete the registration form to continue"
+                )
+        except FileNotFoundError:
+            logging.error("Registration form image not found at graphics/registration_form.jpeg")
+        
+        # Add a small delay for better UX
+        time.sleep(1.5)
+            
+        # Start onboarding process
+        target_group_id = PAID_GROUP_ID  # XM partnership is for regular mentorship only
+        
+        # Check if user is already in the group
+        already_in_group = False
+        try:
+            chat_member = bot.get_chat_member(target_group_id, user_id)
+            already_in_group = True
+            logging.info(f"User {user_id} is already in group {target_group_id}, will skip invite during onboarding")
+        except ApiException:
+            already_in_group = False
+            logging.info(f"User {user_id} is not in group {target_group_id}, will generate invite during onboarding")
+            
+        # Setup for onboarding form
+        PENDING_USERS[user_id] = {
+            'form_answers': {},  # Initialize empty dict to store responses
+            'invite_link': None,  # Will store the invite link to use after form completion
+            'target_group_id': target_group_id,
+            'already_in_group': already_in_group,
+            'membership_type': "Regular"  # XM partnership is for regular mentorship only
+        }
+        save_pending_users()
+        
+        # Start onboarding form process
+        send_onboarding_form(user_id)
+        
+    except Exception as e:
+        logging.error(f"Error in XM verification approval: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        bot.send_message(call.message.chat.id, f"Error processing XM verification: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reject_xm_"))
+def callback_reject_xm(call):
+    """Handle admin rejection of XM verification"""
+    user_id = int(call.data.split("_")[2])
+    admin_id = call.from_user.id
+    
+    # Verify admin status
+    if admin_id not in ADMIN_IDS and admin_id != CREATOR_ID:
+        bot.answer_callback_query(call.id, "❌ You are not authorized to use this action.")
+        return
+    
+    try:
+        # Get user info for notifications
+        try:
+            user_info = bot.get_chat(user_id)
+            username = user_info.username or "No Username"
+            if username != "No Username":
+                username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        except Exception:
+            username = f"User {user_id}"
+        
+        # Remove user from pending status to allow them to try again
+        PENDING_USERS.pop(user_id, None)
+        delete_pending_user(user_id)
+        
+        # Notify admins of the rejection
+        admin_username = call.from_user.username or f"Admin {admin_id}"
+        for admin in ADMIN_IDS:
+            if admin != admin_id:  # Don't notify the admin who took action
+                bot.send_message(
+                    admin,
+                    f"📝 *Activity Log*\n\n@{admin_username} has rejected XM verification for @{username}.",
+                    parse_mode="Markdown"
+                )
+        
+        # Update message confirming rejection
+        bot.edit_message_text(
+            f"❌ *XM Verification REJECTED*\n\n"
+            f"You have rejected @{username}'s XM partnership verification.\n\n"
+            f"They have been notified and can try again if needed.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(call.id, "❌ XM verification rejected")
+        
+        # Notify user of rejection with instructions to try again
+        bot.send_message(
+            user_id,
+            "❌ *XM Verification Declined*\n\n"
+            "We couldn't verify your XM partnership code from the screenshot provided.\n\n"
+            "Possible reasons:\n"
+            "• The partner code wasn't visible or didn't match PTAPARTNER\n"
+            "• Account details weren't clearly shown\n"
+            "• Image quality was too low\n\n"
+            "You can try again by returning to the main menu (/start) and selecting 'Free Mentorship by XM' again.",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logging.error(f"Error in XM verification rejection: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+        bot.send_message(call.message.chat.id, f"Error processing XM rejection: {e}")
+
 @bot.callback_query_handler(func=lambda call: call.data == "menu_aichat")
 def handle_menu_aichat(call):
     """Start AI chat from the main menu"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
     bot.answer_callback_query(call.id, "Starting AI chat...")
     
-    # Remove the inline keyboard
-    bot.edit_message_reply_markup(
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=None
-    )
-    
-    # Start AI chat flow
-    bot.send_message(
-        call.message.chat.id,
+    # Edit the message to show AI chat intro
+    bot.edit_message_text(
         "🤖 *AI Assistant Mode Activated*\n\n"
         "✨ I'm here to help with your trading questions! Just type your question and I'll respond.\n\n"
         "💬 You can ask about:\n"
@@ -1611,7 +4073,10 @@ def handle_menu_aichat(call):
         "• 🛠️ How to use this bot\n"
         "• 📚 PTA resources and membership\n\n"
         "When you're done, simply type `/exit` to end our conversation.",
-        parse_mode="Markdown"
+        chat_id,
+        message_id,
+        parse_mode="Markdown",
+        reply_markup=None  # Remove buttons
     )
     
     # Set user state to conversation_active (directly going to conversation mode)
@@ -1629,14 +4094,11 @@ def remove_inline_keyboard(chat_id, message_id):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("menu_"))
 def handle_main_menu_selection(call):
-    """Handle main menu inline button selections"""
+    """Handle main menu inline button selections with editing instead of new messages"""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
     user_id = call.from_user.id
     option = call.data.split("_")[1]
-    
-    # First, remove the keyboard from the existing message to prevent multiple clicks
-    remove_inline_keyboard(chat_id, message_id)
     
     # Set a default pending status
     PENDING_USERS[user_id] = {'status': 'choosing_option'}
@@ -1644,14 +4106,14 @@ def handle_main_menu_selection(call):
     
     # Handle different menu options
     if option == "buy":
-        # Start the purchase membership flow
+        # Answer callback for feedback to user
         bot.answer_callback_query(call.id, "Starting membership purchase...")
         
         # Check enrollment status for new purchases
         regular_enrollment_open = BOT_SETTINGS.get('regular_enrollment_open', True)
         supreme_enrollment_open = BOT_SETTINGS.get('supreme_enrollment_open', True)
         
-        # If both enrollment types are closed, show message
+        # If both enrollment types are closed, edit message to show notification
         if not regular_enrollment_open and not supreme_enrollment_open:
             markup = InlineKeyboardMarkup(row_width=2)
             markup.add(
@@ -1660,36 +4122,21 @@ def handle_main_menu_selection(call):
             )
             markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
             
-            bot.send_message(
-                chat_id,
+            bot.edit_message_text(
                 "⚠️ *Enrollment is currently closed*\n\n"
                 "New memberships are not available at this time. Please wait for the next "
                 "announcement from the admins about when enrollment will open again.\n\n"
                 "• Click *Get Notified* to receive updates when enrollment opens\n"
                 "• Check our *FAQ* section for more information\n\n"
                 "Thank you for your interest in Prodigy Trading Academy!",
+                chat_id,
+                message_id,
                 parse_mode="Markdown",
                 reply_markup=markup
             )
             return
         
-        # Continue with normal flow - show enrollment benefits image
-        try:
-            with open('graphics/benefits.jpeg', 'rb') as benefits_img:
-                bot.send_photo(
-                    chat_id,
-                    benefits_img,
-                    caption="Explore our membership benefits and choose the plan that's right for you!"
-                )
-        except FileNotFoundError:
-            logging.error("Enrollment benefits image not found at graphics/benefits.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending enrollment benefits image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1.5)
-        
-        # Update status and show mentorship options
+        # Update status and edit message to show mentorship options
         PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
         PENDING_USERS[chat_id]['is_renewal'] = False
         save_pending_users()
@@ -1697,20 +4144,20 @@ def handle_main_menu_selection(call):
         # Show mentorship type options with inline keyboard
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("Regular Mentorship", callback_data="mentorship_regular"),
+            InlineKeyboardButton("Regular Mentorship (FREE)", callback_data="menu_xm_free"),
             InlineKeyboardButton("Supreme Mentorship", callback_data="mentorship_supreme")
         )
         markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
         
-        # Send new message instead of editing
-        bot.send_message(
-            chat_id,
+        # Edit the current message instead of sending a new one
+        bot.edit_message_text(
             "Please select your preferred mentorship level:",
+            chat_id,
+            message_id,
             reply_markup=markup
         )
         
     elif option == "renew":
-        # Similar pattern for other options...
         bot.answer_callback_query(call.id, "Starting membership renewal...")
         
         # Check if they can renew
@@ -1729,23 +4176,7 @@ def handle_main_menu_selection(call):
             )
             return
         
-        # If they can renew, continue with the flow...
-        try:
-            with open('graphics/benefits.jpeg', 'rb') as benefits_img:
-                bot.send_photo(
-                    chat_id,
-                    benefits_img,
-                    caption="Explore our membership benefits and choose the plan that's right for you!"
-                )
-        except FileNotFoundError:
-            logging.error("Enrollment benefits image not found at graphics/benefits.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending enrollment benefits image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1.5)
-        
-        # Update status and show mentorship options
+        # Update status and edit message to show mentorship options
         PENDING_USERS[chat_id]['status'] = 'choosing_mentorship_type'
         PENDING_USERS[chat_id]['is_renewal'] = True
         save_pending_users()
@@ -1753,11 +4184,12 @@ def handle_main_menu_selection(call):
         # Show mentorship type options with inline keyboard
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("Regular Mentorship", callback_data="mentorship_regular"),
+            InlineKeyboardButton("Regular Mentorship (FREE)", callback_data="menu_xm_free"),
             InlineKeyboardButton("Supreme Mentorship", callback_data="mentorship_supreme")
         )
         markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
         
+        # Edit the message
         bot.edit_message_text(
             "Please select your preferred mentorship level to renew:",
             chat_id,
@@ -1765,9 +4197,7 @@ def handle_main_menu_selection(call):
             reply_markup=markup
         )
         
-    # Continue with other options following the same pattern...
     elif option == "cancel":
-        # Start the cancel membership flow
         bot.answer_callback_query(call.id, "Starting membership cancellation...")
         
         # Check if user has an active membership
@@ -1811,22 +4241,6 @@ def handle_main_menu_selection(call):
                     reply_markup=markup
                 )
             return
-            
-        # Send cancellation confirmation graphic
-        try:
-            with open('graphics/cancel_membership.jpeg', 'rb') as cancel_img:
-                bot.send_photo(
-                    chat_id,
-                    cancel_img,
-                    caption="⚠️ Please confirm if you wish to cancel your membership"
-                )
-        except FileNotFoundError:
-            logging.error("Cancellation confirmation image not found at graphics/cancel_membership.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending cancellation confirmation image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1.5)
 
         # Update user status and show confirmation buttons
         PENDING_USERS[chat_id]['status'] = 'cancel_membership'
@@ -1848,37 +4262,22 @@ def handle_main_menu_selection(call):
         )
         
     elif option == "dashboard":
-            # Show user dashboard
-            bot.answer_callback_query(call.id, "Loading your dashboard...")
+        # Show user dashboard
+        bot.answer_callback_query(call.id, "Loading your dashboard...")
             
-            # Create a modified version of the message with the correct user info
-            modified_message = call.message
-            # Important: Set the correct user info from the callback
-            modified_message.from_user = call.from_user
+        # Create a modified version of the message with the correct user info
+        modified_message = call.message
+        # Important: Set the correct user info from the callback
+        modified_message.from_user = call.from_user
             
-            # Now call the dashboard function with the corrected message object
-            show_user_dashboard(modified_message)
+        # Now call the dashboard function with the corrected message object
+        show_user_dashboard(modified_message)
         
     elif option == "faq":
         # Show FAQ options
         bot.answer_callback_query(call.id, "Loading FAQ...")
         
-        # First send the FAQ image
-        try:
-            with open('graphics/faq_main.jpeg', 'rb') as faq_img:
-                bot.send_photo(
-                    chat_id,
-                    faq_img,
-                )
-        except FileNotFoundError:
-            logging.error("FAQ image not found at graphics/faq_main.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending FAQ image: {e}")
-        
-        # Add a small delay for better UX
-        time.sleep(1)
-        
-        # Then show the FAQ categories with inline buttons
+        # Show the FAQ categories with inline buttons
         markup = InlineKeyboardMarkup(row_width=1)
         markup.add(
             InlineKeyboardButton("🎓 Join Academy", callback_data="faq_join_academy"),
@@ -1901,25 +4300,26 @@ def handle_main_menu_selection(call):
         )
 
     elif option == "redeem":
-        # Start the serial redemption flow
         bot.answer_callback_query(call.id, "Starting serial redemption...")
         
-        # Create a fake message object that simulates the user sending /redeem
-        fake_message = types.Message(
-            message_id=9999,  # Arbitrary message ID
-            from_user=call.from_user,  # Use the same user info
-            date=int(time.time()),  # Current time
-            chat=call.message.chat,  # Same chat
-            content_type='text',
-            options={},
-            json_string="{}"  # Empty JSON string
+        # Update user status
+        PENDING_USERS[user_id] = {'status': 'awaiting_serial'}
+        save_pending_users()
+        
+        # Create back button
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
+        
+        # Edit message to prompt for serial number
+        bot.edit_message_text(
+            "🔑 *Serial Redemption*\n\n"
+            "Please enter the serial number you received for your membership.\n\n"
+            "Note: Serial numbers are case-sensitive.",
+            chat_id,
+            message_id,
+            parse_mode="Markdown",
+            reply_markup=markup
         )
-        
-        # Set the text attribute to /redeem command
-        fake_message.text = "/redeem"
-        
-        # Call the redeem_serial function directly with our fake message
-        redeem_serial(fake_message)
         
     elif option == "howto":
         # Show "How to Use" information
@@ -1953,7 +4353,7 @@ def handle_main_menu_selection(call):
             "   • /start - Return to the main menu\n"
             "   • /dashboard - View your membership status\n"
             "   • /chat - Start a conversation with AI\n\n"
-            "Still need help? Click '🤖 Ask AI Assistant' below or contact our admin team at @PTASupportTeam",
+            "Still need help? Click '🤖 Ask AI Assistant' below or contact our Tech Support at @FujiPTA",
             chat_id,
             message_id,
             parse_mode="Markdown",
@@ -1965,11 +4365,8 @@ def back_to_main_menu(call):
     """Return to the main menu from anywhere"""
     bot.answer_callback_query(call.id, "Returning to main menu...")
     
-    # Remove the keyboard from the original message
-    remove_inline_keyboard(call.message.chat.id, call.message.message_id)
-    
-    # Show main menu by sending a new message
-    show_main_menu(call.message.chat.id, call.from_user.id)
+    # Show main menu by editing the current message
+    show_main_menu(call.message.chat.id, call.from_user.id, message_id=call.message.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_confirm_"))
 def handle_cancel_confirmation_callback(call):
@@ -2066,11 +4463,9 @@ def handle_cancel_confirmation_callback(call):
 def handle_mentorship_selection(call):
     """Handle mentorship type selection from inline buttons"""
     chat_id = call.message.chat.id
+    message_id = call.message.message_id
     user_id = call.from_user.id
     mentorship_type = call.data.split("_")[1]
-    
-    # First remove the keyboard from the existing message
-    remove_inline_keyboard(chat_id, call.message.message_id)
     
     # Get renewal status from pending users
     is_renewal = PENDING_USERS[chat_id].get('is_renewal', False)
@@ -2087,35 +4482,21 @@ def handle_mentorship_selection(call):
                 InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
                 InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
             )
+            markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
             
-            bot.send_message(
-                chat_id,
+            bot.edit_message_text(
                 "⚠️ *Regular Membership enrollment is currently CLOSED*\n\n"
                 "New Regular Membership purchases are temporarily unavailable.\n"
                 "Please wait for the next announcement about when enrollment will open again.\n\n"
                 "• Click *Get Notified* to receive updates when enrollment opens\n"
                 "• Check our *FAQ* section for more information\n\n"
                 "Existing members can still renew their memberships.",
+                chat_id,
+                message_id,
                 parse_mode="Markdown",
                 reply_markup=markup
             )
             return
-            
-        # First send the Regular Mentorship pricing image
-        try:
-            with open('graphics/regular.jpeg', 'rb') as pricing_img:
-                bot.send_photo(
-                    chat_id,
-                    pricing_img,
-                    caption="Regular Mentorship Pricing Options"
-                )
-        except FileNotFoundError:
-            logging.error("Regular pricing image not found at graphics/regular.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending Regular pricing image: {e}")
-            
-        # Add a small delay for better UX
-        time.sleep(1.5)
         
         # Get regular discount specifically
         applicable_discount = DISCOUNTS.get('regular')
@@ -2164,21 +4545,24 @@ def handle_mentorship_selection(call):
                 InlineKeyboardButton(f"Legacy (${legacy_discounted:.2f}) / Yearly", callback_data="plan_regular_legacy")
             )
             
-            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            # ADD BACK BUTTON
             markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
             
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
             
-            # Use HTML formatting for both bold and strikethrough
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
-                          f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
-                          f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
-                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # Edit the current message with plans
+            bot.edit_message_text( 
+                f"{intro_text}:\n\n"
+                f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
+                f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
+                f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
         else:
             # No discount - show regular prices without strikethrough
             markup.add(
@@ -2187,19 +4571,23 @@ def handle_mentorship_selection(call):
                 InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Yearly", callback_data="plan_regular_legacy")
             )
             
-            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            # ADD BACK BUTTON
             markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
             
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
             
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
-                          f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
-                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # Edit the current message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
+                f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
+                f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
         
     elif mentorship_type == "supreme":
         # Process Supreme Mentorship selection
@@ -2213,35 +4601,22 @@ def handle_mentorship_selection(call):
                 InlineKeyboardButton("🔔 Get Notified", callback_data="update_yes"),
                 InlineKeyboardButton("❓ FAQ", callback_data="faq_back")
             )
+            markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
             
-            bot.send_message(
-                chat_id,
+            # FIXED: Edit the current message instead of sending new one
+            bot.edit_message_text(
                 "⚠️ *Supreme Membership enrollment is currently CLOSED*\n\n"
                 "New Supreme Membership purchases are temporarily unavailable.\n"
                 "Please wait for the next announcement about when enrollment will open again.\n\n"
                 "• Click *Get Notified* to receive updates when enrollment opens\n"
                 "• Check our *FAQ* section for more information\n\n"
                 "Existing members can still renew their memberships.",
+                chat_id,
+                message_id,
                 parse_mode="Markdown",
                 reply_markup=markup
             )
             return
-            
-        # First send the Supreme Mentorship pricing image
-        try:
-            with open('graphics/supreme.jpeg', 'rb') as pricing_img:
-                bot.send_photo(
-                    chat_id,
-                    pricing_img,
-                    caption="Supreme Mentorship Pricing Options"
-                )
-        except FileNotFoundError:
-            logging.error("Supreme pricing image not found at graphics/supreme.jpeg")
-        except Exception as e:
-            logging.error(f"Error sending Supreme pricing image: {e}")
-            
-        # Add a small delay for better UX
-        time.sleep(1.5)
         
         # Get supreme discount specifically
         applicable_discount = DISCOUNTS.get('supreme')
@@ -2296,15 +4671,18 @@ def handle_mentorship_selection(call):
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
             
-            # Use HTML formatting for both bold and strikethrough
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
-                          f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
-                          f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
-                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # FIXED: Use edit_message_text instead of send_message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
+                f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
+                f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
         else:
             # No discount - show regular prices without strikethrough
             markup.add(
@@ -2313,29 +4691,31 @@ def handle_mentorship_selection(call):
                 InlineKeyboardButton(f"Legacy (${legacy_price:.2f}) / Lifetime", callback_data="plan_supreme_legacy")
             )
             
-            # ADD BACK BUTTON BEFORE SENDING THE MESSAGE
+            # ADD BACK BUTTON
             markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_mentorship_type"))
             
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
             
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
-                          f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
-                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # FIXED: Use edit_message_text instead of send_message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
+                f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
+                f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("plan_"))
 def handle_plan_selection(call):
     """Handle plan selection from inline buttons"""
     chat_id = call.message.chat.id
+    message_id = call.message.message_id
     user_id = call.from_user.id
-    selected_plan = call.data.split("_")[1]
-    
-    # First, remove the keyboard from the existing message to prevent multiple clicks
-    remove_inline_keyboard(chat_id, call.message.message_id)
+    selected_plan = call.data.split("_", 1)[1]  # Split only on first underscore
     
     # Extract plan data based on selection
     if selected_plan == "trial":
@@ -2343,37 +4723,31 @@ def handle_plan_selection(call):
         price_usd = 7.99  # Store numeric USD price for currency conversion
         duration = "Monthly"
         mentorship_type = "regular"
-        plan_image = "graphics/trial.jpeg"
     elif selected_plan == "momentum":
         plan = "Momentum"
         price_usd = 20.99
         duration = "3 Months"
         mentorship_type = "regular"
-        plan_image = "graphics/momentum.jpeg"
     elif selected_plan == "apprentice":
         plan = "Apprentice"
         price_usd = 309.99
         duration = "3 Months"
         mentorship_type = "supreme"
-        plan_image = "graphics/apprentice.jpeg"
     elif selected_plan == "disciple":
         plan = "Disciple"
         price_usd = 524.99
         duration = "6 Months" 
         mentorship_type = "supreme"
-        plan_image = "graphics/disciple.jpeg"
     elif selected_plan == "regular_legacy":
         plan = "Legacy"
         price_usd = 89.99
         duration = "Yearly"
         mentorship_type = "regular"
-        plan_image = "graphics/regular_legacy.jpeg"
     elif selected_plan == "supreme_legacy":
         plan = "Legacy"
         price_usd = 899.99
         duration = "Lifetime"
         mentorship_type = "supreme"
-        plan_image = "graphics/master.jpeg"
     else:
         # If we get an unknown plan, respond with an error and return
         bot.answer_callback_query(call.id, "❌ Invalid plan selection.")
@@ -2381,21 +4755,6 @@ def handle_plan_selection(call):
 
     # Acknowledge the selection
     bot.answer_callback_query(call.id, f"Selected {plan} plan")
-
-    # Send the plan-specific graphic
-    try:
-        with open(plan_image, 'rb') as img:
-            bot.send_photo(
-                chat_id,
-                img,
-            )
-    except FileNotFoundError:
-        logging.error(f"Plan image not found at {plan_image}")
-    except Exception as e:
-        logging.error(f"Error sending plan image: {e}")
-    
-    # Add a small delay for better UX
-    time.sleep(1.5)
 
     # Store original price before any discounts
     original_price_usd = price_usd
@@ -2479,35 +4838,15 @@ def handle_plan_selection(call):
             f"🔖 Discount: {PENDING_USERS[chat_id]['discount_percentage']}% OFF ({PENDING_USERS[chat_id]['discount_name']})\n\n"
             f"• You pay: {price}\n"
             f"• Duration: {duration}\n\n"
-            f"Please be prepared for the following steps:\n"
-            f"• Payment\n"
-            f"• Registration Forms\n\n"
+            f"Please select your payment method:"
         )
     else:
         plan_message = (
             f"🙌 You've selected the {mentorship_type.capitalize()} {plan} plan:\n\n"
             f"• Price: {price}\n"
             f"• Duration: {duration}\n\n"
-            f"Please be prepared for the following steps:\n"
-            f"• Payment\n"
-            f"• Registration Forms\n\n"
+            f"Please select your payment method:"
         )
-    
-    # Show plan confirmation message
-    bot.send_message(chat_id, plan_message)
-    
-    # Add a transition message with typing indicator
-    bot.send_chat_action(chat_id, 'typing')
-    transition_msg = bot.send_message(chat_id, "⏳ Moving on to payment options...")
-    
-    # Add a small delay for better UX
-    time.sleep(1.5)
-    
-    # Delete the transition message
-    try:
-        bot.delete_message(chat_id, transition_msg.message_id)
-    except Exception as e:
-        logging.error(f"Error deleting transition message: {e}")
     
     # Create payment method markup using inline buttons
     markup = InlineKeyboardMarkup(row_width=2)
@@ -2520,9 +4859,9 @@ def handle_plan_selection(call):
         InlineKeyboardButton("🏦 Bank Transfer", callback_data="payment_bank")
     )
     markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_plan_selection"))
-        
-    # Ask for payment method after transition
-    bot.send_message(chat_id, "Please select your payment method:", reply_markup=markup)
+    
+    # Edit current message with payment options
+    bot.edit_message_text(plan_message, chat_id, message_id, reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("payment_"))
 def handle_payment_method(call):
@@ -2730,10 +5069,8 @@ def handle_payment_method(call):
 def back_to_plan_selection(call):
     """Handle going back to plan selection"""
     chat_id = call.message.chat.id
+    message_id = call.message.message_id
     user_id = call.from_user.id
-    
-    # First, remove the keyboard from the existing message to prevent multiple clicks
-    remove_inline_keyboard(chat_id, call.message.message_id)
     
     bot.answer_callback_query(call.id, "Returning to plan selection...")
     
@@ -2748,6 +5085,7 @@ def back_to_plan_selection(call):
     # Create new markup based on the mentorship type
     markup = InlineKeyboardMarkup(row_width=1)
     
+    # Use stored mentorship type to determine which plans to show
     if mentorship_type == 'regular':
         # Get regular discount if applicable
         applicable_discount = DISCOUNTS.get('regular')
@@ -2795,15 +5133,18 @@ def back_to_plan_selection(call):
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
             
-            # Use HTML formatting for both bold and strikethrough
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
-                          f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
-                          f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
-                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # FIXED: Use edit_message_text instead of send_message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                f"💰 <b>Trial</b> - <s>${trial_price:.2f}</s> ${trial_discounted:.2f} / Monthly\n"
+                f"💰 <b>Momentum</b> - <s>${momentum_price:.2f}</s> ${momentum_discounted:.2f} / 3 Months\n"
+                f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Yearly", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
         else:
             # No discount - show regular prices without strikethrough
             markup.add(
@@ -2818,13 +5159,17 @@ def back_to_plan_selection(call):
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Regular Mentorship plan"
             
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
-                          f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
-                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # FIXED: Use edit_message_text instead of send_message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"💰 <b>Trial</b> - ${trial_price:.2f} / Monthly\n"
+                f"💰 <b>Momentum</b> - ${momentum_price:.2f} / 3 Months\n"
+                f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Yearly", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
     else:
         # Supreme membership
         # Get supreme discount if applicable
@@ -2873,15 +5218,18 @@ def back_to_plan_selection(call):
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
             
-            # Use HTML formatting for both bold and strikethrough
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
-                          f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
-                          f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
-                          f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # FIXED: Use edit_message_text instead of send_message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"🎉 <b>{discount_name}: {discount_percentage}% OFF!</b>\n\n"
+                f"💰 <b>Apprentice</b> - <s>${apprentice_price:.2f}</s> ${apprentice_discounted:.2f} / 3 Months\n"
+                f"💰 <b>Disciple</b> - <s>${disciple_price:.2f}</s> ${disciple_discounted:.2f} / 6 Months\n"
+                f"💰 <b>Legacy</b> - <s>${legacy_price:.2f}</s> ${legacy_discounted:.2f} / Lifetime", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
         else:
             # No discount - show regular prices without strikethrough
             markup.add(
@@ -2896,19 +5244,24 @@ def back_to_plan_selection(call):
             # Customize message based on whether this is a renewal
             intro_text = "Renewal options" if is_renewal else "Please select your Supreme Mentorship plan"
             
-            bot.send_message(chat_id, 
-                          f"{intro_text}:\n\n"
-                          f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
-                          f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
-                          f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
-                          reply_markup=markup, 
-                          parse_mode="HTML")
+            # FIXED: Use edit_message_text instead of send_message
+            bot.edit_message_text(
+                f"{intro_text}:\n\n"
+                f"💰 <b>Apprentice</b> - ${apprentice_price:.2f} / 3 Months\n"
+                f"💰 <b>Disciple</b> - ${disciple_price:.2f} / 6 Months\n"
+                f"💰 <b>Legacy</b> - ${legacy_price:.2f} / Lifetime", 
+                chat_id,
+                message_id,
+                reply_markup=markup, 
+                parse_mode="HTML"
+            )
 
 # Add handler for back button if needed
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_mentorship_type")
 def back_to_mentorship_type(call):
     """Handle back button to return to mentorship type selection"""
     chat_id = call.message.chat.id
+    message_id = call.message.message_id
     user_id = call.from_user.id
     
     # Update status to go back to mentorship type selection
@@ -2921,12 +5274,12 @@ def back_to_mentorship_type(call):
         InlineKeyboardButton("Regular Mentorship", callback_data="mentorship_regular"),
         InlineKeyboardButton("Supreme Mentorship", callback_data="mentorship_supreme")
     )
-    markup.add(InlineKeyboardButton("⬅️ Go Back", callback_data="back_to_main_menu"))
+    markup.add(InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu"))
     
     bot.edit_message_text(
         "Please select your preferred mentorship level:",
         chat_id,
-        call.message.message_id,
+        message_id,
         reply_markup=markup
     )
     
@@ -3143,6 +5496,8 @@ def process_serial_number(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("faq_"))
 def handle_faq_category(call):
     """Handle FAQ category selection"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
     category = call.data.split("_", 1)[1]  # Split at first underscore to get category
     
     if category == "join_academy":
@@ -3164,8 +5519,8 @@ def handle_faq_category(call):
         
         bot.edit_message_text(
             welcome_message,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3188,8 +5543,8 @@ def handle_faq_category(call):
         
         bot.edit_message_text(
             admissions_message,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3220,8 +5575,8 @@ def handle_faq_category(call):
         
         bot.edit_message_text(
             pricing_message,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3250,8 +5605,8 @@ def handle_faq_category(call):
         
         bot.edit_message_text(
             products_message,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3279,8 +5634,8 @@ def handle_faq_category(call):
         
         bot.edit_message_text(
             benefits_message,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3329,8 +5684,8 @@ def handle_faq_category(call):
         # Edit the original message instead of sending a new one
         bot.edit_message_text(
             terms_text,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3382,8 +5737,8 @@ def handle_faq_category(call):
         # Edit the original message instead of sending a new one
         bot.edit_message_text(
             privacy_text,
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3392,20 +5747,6 @@ def handle_faq_category(call):
         bot.answer_callback_query(call.id, "Viewing Privacy Policy" + (" (PDF sent)" if pdf_sent else ""))
     
     elif category == "back":
-        # First try to delete any PDF file that was sent
-        user_id = call.from_user.id
-        if user_id in PDF_MESSAGE_IDS:
-            try:
-                bot.delete_message(
-                    PDF_MESSAGE_IDS[user_id]['chat_id'],
-                    PDF_MESSAGE_IDS[user_id]['message_id']
-                )
-                # Remove from tracking after successful deletion
-                PDF_MESSAGE_IDS.pop(user_id, None)
-                logging.info(f"Deleted PDF message for user {user_id} when returning to FAQ categories")
-            except Exception as e:
-                logging.error(f"Failed to delete PDF message when returning to FAQ: {e}")
-        
         # Go back to main FAQ categories
         markup = InlineKeyboardMarkup(row_width=1)
         markup.add(
@@ -3422,8 +5763,8 @@ def handle_faq_category(call):
         bot.edit_message_text(
             "🔍 *Frequently Asked Questions*\n\n"
             "Select a category to view related questions:",
-            call.message.chat.id,
-            call.message.message_id,
+            chat_id,
+            message_id,
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -3431,37 +5772,14 @@ def handle_faq_category(call):
         bot.answer_callback_query(call.id, "Back to FAQ categories")
     
     elif category == "main_menu":
-        # Also clean up any PDF messages when returning to main menu
-        user_id = call.from_user.id
-        if user_id in PDF_MESSAGE_IDS:
-            try:
-                bot.delete_message(
-                    PDF_MESSAGE_IDS[user_id]['chat_id'],
-                    PDF_MESSAGE_IDS[user_id]['message_id']
-                )
-                # Remove from tracking after successful deletion
-                PDF_MESSAGE_IDS.pop(user_id, None)
-                logging.info(f"Deleted PDF message for user {user_id} when returning to main menu")
-            except Exception as e:
-                logging.error(f"Failed to delete PDF message when returning to main menu: {e}")
-        
-        # Go back to the main menu
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-            logging.info(f"Deleted original FAQ message when returning to main menu")
-        except Exception as e:
-            logging.error(f"Error deleting FAQ message: {e}")
-        
-        # Show the main menu
-        show_main_menu(call.message.chat.id, call.from_user.id)
-        
+        # Return to the main menu
+        show_main_menu(chat_id, user_id=call.from_user.id, message_id=message_id)
         bot.answer_callback_query(call.id, "Returning to main menu")
 
 # Verify Command - Asks for proof of payment
 @bot.message_handler(commands=['verify'])
 def request_payment_proof(message):
     if message.chat.type != 'private':
-        bot.send_message(message.chat.id, "Please DM the bot to get started.")
         return  # Ignore if not in private chat
     chat_id = message.chat.id
 
@@ -3487,14 +5805,75 @@ def handle_payment_screenshot(message):
         # Process as a confession photo - call the handler directly
         handle_photo_confession(message)
         return
-    
-        # Check if user is in announcement mode - if so, skip this handler
+        
+    # Check if user is in announcement mode - if so, skip this handler
     if user_id in ADMIN_ANNOUNCING and ADMIN_ANNOUNCING[user_id]['status'] == 'waiting_for_announcement':
         # Process as an announcement photo
         handle_announcement_message(message)
         return
+
+    # Add new condition for awaiting XM account screenshot
+    if user_id in PENDING_USERS and PENDING_USERS[user_id].get('status') == 'xm_awaiting_account_screenshot':
+        # Store screenshot details
+        PENDING_USERS[user_id]['screenshot_message_id'] = message.message_id
+        PENDING_USERS[user_id]['status'] = 'xm_awaiting_account_id'
+        save_pending_users()
+        
+        # Ask for account ID
+        bot.send_message(
+            chat_id,
+            "📝 *XM Account ID*\n\n"
+            "Thank you for the screenshot. Now, please provide your XM Trading Account ID:",
+            parse_mode="Markdown"
+        )
+        return
     
-    # Otherwise, continue with payment verification logic
+    # Check if waiting for XM screenshot
+    if user_id in PENDING_USERS and PENDING_USERS[user_id].get('status') == 'xm_awaiting_screenshot':
+        # Handle XM verification screenshot
+        username = message.from_user.username or "No Username"
+        if username != "No Username":
+            username = re.sub(r'([_*[\]()~`>#\+\-=|{}.!])', r'\\\1', username)
+        
+        # Forward screenshot to admins WITH enhanced context and inline buttons
+        for admin in ADMIN_IDS:
+            # Forward the actual screenshot
+            bot.forward_message(admin, chat_id, message.message_id)
+            
+            # Send explanatory message with verification buttons
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("✅ Approve XM", callback_data=f"approve_xm_{user_id}"),
+                InlineKeyboardButton("❌ Reject XM", callback_data=f"reject_xm_{user_id}")
+            )
+
+            bot.send_message(
+                admin,
+                f"🔔 *XM Partnership Verification Request:*\n\n"
+                f"User @{username} (ID: `{user_id}`) has submitted a screenshot showing their XM account with partner code.\n\n"
+                f"Please verify that:\n"
+                f"• The partner code PTAPARTNER is correctly applied\n"
+                f"• The screenshot is from a valid XM account\n\n"
+                f"Then approve or reject this verification request.",
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+        
+        # Update user status
+        PENDING_USERS[user_id]['status'] = 'xm_waiting_approval'
+        save_pending_users()
+        
+        # Send confirmation message to user
+        bot.send_message(
+            chat_id,
+            "✅ *XM Verification Submitted*\n\n"
+            "Your XM account verification screenshot has been sent to our admins for review.\n\n"
+            "You will be notified once your verification is approved or rejected.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Otherwise, continue with original payment verification logic
     if chat_id not in PENDING_USERS or PENDING_USERS[chat_id]['status'] != 'awaiting_proof':
         bot.send_message(chat_id, "❌ Please start verification with `/verify`.")
         return
@@ -3708,7 +6087,7 @@ def callback_approve_payment(call):
         logging.info(f"Saving payment data for user {user_id}: {PAYMENT_DATA[str(user_id)]}")
         save_payment_data()  # Ensure this function is called to save the data
 
-                # ✅ Check if the bot can message the user
+        # ✅ Check if the bot can message the user
         try:
             bot.send_chat_action(user_id, 'typing')  # Check if the user exists
         except ApiException:
@@ -3749,7 +6128,7 @@ def callback_approve_payment(call):
             bot.send_message(user_id, random.choice(payment_approval_messages), parse_mode="Markdown")
             bot.answer_callback_query(call.id, "✅ Payment approved successfully.")
 
-                        # 📅 Step 2: Determine and send due date
+            # 📅 Step 2: Determine and send due date
             USER_PAYMENT_DUE[user_id] = due_date
             bot.send_message(user_id, f"📅 *Your next payment is due on:* {due_date.strftime('%Y/%m/%d %I:%M:%S %p')}.")
 
@@ -3782,17 +6161,29 @@ def callback_approve_payment(call):
             except Exception as e:
                 logging.error(f"Error deleting transition message: {e}")
             
-            # 📝 Step 3: Send onboarding form
-            target_group_id = SUPREME_GROUP_ID if mentorship_type.lower() == 'supreme' else PAID_GROUP_ID
-            PENDING_USERS[user_id] = {
-                'form_answers': {},  # Initialize empty dict to store responses
-                'invite_link': None,  # Will store the invite link to use after form completion
-                'target_group_id': target_group_id  # Store which group to invite to
-            }
-            save_pending_users()
+                # 📝 Step 3: Send onboarding form
+                target_group_id = SUPREME_GROUP_ID if mentorship_type.lower() == 'supreme' else PAID_GROUP_ID
 
-            # Then call send_onboarding_form which will set the proper status
-            send_onboarding_form(user_id)
+                # --- Add check if user is already in the target group ---
+                already_in_group = False
+                try:
+                    chat_member = bot.get_chat_member(target_group_id, user_id)
+                    # If we get here without exception, user is already in the group
+                    already_in_group = True
+                    logging.info(f"User {user_id} is already in group {target_group_id}, will skip invite during onboarding")
+                except ApiException:
+                    # User is not in the chat yet
+                    already_in_group = False
+                    logging.info(f"User {user_id} is not in group {target_group_id}, will generate invite during onboarding")
+
+                PENDING_USERS[user_id] = {
+                    'form_answers': {},  # Initialize empty dict to store responses
+                    'invite_link': None,  # Will store the invite link to use after form completion
+                    'target_group_id': target_group_id,  # Store which group to invite to
+                    'already_in_group': already_in_group,  # Add this flag
+                    'membership_type': mentorship_type  # Make sure membership type is carried through
+                }
+                save_pending_users()
             
         except Exception as e:
             bot.answer_callback_query(call.id, f"❌ Error sending onboarding form: {e}")
@@ -3800,9 +6191,22 @@ def callback_approve_payment(call):
 
         # 🔒 Step 6: Ensure bot is an admin before adding restrictions
         try:
-            bot.restrict_chat_member(PAID_GROUP_ID, user_id, can_send_messages=True)
+            # Check if user is a chat member first
+            chat_member = None
+            try:
+                chat_member = bot.get_chat_member(PAID_GROUP_ID, user_id)
+            except ApiException:
+                # User is not in the chat yet, which is fine
+                pass
+            
+            # Only try to restrict if user is not the chat owner
+            if not chat_member or chat_member.status != "creator":
+                bot.restrict_chat_member(PAID_GROUP_ID, user_id, can_send_messages=True)
         except ApiException as e:
-            bot.send_message(call.message.chat.id, f"⚠️ Warning: Could not restrict user in the group. Error: {e}")
+            bot.send_message(call.message.chat.id, f"⚠️ Note: User permissions were not modified. Error: {e}")
+
+        # Then call send_onboarding_form which will set the proper status
+        send_onboarding_form(user_id)
 
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Unexpected error approving payment: {e}")
@@ -3908,10 +6312,10 @@ def handle_regular_form_step1(message):
     bot.send_chat_action(user_id, 'typing')
     time.sleep(1.5)
     
-    # Send second question for Birthday (changed from Age/Birth Year)
+    # Send second question for Birthday (changed format to MM/DD/YYYY)
     bot.send_message(
         user_id,
-        "📝 *Question 2:* Birthday (DD/MM/YYYY format, e.g., 15/06/1990)",
+        "📝 *Question 2:* Birthday (MM/DD/YYYY format, e.g., 06/15/1990)",
         parse_mode="Markdown"
     )
 
@@ -3920,18 +6324,18 @@ def handle_regular_form_step2(message):
     user_id = message.from_user.id
     birthday_input = message.text
     
-    # Validate birthday format (DD/MM/YYYY)
+    # Validate birthday format (MM/DD/YYYY)
     try:
-        # Check if input matches DD/MM/YYYY pattern
+        # Check if input matches MM/DD/YYYY pattern
         if not re.match(r"^\d{2}/\d{2}/\d{4}$", birthday_input):
             bot.send_message(
                 user_id,
-                "❌ Invalid birthday format. Please use DD/MM/YYYY format (e.g., 15/06/1990)."
+                "❌ Invalid birthday format. Please use MM/DD/YYYY format (e.g., 06/15/1990)."
             )
             return
             
         # Try to parse the date to ensure it's valid
-        day, month, year = map(int, birthday_input.split('/'))
+        month, day, year = map(int, birthday_input.split('/'))
         birthday_date = datetime(year, month, day)
         
         # Check if birthday is in the past
@@ -3941,9 +6345,54 @@ def handle_regular_form_step2(message):
                 "❌ Birthday cannot be in the future. Please enter a valid date."
             )
             return
-            
-        # Store the answer - now as proper birthday
-        PENDING_USERS[user_id]['form_answers']['birthday'] = birthday_input
+        
+        # Store the birthday temporarily and move to confirmation step
+        PENDING_USERS[user_id]['temp_birthday'] = birthday_input
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step2_confirm'
+        save_pending_users()
+        
+        # Format the date in a human-readable format for confirmation
+        formatted_date = birthday_date.strftime("%B %d, %Y")  # Format as "June 15, 1990"
+        
+        # Create keyboard for confirmation
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.row("✅ Yes, that's correct", "❌ No, I need to re-enter")
+        
+        # Send confirmation message
+        bot.send_message(
+            user_id,
+            f"📅 You entered: *{formatted_date}*\n\nIs this correct?",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    except ValueError:
+        bot.send_message(
+            user_id,
+            "❌ Invalid date. Please enter a valid birthday in MM/DD/YYYY format (e.g., 06/15/1990)."
+        )
+
+# Add a new handler for the birthday confirmation step
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step2_confirm')
+def handle_regular_form_step2_confirm(message):
+    user_id = message.from_user.id
+    response = message.text.lower()
+    
+    # Check the user's response
+    if "yes" in response or "correct" in response:
+        # User confirmed the birthday is correct
+        
+        # Get the temporary birthday we stored
+        birthday = PENDING_USERS[user_id].get('temp_birthday')
+        
+        # Store the answer in form_answers
+        PENDING_USERS[user_id]['form_answers']['birthday'] = birthday
+        
+        # Remove temporary birthday storage
+        if 'temp_birthday' in PENDING_USERS[user_id]:
+            del PENDING_USERS[user_id]['temp_birthday']
+        
+        # Move to step 3
         PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step3'
         save_pending_users()
         
@@ -3951,26 +6400,37 @@ def handle_regular_form_step2(message):
         bot.send_chat_action(user_id, 'typing')
         time.sleep(1.5)
         
+        # Remove keyboard
+        markup = ReplyKeyboardRemove()
+        
         # Send third question with multiple choice options for experience level
-        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        markup.row("a. Completely new")
-        markup.row("b. Beginner")
-        markup.row("c. Intermediate")
-        markup.row("d. Expert")
-        markup.row("e. Master")
+        experience_markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        experience_markup.row("a. Completely new")
+        experience_markup.row("b. Beginner")
+        experience_markup.row("c. Intermediate")
+        experience_markup.row("d. Expert")
+        experience_markup.row("e. Master")
         
         bot.send_message(
             user_id,
             "📝 *Question 3:* Are you completely new to trading or do you have some experience?",
             parse_mode="Markdown",
-            reply_markup=markup
+            reply_markup=experience_markup
         )
-    except ValueError:
+    else:
+        # User wants to re-enter the birthday
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_regular_step2'
+        save_pending_users()
+        
+        # Remove keyboard
+        markup = ReplyKeyboardRemove()
+        
+        # Send message to retry
         bot.send_message(
             user_id,
-            "❌ Invalid date. Please enter a valid birthday in DD/MM/YYYY format (e.g., 15/06/1990)."
+            "📅 Please re-enter your birthday in MM/DD/YYYY format (e.g., 06/15/1990):",
+            reply_markup=markup
         )
-
 
 @bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_regular_step3')
 def handle_regular_form_step3(message):
@@ -4107,10 +6567,10 @@ def handle_supreme_form_step1(message):
     bot.send_chat_action(user_id, 'typing')
     time.sleep(1.5)
     
-    # Send second question for Birthday
+    # Send second question for Birthday (changed format to MM/DD/YYYY)
     bot.send_message(
         user_id,
-        "📝 *Question 2:* Birthday (DD/MM/YYYY)",
+        "📝 *Question 2:* Birthday (MM/DD/YYYY format, e.g., 06/15/1990)",
         parse_mode="Markdown"
     )
 
@@ -4119,18 +6579,18 @@ def handle_supreme_form_step2(message):
     user_id = message.from_user.id
     birthday_input = message.text
     
-    # Validate birthday format (DD/MM/YYYY)
+    # Validate birthday format (MM/DD/YYYY)
     try:
-        # Check if input matches DD/MM/YYYY pattern
+        # Check if input matches MM/DD/YYYY pattern
         if not re.match(r"^\d{2}/\d{2}/\d{4}$", birthday_input):
             bot.send_message(
                 user_id,
-                "❌ Invalid birthday format. Please use DD/MM/YYYY format (e.g., 15/06/1990)."
+                "❌ Invalid birthday format. Please use MM/DD/YYYY format (e.g., 06/15/1990)."
             )
             return
             
         # Try to parse the date to ensure it's valid
-        day, month, year = map(int, birthday_input.split('/'))
+        month, day, year = map(int, birthday_input.split('/'))
         birthday_date = datetime(year, month, day)
         
         # Check if birthday is in the past
@@ -4140,9 +6600,54 @@ def handle_supreme_form_step2(message):
                 "❌ Birthday cannot be in the future. Please enter a valid date."
             )
             return
-            
-        # Store the answer - this is the birthday
-        PENDING_USERS[user_id]['form_answers']['birthday'] = birthday_input
+        
+        # Store the birthday temporarily and move to confirmation step
+        PENDING_USERS[user_id]['temp_birthday'] = birthday_input
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step2_confirm'
+        save_pending_users()
+        
+        # Format the date in a human-readable format for confirmation
+        formatted_date = birthday_date.strftime("%B %d, %Y")  # Format as "June 15, 1990"
+        
+        # Create keyboard for confirmation
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.row("✅ Yes, that's correct", "❌ No, I need to re-enter")
+        
+        # Send confirmation message
+        bot.send_message(
+            user_id,
+            f"📅 You entered: *{formatted_date}*\n\nIs this correct?",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        
+    except ValueError:
+        bot.send_message(
+            user_id,
+            "❌ Invalid date. Please enter a valid birthday in MM/DD/YYYY format (e.g., 06/15/1990)."
+        )
+
+# Add a new handler for the birthday confirmation step
+@bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step2_confirm')
+def handle_supreme_form_step2_confirm(message):
+    user_id = message.from_user.id
+    response = message.text.lower()
+    
+    # Check the user's response
+    if "yes" in response or "correct" in response:
+        # User confirmed the birthday is correct
+        
+        # Get the temporary birthday we stored
+        birthday = PENDING_USERS[user_id].get('temp_birthday')
+        
+        # Store the answer in form_answers
+        PENDING_USERS[user_id]['form_answers']['birthday'] = birthday
+        
+        # Remove temporary birthday storage
+        if 'temp_birthday' in PENDING_USERS[user_id]:
+            del PENDING_USERS[user_id]['temp_birthday']
+        
+        # Move to step 3
         PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step3'
         save_pending_users()
         
@@ -4150,16 +6655,29 @@ def handle_supreme_form_step2(message):
         bot.send_chat_action(user_id, 'typing')
         time.sleep(1.5)
         
-        # Send third question for Phone Number with country code instructions
+        # Remove keyboard
+        markup = ReplyKeyboardRemove()
+        
+        # Send third question for Phone Number
         bot.send_message(
             user_id,
             "📝 *Question 3:* Phone Number (include country code, ex. +63 917 123 4567 for Philippines or +1 555 123 4567 for US)",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=markup
         )
-    except ValueError:
+    else:
+        # User wants to re-enter the birthday
+        PENDING_USERS[user_id]['status'] = 'onboarding_form_supreme_step2'
+        save_pending_users()
+        
+        # Remove keyboard
+        markup = ReplyKeyboardRemove()
+        
+        # Send message to retry
         bot.send_message(
             user_id,
-            "❌ Invalid date. Please enter a valid birthday in DD/MM/YYYY format (e.g., 15/06/1990)."
+            "📅 Please re-enter your birthday in MM/DD/YYYY format (e.g., 06/15/1990):",
+            reply_markup=markup
         )
 
 @bot.message_handler(func=lambda message: PENDING_USERS.get(message.from_user.id, {}).get('status') == 'onboarding_form_supreme_step3')
@@ -4554,8 +7072,8 @@ def complete_onboarding(user_id):
             # If we don't have an invite link yet, generate one
             if not invite_link:
                 try:
-                    # Generate a new invite link
-                    new_invite = bot.create_chat_invite_link(
+                    # Generate a new invite link - explicitly note it's a ChatInviteLink object
+                    new_invite: ChatInviteLink = bot.create_chat_invite_link(
                         target_group_id,
                         name=f"User {user_id} onboarding",
                         creates_join_request=False,
@@ -4632,10 +7150,13 @@ def complete_onboarding(user_id):
                 expiration_time = datetime.now() + timedelta(seconds=60)  # Link expires in 60 seconds
                 formatted_expiration = expiration_time.strftime("%I:%M:%S %p")  # Format as hour:minute:second AM/PM
 
+                # Escape special characters in the invite link
+                safe_invite_link = invite_link.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[").replace("]", "\\]")
+                
                 bot.send_message(
                     user_id,
                     f"🎉 *Welcome to {group_name}!*\n\n"
-                    f"Please join our community here: {invite_link}\n\n"
+                    f"Please join our community here: {safe_invite_link}\n\n"
                     f"⏰ *Link expires at:* {formatted_expiration} (60 seconds from now)",
                     parse_mode="Markdown"
                 )
@@ -4646,7 +7167,7 @@ def complete_onboarding(user_id):
                     try:
                         bot.revoke_chat_invite_link(chat_id, invite_link)
                         for admin_id in admin_ids:
-                            bot.send_message(admin_id, f"🔒 One-time invite link revoked: {invite_link}")
+                            pass
                     except Exception as e:
                         logging.error(f"⚠️ Failed to revoke invite link: {e}")
 
@@ -4667,6 +7188,8 @@ def complete_onboarding(user_id):
                 # Add form answers to payment data
                 PAYMENT_DATA[user_id_str]['form_answers'] = form_answers
                 PAYMENT_DATA[user_id_str]['form_completion_date'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                # IMPORTANT FIX: Remove the forms_needed flag after completion
+                PAYMENT_DATA[user_id_str]['forms_needed'] = False
                 save_payment_data()  # Save to database
                 logging.info(f"Form responses saved to PAYMENT_DATA for user {user_id}")
             
@@ -4715,6 +7238,18 @@ def complete_onboarding(user_id):
         except Exception as e:
             logging.error(f"Error sending form responses to admins: {e}")
         
+        # NEW: Notify user of successful registration completion
+        try:
+            bot.send_message(
+                user_id,
+                "✅ *Registration Complete!*\n\n"
+                "Thank you for completing your registration forms. Your membership is now fully activated.\n\n"
+                "Use the /start command anytime to access your membership options and features.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Error sending completion notification to user: {e}")
+        
         # NEW: Prompt user to subscribe to updates
         time.sleep(1)  # Add a small delay for better UX
         
@@ -4741,18 +7276,6 @@ def complete_onboarding(user_id):
         # Instead of deleting the user, set a completed status
         PENDING_USERS[user_id]['status'] = 'completed_onboarding'
         save_pending_users()
-        
-        # If this is a supreme member, suggest the supreme dashboard command
-        # if PENDING_USERS[user_id].get('mentorship_type', '').lower() == 'supreme':
-        #     time.sleep(2)  # Add another small delay
-        #     bot.send_message(
-        #         user_id,
-        #         "✨ *Supreme Member Exclusive*\n\n"
-        #         "Access your personalized Supreme dashboard with:\n"
-        #         "`/supreme_dashboard`\n\n"
-        #         "This will give you access to your mentor line, trading journey, and more!",
-        #         parse_mode="Markdown"
-        #     )
         
     except Exception as e:
         logging.error(f"Error in complete_onboarding for user {user_id}: {e}")
@@ -12850,8 +15373,8 @@ def show_enrollment_options(call):
     # Create keyboard with options for both membership types
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("🟢 Open Regular", callback_data="enrollment_regular_open"),
-        InlineKeyboardButton("🔴 Close Regular", callback_data="enrollment_regular_close")
+        InlineKeyboardButton("🟢 Open XM Partnership", callback_data="enrollment_regular_open"),
+        InlineKeyboardButton("🔴 Close XM Partnership", callback_data="enrollment_regular_close")
     )
     markup.add(
         InlineKeyboardButton("🟢 Open Supreme", callback_data="enrollment_supreme_open"),
@@ -12867,8 +15390,8 @@ def show_enrollment_options(call):
     # Edit the message with enrollment options for both types
     bot.edit_message_text(
         f"🔓 *ENROLLMENT STATUS*\n\n"
-        f"*Regular Membership:* {regular_status}\n"
-        f"*Supreme Membership:* {supreme_status}\n\n"
+        f"*XM Partnership (Free):* {regular_status}\n"
+        f"*Supreme Membership (Paid):* {supreme_status}\n\n"
         f"Select an option to change enrollment status:",
         call.message.chat.id,
         call.message.message_id,
@@ -14644,6 +17167,11 @@ def check_and_reset_rate_limits():
                 if now - last_used >= 3600:
                     # Reset count to 0
                     QWEN_USAGE[user_id]['count'] = 0
+                    
+                    # If there was a 'reset_scheduled' flag, clear it
+                    if 'reset_scheduled' in QWEN_USAGE[user_id]:
+                        QWEN_USAGE[user_id]['reset_scheduled'] = False
+                    
                     # Update in MongoDB too
                     jarvis_usage_collection.update_one(
                         {"user_id": user_id},
@@ -14665,7 +17193,7 @@ def check_and_reset_rate_limits():
 keep_alive()
 
 # Start the rate limit checker thread
-threading.Thread(target=check_and_reset_rate_limits, daemon=True).start()
+# threading.Thread(target=check_and_reset_rate_limits, daemon=True).start()
 
 # Start reminder thread
 reminder_thread = threading.Thread(target=send_payment_reminder)
@@ -14710,33 +17238,89 @@ pending_cleanup_thread.start()
 birthday_thread = threading.Thread(target=birthday_check_thread, daemon=True)
 birthday_thread.start()
 
+# Start the trial reminder checker thread
+threading.Thread(target=check_trial_reminders, daemon=True).start()
+
 # Function to start the bot with auto-restart
 def start_bot():
-    """Start the bot with enhanced error handling and reconnection logic"""
+    """Start the bot using webhooks instead of polling"""
+    # Set up webhook
+    WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://ptabot.up.railway.app/')
+    WEBHOOK_SECRET_PATH = os.environ.get('WEBHOOK_SECRET_PATH', 'telegram_webhook')
+    PORT = int(os.environ.get('PORT', 5001))
+    
+    # Log webhook setup
+    logging.info(f"Setting up webhook at {WEBHOOK_URL + WEBHOOK_SECRET_PATH}")
+    
+    try:
+        # Remove any existing webhook first
+        bot.remove_webhook()
+        time.sleep(1)  # Small delay to ensure webhook is removed
+        
+        # Set up the new webhook
+        bot.set_webhook(url=WEBHOOK_URL + WEBHOOK_SECRET_PATH)
+        logging.info("Webhook set successfully")
+        
+        # Set up Flask route to handle webhook updates
+        @server.route('/' + WEBHOOK_SECRET_PATH, methods=['POST'])
+        def webhook():
+            try:
+                json_string = request.get_data().decode('utf-8')
+                update = telebot.types.Update.de_json(json_string)
+                bot.process_new_updates([update])
+                return '', 200
+            except Exception as e:
+                logging.error(f"Error in webhook handler: {e}", exc_info=True)
+                return '', 500
+        
+        # Add a health check endpoint for monitoring
+        @server.route('/health', methods=['GET'])
+        def health_check():
+            return 'Bot is running', 200
+        
+        # Add a root endpoint
+        @server.route('/', methods=['GET'])
+        def index():
+            return 'PTA Bot is running', 200
+        
+        # Start the Flask server
+        logging.info(f"Starting Flask server on port {PORT}")
+        server.run(host='0.0.0.0', port=PORT)
+        
+    except Exception as e:
+        logging.critical(f"Critical error setting up webhook: {e}", exc_info=True)
+        
+        # If webhook setup fails, fall back to polling as a backup
+        logging.info("Falling back to polling method")
+        use_polling_fallback()
+
+def use_polling_fallback():
+    """Fallback to polling if webhook fails"""
     consecutive_errors = 0
     max_consecutive_errors = 5
     backoff_time = 5  # Initial backoff time in seconds
     max_backoff_time = 300  # Maximum backoff time (5 minutes)
     
+    logging.warning("Using polling as fallback method")
+    
     while True:
         try:
-            logging.info("Starting the bot...")
+            # Make sure webhook is removed before polling
+            bot.remove_webhook()
+            time.sleep(2)
             
-            # Add connection status tracking
+            logging.info("Starting polling mode...")
             connection_time = datetime.now()
             logging.info(f"Bot connecting at {connection_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
-            # Wait for any previous connections to close
-            time.sleep(10)
-            
             # Start polling with better parameters
-            bot.polling()
+            bot.polling(none_stop=True, interval=1, timeout=60)
             
             # Reset error counter on successful connection
             consecutive_errors = 0
             backoff_time = 5
             
-            logging.info("Bot is online and processing messages")
+            logging.info("Bot is online and processing messages via polling")
             
         except requests.exceptions.ReadTimeout:
             # Handle timeout separately - this is generally not critical
@@ -14787,5 +17371,7 @@ def start_bot():
             
             time.sleep(wait_time)
             logging.info("Restarting the bot...")
+
 if __name__ == "__main__":
+    # Make sure all background threads are started before setting up webhooks
     start_bot()
